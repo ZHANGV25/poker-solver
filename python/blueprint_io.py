@@ -18,6 +18,7 @@ Usage:
 """
 
 import json
+import lzma
 import os
 import sys
 from typing import Dict, List, Optional, Tuple
@@ -120,24 +121,34 @@ class Blueprint:
         for name in os.listdir(self.solutions_dir):
             path = os.path.join(self.solutions_dir, name)
             if os.path.isdir(path):
-                # Count files
-                n = len([f for f in os.listdir(path) if f.endswith(".json")])
+                # Count files (.json or .json.lzma)
+                n = len([f for f in os.listdir(path)
+                         if f.endswith(".json") or f.endswith(".json.lzma")])
                 if n > 0:
                     scenarios[name] = n
         return scenarios
 
     def _load_solution(self, scenario_id, tex_key):
-        """Load a single solution file (cached)."""
+        """Load a single solution file (cached). Supports JSON and LZMA."""
         cache_key = (scenario_id, tex_key)
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        path = os.path.join(self.solutions_dir, scenario_id, tex_key + ".json")
-        if not os.path.exists(path):
-            return None
+        # Try LZMA first (compressed), then JSON
+        lzma_path = os.path.join(self.solutions_dir, scenario_id,
+                                  tex_key + ".json.lzma")
+        json_path = os.path.join(self.solutions_dir, scenario_id,
+                                  tex_key + ".json")
 
-        with open(path) as f:
-            data = json.load(f)
+        data = None
+        if os.path.exists(lzma_path):
+            with open(lzma_path, 'rb') as f:
+                data = json.loads(lzma.decompress(f.read()))
+        elif os.path.exists(json_path):
+            with open(json_path) as f:
+                data = json.load(f)
+        else:
+            return None
 
         self._cache[cache_key] = data
         return data
