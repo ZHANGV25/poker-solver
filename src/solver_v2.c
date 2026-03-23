@@ -355,13 +355,13 @@ static void cfr_traverse(SolverV2 *s, int node_idx, int traverser,
             for (int h = 0; h < n_trav; h++)
                 is->regrets[a * n_trav + h] += action_cfv[a * n_trav + h] - cfv_out[h];
 
-        /* Update strategy sum with Linear CFR weighting (weight = iteration) */
+        /* Update strategy sum: CFR+ uses iteration-weighted sum.
+         * Weight = iteration number (Linear CFR / CFR+ style). */
         float *my_reach = (traverser == 0) ? reach0 : reach1;
-        float weight = (float)iter;
         for (int a = 0; a < n_actions; a++)
             for (int h = 0; h < n_trav; h++)
                 is->strategy_sum[a * n_trav + h] +=
-                    weight * my_reach[h] * is->current_strategy[a * nh_acting + h];
+                    my_reach[h] * is->current_strategy[a * nh_acting + h];
 
     } else {
         /* Opponent: sample via current strategy */
@@ -385,19 +385,17 @@ static void cfr_traverse(SolverV2 *s, int node_idx, int traverser,
 
 /* ── Linear CFR discounting ────────────────────────────────────────────── */
 
-static void apply_linear_cfr_discount(SolverV2 *s, int iter) {
-    /* Linear CFR: weight iteration t by t.
-     * Equivalent to DCFR(1,1,1).
-     * Discount factor: d = t / (t+1) applied to regrets and strategy sums.
-     * Applied every iteration. */
-    float d = (float)iter / ((float)iter + 1.0f);
+static void apply_cfr_plus(SolverV2 *s, int iter) {
+    /* CFR+: floor negative regrets at 0.
+     * This is proven to converge and is simpler than DCFR/Linear CFR.
+     * Strategy sum is weighted by iteration (linear weighting). */
     for (int n = 0; n < s->num_nodes; n++) {
         InfoSetV2 *is = &s->info_sets[n];
         if (is->regrets == NULL) continue;
         int size = is->num_actions * is->num_hands;
         for (int i = 0; i < size; i++) {
-            is->regrets[i] *= d;
-            is->strategy_sum[i] *= d;
+            /* CFR+: floor regrets at 0 */
+            if (is->regrets[i] < 0) is->regrets[i] = 0;
         }
     }
 }
@@ -707,7 +705,7 @@ float sv2_solve(SolverV2 *s, int max_iterations, float target_exploitability) {
         memcpy(reach1, s->weights[1], n1 * sizeof(float));
         cfr_traverse(s, 0, 1, reach0, reach1, cfv, iter);
 
-        apply_linear_cfr_discount(s, iter);
+        apply_cfr_plus(s, iter);
         s->iterations_run = iter;
     }
     return 0;
