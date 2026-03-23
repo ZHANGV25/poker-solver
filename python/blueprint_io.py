@@ -23,7 +23,10 @@ import sys
 from typing import Dict, List, Optional, Tuple
 
 # Import from sibling module
-from solver import card_to_int, int_to_card
+try:
+    from solver import card_to_int, int_to_card
+except ImportError:
+    from python.solver import card_to_int, int_to_card
 
 # ── Suit isomorphism (from precompute_flops.py) ─────────────────────────────
 

@@ -30,7 +30,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor, Future
 from typing import Dict, List, Optional, Tuple
 
-from solver import card_to_int, int_to_card, SCALE, MAX_ACTIONS
+try:
+    from solver import card_to_int, int_to_card, SCALE, MAX_ACTIONS
+except ImportError:
+    from python.solver import card_to_int, int_to_card, SCALE, MAX_ACTIONS
 
 
 class SolverPool:

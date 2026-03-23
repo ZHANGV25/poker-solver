@@ -34,10 +34,16 @@ from typing import Dict, List, Optional, Tuple
 # Import solver components
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from solver import card_to_int, int_to_card, parse_range_string, SCALE, MAX_ACTIONS
-from range_narrowing import RangeNarrower
-from blueprint_io import Blueprint
-from solver_pool import SolverPool
+try:
+    from solver import card_to_int, int_to_card, parse_range_string, SCALE, MAX_ACTIONS
+    from range_narrowing import RangeNarrower
+    from blueprint_io import Blueprint
+    from solver_pool import SolverPool
+except ImportError:
+    from python.solver import card_to_int, int_to_card, parse_range_string, SCALE, MAX_ACTIONS
+    from python.range_narrowing import RangeNarrower
+    from python.blueprint_io import Blueprint
+    from python.solver_pool import SolverPool
 
 
 class HUDSolver:
