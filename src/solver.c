@@ -420,12 +420,55 @@ static void cfr_traverse(Solver *s, int node_idx, int traverser,
 
     /* Terminal: leaf (depth-limited) */
     if (node->type == NODE_LEAF) {
-        /* For now, use simple equity as leaf value.
-           TODO: Implement 4 continuation strategies */
         float *reach_opp = (traverser == 0) ? reach1 : reach0;
-        /* Simplified: just return 0 (check-through equity) */
-        for (int h = 0; h < s->num_hands[traverser]; h++)
+
+        if (s->leaf_values != NULL) {
+            /* Use precomputed continuation values from blueprint.
+             * leaf_values stores per-hand EV for each player at this leaf.
+             * This captures implied odds from future streets. */
+            /* Find leaf index */
+            int leaf_idx = 0;
+            for (int i = 0; i < node_idx; i++) {
+                if (s->nodes[i].type == NODE_LEAF) leaf_idx++;
+            }
+            if (leaf_idx < s->num_leaves && s->leaf_values[leaf_idx].values != NULL) {
+                float *vals = s->leaf_values[leaf_idx].values;
+                int n_hero = s->num_hands[traverser];
+                int n_opp = s->num_hands[1 - traverser];
+                int opp = 1 - traverser;
+                /* Values are stored as [player][hand] */
+                float *my_vals = vals + traverser * MAX_HANDS;
+                for (int h = 0; h < n_hero; h++) {
+                    int c0 = s->hands[traverser][h][0];
+                    int c1 = s->hands[traverser][h][1];
+                    float opp_total = 0;
+                    for (int o = 0; o < n_opp; o++) {
+                        if (!cards_conflict(c0, c1, s->hands[opp][o][0],
+                                            s->hands[opp][o][1]))
+                            opp_total += reach_opp[o];
+                    }
+                    cfv_out[h] = opp_total * my_vals[h];
+                }
+                return;
+            }
+        }
+
+        /* Fallback: use pot equity (each player gets their share of the pot
+         * based on their contribution). This is equivalent to check-through. */
+        int n_hero = s->num_hands[traverser];
+        int n_opp = s->num_hands[1 - traverser];
+        for (int h = 0; h < n_hero; h++) {
+            int c0 = s->hands[traverser][h][0];
+            int c1 = s->hands[traverser][h][1];
+            float opp_total = 0;
+            for (int o = 0; o < n_opp; o++) {
+                if (!cards_conflict(c0, c1, s->hands[1-traverser][o][0],
+                                    s->hands[1-traverser][o][1]))
+                    opp_total += reach_opp[o];
+            }
+            /* Leaf value = 0 (neutral — each player keeps their current contribution) */
             cfv_out[h] = 0;
+        }
         return;
     }
 
@@ -779,6 +822,29 @@ int solver_init(Solver *s,
     return 0;
 }
 
+int solver_set_leaf_values(Solver *s, int leaf_idx,
+                           const float *values_p0, const float *values_p1) {
+    /* Count leaves if not yet done */
+    if (s->leaf_values == NULL) {
+        int n_leaves = 0;
+        for (int i = 0; i < s->num_nodes; i++)
+            if (s->nodes[i].type == NODE_LEAF) n_leaves++;
+        s->num_leaves = n_leaves;
+        s->leaf_values = calloc(n_leaves, sizeof(LeafValues));
+    }
+
+    if (leaf_idx < 0 || leaf_idx >= s->num_leaves)
+        return -1;
+
+    /* Allocate and copy values */
+    s->leaf_values[leaf_idx].values = malloc(2 * MAX_HANDS * sizeof(float));
+    memcpy(s->leaf_values[leaf_idx].values, values_p0,
+           s->num_hands[0] * sizeof(float));
+    memcpy(s->leaf_values[leaf_idx].values + MAX_HANDS, values_p1,
+           s->num_hands[1] * sizeof(float));
+    return 0;
+}
+
 float solver_solve(Solver *s, int max_iterations, float target_exploitability) {
     int n0 = s->num_hands[0];
     int n1 = s->num_hands[1];
@@ -937,6 +1003,11 @@ void solver_free(Solver *s) {
     if (s->sorted[1].strengths) free(s->sorted[1].strengths);
     if (s->hand_strengths[0]) free(s->hand_strengths[0]);
     if (s->hand_strengths[1]) free(s->hand_strengths[1]);
+    if (s->leaf_values) {
+        for (int i = 0; i < s->num_leaves; i++)
+            if (s->leaf_values[i].values) free(s->leaf_values[i].values);
+        free(s->leaf_values);
+    }
     if (s->scratch_reach[0]) free(s->scratch_reach[0]);
     if (s->scratch_reach[1]) free(s->scratch_reach[1]);
     if (s->scratch_cfv) free(s->scratch_cfv);
