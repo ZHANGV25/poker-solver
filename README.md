@@ -1,83 +1,78 @@
 # poker-solver
 
-Custom DCFR poker solver for real-time depth-limited subgame solving. Pluribus-inspired architecture with Bayesian range narrowing.
+Pluribus-style depth-limited DCFR poker solver for real-time 6-max NLHE.
 
 ## Architecture
 
 ```
-Precompute (EC2):
-  27 scenarios x 1,755 flop textures -> per-hand strategies
-  Stored as JSON with suit isomorphism, LZMA-ready
-
-Runtime (Desktop):
-  Blueprint lookup -> Bayesian range narrowing -> DCFR re-solve
-  Per-decision: <500ms for narrowed river, <2s for turn
+PREFLOP:  Scenario selection → starting ranges (instant)
+FLOP:     Precomputed blueprint lookup + Bayesian range narrowing (instant)
+TURN:     Re-solve with narrowed ranges + 4 continuation strategies (~200ms)
+RIVER:    Re-solve with narrowed ranges to showdown (~180ms)
 ```
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for full design details.
 
 ### Components
 
-- **C solver** (`src/solver.c`): DCFR with Brown's parameters, depth-limited leaf values
-- **Python bindings** (`python/solver.py`): ctypes wrapper, range parsing
-- **Range narrowing** (`python/range_narrowing.py`): Bayesian updates for hero + villain
-- **Blueprint I/O** (`python/blueprint_io.py`): reads precomputed flop solutions
-- **Solver pool** (`python/solver_pool.py`): thread pool for multi-table concurrent solving
-- **HUD interface** (`python/hud_solver.py`): high-level API for ACR HUD integration
-- **EC2 precompute** (`precompute/`): batch solve + deployment scripts
+| Component | File | Description |
+|-----------|------|-------------|
+| **C solver v2** | `src/solver_v2.c` | Linear CFR (Pluribus-style), final iteration strategy, leaf continuation values |
+| **C solver v1** | `src/solver.c` | DCFR baseline, cross-validated against postflop-solver (Rust) |
+| **Hand evaluation** | `src/hand_eval.h` | 7-card eval via 21× 5-card combinations |
+| **CUDA solver** | `src/cuda/gpu_solver.cu` | GPU batch solver for EC2 precomputation (WIP) |
+| **Python bindings** | `python/solver.py` | ctypes wrapper, range parsing |
+| **Range narrowing** | `python/range_narrowing.py` | Bayesian updates for hero + villain |
+| **Blueprint I/O** | `python/blueprint_io.py` | Read precomputed solutions (JSON + LZMA) |
+| **Solver pool** | `python/solver_pool.py` | Thread pool for multi-table concurrent solving |
+| **HUD interface** | `python/hud_solver.py` | High-level API for ACR HUD integration |
+| **LZMA compression** | `python/compression.py` | 20x compression for blueprint data |
+| **EC2 precompute** | `precompute/` | Batch solve + GPU/CPU deployment scripts |
 
 ## Quick Start
 
 ```bash
-# Build C solver
-make all
-
-# Run benchmarks
-make bench
-
-# Run unit tests
-python tests/test_end_to_end.py
-
-# Run integration tests (requires ACR HUD flop_solutions)
-python tests/test_integration.py
+make all          # build solver v2 + DLL
+make bench        # run benchmarks
+make test         # run Python tests
 ```
 
-## Performance (i7-13700K, single thread)
+## Performance (i7-13700K, single thread, solver v2, 500 iterations)
 
-| Hands | 500 iter | Exploitability | Use Case |
-|-------|----------|----------------|----------|
-| 20    | 15ms     | 0.000%         | Tiny range |
-| 40    | 38ms     | 0.000%         | Very narrow |
-| 60    | 109ms    | 0.009%         | River (narrow) |
-| 80    | 188ms    | 0.083%         | Turn (narrow) |
-| 100   | 306ms    | 0.360%         | Moderate |
-| 200   | 1,497ms  | 0.135%         | Full range |
+| Hands | River | Turn (w/ leaf eval) |
+|-------|-------|---------------------|
+| 40    | 35ms  | 48ms                |
+| 60    | 104ms | 117ms               |
+| 80    | 180ms | 203ms               |
+| 100   | 301ms | 324ms               |
 
-Concurrent: 3 tables solved in 36ms wall time.
+8 concurrent river solves: 103ms average, ~103ms wall time with threading.
 
-## EC2 Precompute
+## Pluribus Alignment
 
-```bash
-# Deploy to EC2 spot instances
-cd precompute
-./deploy.sh --all --workers 16
-
-# Or solve a single scenario locally
-python solve_scenarios.py --scenario CO_vs_BB_srp --workers 4
-```
+| Feature | Status |
+|---------|--------|
+| Linear CFR (DCFR α=1,β=1,γ=1) | ✅ Implemented |
+| Final iteration strategy | ✅ Implemented |
+| 4 continuation strategies at leaves | ✅ Implemented |
+| Bayesian range narrowing | ✅ Implemented |
+| Depth-limited to current street | ✅ Implemented |
+| Unsafe search (no gadget) | ✅ Matches Pluribus |
+| Subgame root at round start | ⬜ TODO |
+| Multiway solving (>2 players) | ⬜ TODO (heads-up only) |
 
 ## Status
 
-- [x] DCFR solver (C, O3-optimized)
-- [x] Hand evaluation (7-card, 21-combo)
-- [x] Precomputed hand strengths (213x speedup)
-- [x] Exploitability computation (best-response)
-- [x] Depth-limited leaf value support
-- [x] Python bindings (ctypes, auto-compile)
-- [x] Range narrowing (Bayesian, hero + villain)
-- [x] Blueprint I/O (suit isomorphism, lazy load)
-- [x] Solver pool (multi-table threading)
+- [x] Solver v2 (Linear CFR, final iteration, leaf values)
+- [x] Solver v1 (DCFR baseline, cross-validated)
+- [x] Hand evaluation + precomputed strengths
+- [x] Exploitability computation
+- [x] Python bindings + range parser
+- [x] Bayesian range narrowing (hero + villain)
+- [x] Blueprint I/O (JSON + LZMA, 20x compression)
+- [x] Multi-table solver pool
 - [x] HUD integration interface
 - [x] EC2 precompute pipeline
-- [x] Cross-validated against postflop-solver (Rust)
-- [ ] LZMA blueprint compression
-- [ ] CUDA GPU acceleration
+- [ ] CUDA GPU solver for fast precompute
 - [ ] Turn strategy precomputation
+- [ ] Subgame rooting at round start

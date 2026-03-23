@@ -4,5 +4,14 @@ build/
 *.so
 *.o
 *.obj
+*.pdb
+*.lib
+*.exp
 __pycache__/
 *.pyc
+*.lzma
+*.xz
+flop_solutions/
+.vscode/
+.idea/
+*.log

@@ -50,13 +50,12 @@ EC2 cost: ~$25 (4-8 × c5.4xlarge spot, 12-25 hours)
 - **Unsafe search**: No gadget game (mitigated by round-rooting + multi-strategy leaves)
 - **Iterations**: Time-budgeted, 200-500 per subgame
 
-## Performance Targets
+## Measured Performance (solver v2, i7-13700K, single thread, 500 iter)
 
-- River re-solve: <200ms
-- Turn re-solve: <400ms
-- Flop re-solve (when facing action): <300ms
-- 12 tables concurrent: <500ms per decision
-- All decisions under 10 seconds
+- River re-solve (80 hands): **180ms** (0.000% exploitability)
+- Turn re-solve (80 hands): **203ms** (precomp 5ms + leaf 97ms + DCFR 102ms)
+- 8 concurrent river solves: **103ms** wall time
+- All decisions under 500ms
 
 ## Known Gaps
 
