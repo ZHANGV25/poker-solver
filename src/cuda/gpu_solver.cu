@@ -182,9 +182,11 @@ __global__ void terminal_value_kernel(
 
     if (node->type == GPU_NODE_FOLD) {
         int winner = node->player;
+        int loser = 1 - winner;
+        float half_start = t->starting_pot * 0.5f;
         float payoff = (traverser == winner)
-            ? (float)node->bets[1 - winner]
-            : -(float)node->bets[traverser];
+            ? (half_start + (float)node->bets[loser])
+            : -(half_start + (float)node->bets[traverser]);
         float val = 0;
         for (int o = 0; o < n_opp; o++) {
             int oc0 = t->hands[opp][o][0], oc1 = t->hands[opp][o][1];
@@ -195,16 +197,15 @@ __global__ void terminal_value_kernel(
     }
     else if (node->type == GPU_NODE_SHOWDOWN) {
         uint32_t hs = t->strengths[traverser][hand];
-        float win_pay = (float)node->bets[opp];
-        float lose_pay = -(float)node->bets[traverser];
+        float half_pot = node->pot * 0.5f;
         float val = 0;
         for (int o = 0; o < n_opp; o++) {
             int oc0 = t->hands[opp][o][0], oc1 = t->hands[opp][o][1];
             if (hc0==oc0||hc0==oc1||hc1==oc0||hc1==oc1) continue;
             uint32_t os = t->strengths[opp][o];
             float w = node_reach[reach_base + o];
-            if (hs > os) val += w * win_pay;
-            else if (hs < os) val += w * lose_pay;
+            if (hs > os) val += w * half_pot;
+            else if (hs < os) val -= w * half_pot;
         }
         cfv[cfv_idx] = val;
     }

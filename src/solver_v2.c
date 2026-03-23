@@ -209,9 +209,20 @@ static void cfr_traverse(SolverV2 *s, int node_idx, int traverser,
         int winner = node->player;
         float *reach_opp = (traverser == 0) ? reach1 : reach0;
         int n_opp = s->num_hands[opp];
-        float payoff = (traverser == winner)
-            ? (float)node->bets[1 - winner]
-            : -(float)node->bets[traverser];
+        /* Fold payoff: winner gets the pot minus their contribution.
+         * Loser loses their contribution.
+         * Since pot = starting_pot + bets[0] + bets[1],
+         * winner's profit = pot - (starting_pot/2 + bets[winner])
+         *                 = starting_pot/2 + bets[loser]
+         * loser's loss = -(starting_pot/2 + bets[loser])
+         */
+        float half_start = s->starting_pot * 0.5f;
+        int loser = 1 - winner;
+        float payoff;
+        if (traverser == winner)
+            payoff = half_start + (float)node->bets[loser];
+        else
+            payoff = -(half_start + (float)node->bets[traverser]);
 
         for (int h = 0; h < n_trav; h++) {
             float opp_sum = 0;
@@ -229,8 +240,11 @@ static void cfr_traverse(SolverV2 *s, int node_idx, int traverser,
     if (node->type == NODE_V2_SHOWDOWN) {
         float *reach_opp = (traverser == 0) ? reach1 : reach0;
         int n_opp = s->num_hands[opp];
-        float win_pay = (float)node->bets[opp];
-        float lose_pay = -(float)node->bets[traverser];
+        /* Payoff: winner gets half the pot (profit), loser loses half.
+         * This correctly handles the starting pot + current street bets. */
+        float half_pot = node->pot * 0.5f;
+        float win_pay = half_pot;
+        float lose_pay = -half_pot;
 
         for (int h = 0; h < n_trav; h++) {
             int c0 = s->hands[traverser][h][0], c1 = s->hands[traverser][h][1];
@@ -400,9 +414,12 @@ static void best_response(SolverV2 *s, int node_idx, int br_player,
     if (node->type == NODE_V2_FOLD) {
         float *reach_opp = (br_player == 0) ? reach1 : reach0;
         int n_opp = s->num_hands[opp];
-        float payoff = (br_player == node->player)
-            ? (float)node->bets[1 - node->player]
-            : -(float)node->bets[br_player];
+        int winner = node->player;
+        int loser = 1 - winner;
+        float half_start = s->starting_pot * 0.5f;
+        float payoff = (br_player == winner)
+            ? (half_start + (float)node->bets[loser])
+            : -(half_start + (float)node->bets[br_player]);
         for (int h = 0; h < n_br; h++) {
             float os = 0;
             for (int o = 0; o < n_opp; o++)
@@ -416,6 +433,7 @@ static void best_response(SolverV2 *s, int node_idx, int br_player,
     if (node->type == NODE_V2_SHOWDOWN) {
         float *reach_opp = (br_player == 0) ? reach1 : reach0;
         int n_opp = s->num_hands[opp];
+        float half_pot = node->pot * 0.5f;
         for (int h = 0; h < n_br; h++) {
             float total = 0;
             uint32_t hs = s->hand_strengths[br_player][h];
@@ -424,8 +442,8 @@ static void best_response(SolverV2 *s, int node_idx, int br_player,
                                    s->hands[opp][o][0], s->hands[opp][o][1]))
                     continue;
                 uint32_t os = s->hand_strengths[opp][o];
-                if (hs > os) total += reach_opp[o] * (float)node->bets[opp];
-                else if (hs < os) total -= reach_opp[o] * (float)node->bets[br_player];
+                if (hs > os) total += reach_opp[o] * half_pot;
+                else if (hs < os) total -= reach_opp[o] * half_pot;
             }
             cfv_out[h] = total;
         }
