@@ -74,69 +74,87 @@ static void info_table_init(BPInfoTable *t, int table_size) {
     t->num_entries = 0;
 }
 
-/* Thread-safe find-or-create using CAS-like logic.
- * In practice, the occupied[] flag is set non-atomically (Hogwild).
- * Duplicate entries are harmless — they just waste a slot. */
+/* Lock-free find-or-create using atomic CAS on the occupied flag.
+ *
+ * occupied states: 0 = empty, 1 = ready, 2 = being initialized
+ *
+ * Protocol:
+ *   1. CAS(occupied[idx], 0 -> 2): we won the slot, initialize it
+ *   2. If occupied[idx] == 2: another thread is initializing, spin until 1
+ *   3. If occupied[idx] == 1: slot is ready, check if key matches
+ *
+ * This is fully lock-free for lookups (common case) and per-slot atomic
+ * for insertions (no global lock, no contention between different slots). */
 static int info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
                                       int num_actions, int num_hands) {
     uint64_t h = hash_combine(key.board_hash, key.action_hash);
     h = hash_combine(h, (uint64_t)key.player);
     int slot = (int)(h % (uint64_t)t->table_size);
 
-    for (int probe = 0; probe < 1024; probe++) {
+    for (int probe = 0; probe < 4096; probe++) {
         int idx = (slot + probe) % t->table_size;
-        if (t->occupied[idx]) {
-            /* Check if this is our key */
+        int state = __atomic_load_n(&t->occupied[idx], __ATOMIC_ACQUIRE);
+
+        if (state == 1) {
+            /* Slot is ready — check if it's our key */
             if (t->keys[idx].player == key.player &&
                 t->keys[idx].board_hash == key.board_hash &&
                 t->keys[idx].action_hash == key.action_hash) {
-                return idx;  /* Fast path: existing entry (lock-free) */
+                return idx;  /* Fast path: existing entry */
             }
-            continue; /* Collision, try next slot */
+            continue; /* Different key, probe next */
         }
-        /* Empty slot — need to create. Use critical section because
-         * calloc + multi-field init isn't atomic. The critical section
-         * only fires for NEW info sets (~once per set), not lookups. */
-        int created = 0;
-        #ifdef _OPENMP
-        #pragma omp critical(hash_insert)
-        #endif
-        {
-            if (!t->occupied[idx]) {
-                /* Double-check under lock */
+
+        if (state == 0) {
+            /* Empty slot — try to claim it via CAS(0 -> 2) */
+            int expected = 0;
+            if (__atomic_compare_exchange_n(&t->occupied[idx], &expected, 2,
+                                            0 /*strong*/, __ATOMIC_ACQ_REL,
+                                            __ATOMIC_ACQUIRE)) {
+                /* We won the slot. Initialize it. */
                 t->sets[idx].num_actions = num_actions;
                 t->sets[idx].num_hands = num_hands;
                 t->sets[idx].regrets = (int*)calloc(num_actions * num_hands, sizeof(int));
                 t->sets[idx].strategy_sum = NULL;
                 t->sets[idx].current_strategy = (float*)calloc(num_actions * num_hands, sizeof(float));
                 t->keys[idx] = key;
-                t->occupied[idx] = 1; /* Publish LAST (acts as release fence) */
-                t->num_entries++;
-                created = 1;
+                __atomic_fetch_add(&t->num_entries, 1, __ATOMIC_RELAXED);
+                /* Publish: set occupied to 1 (ready) with release semantics */
+                __atomic_store_n(&t->occupied[idx], 1, __ATOMIC_RELEASE);
+                return idx;
             }
+            /* CAS failed — another thread claimed this slot. Re-read state. */
+            state = __atomic_load_n(&t->occupied[idx], __ATOMIC_ACQUIRE);
         }
-        if (created) return idx;
-        /* Another thread created an entry here — check if it's ours */
-        if (t->keys[idx].player == key.player &&
-            t->keys[idx].board_hash == key.board_hash &&
-            t->keys[idx].action_hash == key.action_hash) {
-            return idx;
+
+        if (state == 2) {
+            /* Slot is being initialized by another thread. Spin briefly. */
+            int spins = 0;
+            while (__atomic_load_n(&t->occupied[idx], __ATOMIC_ACQUIRE) == 2) {
+                if (++spins > 10000) break; /* give up, try next slot */
+            }
+            if (__atomic_load_n(&t->occupied[idx], __ATOMIC_ACQUIRE) == 1) {
+                /* Now ready — check key */
+                if (t->keys[idx].player == key.player &&
+                    t->keys[idx].board_hash == key.board_hash &&
+                    t->keys[idx].action_hash == key.action_hash) {
+                    return idx;
+                }
+            }
+            continue; /* Different key or still initializing, probe next */
         }
-        /* Different key was inserted, continue probing */
     }
-    return -1;
+    return -1; /* Table full or probe limit reached */
 }
 
 /* Allocate strategy_sum for an info set (lazy, for round 1 only) */
 static void ensure_strategy_sum(BPInfoSet *is) {
-    if (is->strategy_sum == NULL) {
-        #ifdef _OPENMP
-        #pragma omp critical(strategy_sum_alloc)
-        #endif
-        {
-            if (is->strategy_sum == NULL) {
-                is->strategy_sum = (float*)calloc(is->num_actions * is->num_hands, sizeof(float));
-            }
+    if (__atomic_load_n((void**)&is->strategy_sum, __ATOMIC_ACQUIRE) == NULL) {
+        float *buf = (float*)calloc(is->num_actions * is->num_hands, sizeof(float));
+        float *expected = NULL;
+        if (!__atomic_compare_exchange_n(&is->strategy_sum, &expected, buf,
+                                          0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            free(buf); /* Another thread beat us — discard our allocation */
         }
     }
 }
