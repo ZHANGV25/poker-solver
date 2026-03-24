@@ -170,8 +170,8 @@ aws s3 sync s3://$S3_BUCKET/code/ \$WORKDIR/ --quiet
 
 # Compile for Linux
 echo "Compiling..."
-gcc -O2 -shared -fopenmp -o build/mccfr_blueprint.so src/mccfr_blueprint.c -I src -lm -lpthread
-gcc -O2 -shared -o build/card_abstraction.so src/card_abstraction.c -I src -lm
+gcc -O2 -fPIC -shared -fopenmp -o build/mccfr_blueprint.so src/mccfr_blueprint.c -I src -lm -lpthread
+gcc -O2 -fPIC -shared -o build/card_abstraction.so src/card_abstraction.c -I src -lm
 echo "Compilation complete."
 
 # Run worker

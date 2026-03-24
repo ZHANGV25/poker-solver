@@ -85,29 +85,44 @@ static int info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
 
     for (int probe = 0; probe < 1024; probe++) {
         int idx = (slot + probe) % t->table_size;
-        if (!t->occupied[idx]) {
-            /* Create new entry (lazy allocation) */
-            t->occupied[idx] = 1;
-            t->keys[idx] = key;
-            t->sets[idx].num_actions = num_actions;
-            t->sets[idx].num_hands = num_hands;
-            /* Integer regrets */
-            t->sets[idx].regrets = (int*)calloc(num_actions * num_hands, sizeof(int));
-            /* strategy_sum: only allocate for round 1, NULL otherwise */
-            t->sets[idx].strategy_sum = NULL;
-            /* current_strategy: transient, allocated per-thread or shared */
-            t->sets[idx].current_strategy = (float*)calloc(num_actions * num_hands, sizeof(float));
-            #ifdef _OPENMP
-            #pragma omp atomic
-            #endif
-            t->num_entries++;
-            return idx;
+        if (t->occupied[idx]) {
+            /* Check if this is our key */
+            if (t->keys[idx].player == key.player &&
+                t->keys[idx].board_hash == key.board_hash &&
+                t->keys[idx].action_hash == key.action_hash) {
+                return idx;  /* Fast path: existing entry (lock-free) */
+            }
+            continue; /* Collision, try next slot */
         }
+        /* Empty slot — need to create. Use critical section because
+         * calloc + multi-field init isn't atomic. The critical section
+         * only fires for NEW info sets (~once per set), not lookups. */
+        int created = 0;
+        #ifdef _OPENMP
+        #pragma omp critical(hash_insert)
+        #endif
+        {
+            if (!t->occupied[idx]) {
+                /* Double-check under lock */
+                t->sets[idx].num_actions = num_actions;
+                t->sets[idx].num_hands = num_hands;
+                t->sets[idx].regrets = (int*)calloc(num_actions * num_hands, sizeof(int));
+                t->sets[idx].strategy_sum = NULL;
+                t->sets[idx].current_strategy = (float*)calloc(num_actions * num_hands, sizeof(float));
+                t->keys[idx] = key;
+                t->occupied[idx] = 1; /* Publish LAST (acts as release fence) */
+                t->num_entries++;
+                created = 1;
+            }
+        }
+        if (created) return idx;
+        /* Another thread created an entry here — check if it's ours */
         if (t->keys[idx].player == key.player &&
             t->keys[idx].board_hash == key.board_hash &&
             t->keys[idx].action_hash == key.action_hash) {
             return idx;
         }
+        /* Different key was inserted, continue probing */
     }
     return -1;
 }
@@ -115,7 +130,14 @@ static int info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
 /* Allocate strategy_sum for an info set (lazy, for round 1 only) */
 static void ensure_strategy_sum(BPInfoSet *is) {
     if (is->strategy_sum == NULL) {
-        is->strategy_sum = (float*)calloc(is->num_actions * is->num_hands, sizeof(float));
+        #ifdef _OPENMP
+        #pragma omp critical(strategy_sum_alloc)
+        #endif
+        {
+            if (is->strategy_sum == NULL) {
+                is->strategy_sum = (float*)calloc(is->num_actions * is->num_hands, sizeof(float));
+            }
+        }
     }
 }
 
