@@ -92,6 +92,22 @@ typedef struct {
 
     /* Per-hand EV at root */
     float *root_ev;           /* [2][num_hands] */
+
+    /* ── Extended output for precompute (Pluribus blueprint extraction) ── */
+
+    /* Weighted average strategies at ALL decision nodes.
+     * all_avg_strategies[node_idx * FS_MAX_ACTIONS * max_hands + a * max_hands + h]
+     * Only allocated when fs_solve_gpu is called with extract_all=1. */
+    float *all_avg_strategies;  /* [num_nodes * FS_MAX_ACTIONS * max_hands] */
+    float *all_cfv;             /* [num_nodes * max_hands] per-hand CFV at each node */
+    int max_hands;              /* max(num_hands[0], num_hands[1]) */
+
+    /* Turn root identification.
+     * turn_root_indices[i] = node index of the i-th turn root.
+     * turn_root_cards[i]   = which card was dealt (0-51). */
+    int *turn_root_indices;
+    int *turn_root_cards;
+    int num_turn_roots;
 } FSOutput;
 
 /* ── Host API ─────────────────────────────────────────────────────────── */
@@ -142,6 +158,22 @@ FS_EXPORT void fs_free_tree(FSTreeData *tree_data);
  * Free output data.
  */
 FS_EXPORT void fs_free_output(FSOutput *output);
+
+/**
+ * Solve with full strategy extraction for precompute.
+ *
+ * Like fs_solve_gpu() but also extracts:
+ *   - Weighted average strategies at all decision nodes
+ *   - Per-hand CFV at all nodes
+ *   - Turn root node identification
+ *
+ * Used by the precompute pipeline to generate blueprint data.
+ */
+FS_EXPORT int fs_solve_gpu_extract_all(
+    FSTreeData *tree_data,
+    int max_iterations,
+    FSOutput *output
+);
 
 #ifdef __cplusplus
 }

@@ -1,63 +1,79 @@
-# Poker Solver v2 Architecture
+# Poker Solver Architecture — Pluribus Implementation
 
-## Goal
-Real-time depth-limited subgame solving for 6-max NLHE cash games.
-Pluribus-inspired with Bayesian range narrowing at every street.
+## Overview
+
+Full Pluribus architecture for 6-max NLHE: N-player street-by-street GPU
+solving with precomputed blueprint strategies from N-player MCCFR.
+
+## Components
+
+### Runtime (GPU, <300ms per decision)
+**`street_solve.cu`** — N-player single-street GPU solver
+- 2-6 player subgame solving in one betting round
+- Level-batched Linear CFR, regret-based pruning
+- External leaf values from blueprint continuation strategies
+- 4 continuation strategies per player at depth-limit leaves
+- Extracts final-iteration strategy (play) + weighted average (narrowing)
+
+### Blueprint Training (CPU, EC2)
+**`mccfr_blueprint.c`** — N-player external-sampling MCCFR
+- Full flop→turn→river traversal with sampled chance/opponent actions
+- Linear CFR discounting (DCFR α=β=γ=1)
+- Hash table info set storage (~4M slots)
+- Designed for parallel execution across CPU cores
+
+### Python Layer
+- **`hud_solver.py`** — Street-by-street decision pipeline for ACR HUD
+- **`street_solver_gpu.py`** — ctypes wrapper for street_solve.dll
+- **`leaf_values.py`** — Continuation values from blueprint (4 biased strategies)
+- **`blueprint_store.py`** — Binary storage format (LZMA compressed)
+- **`range_narrowing.py`** — Bayesian range tracking (weighted average)
+- **`off_tree.py`** — Pseudoharmonic interpolation for off-tree bets
 
 ## Decision Pipeline
 
 ```
-PREFLOP:  Scenario selection from ranges.json → starting ranges (instant)
+PREFLOP:  Load ranges from ranges.json → starting ranges
 
-FLOP (first to act):
-  Blueprint lookup — exact per-texture, no abstraction. (instant)
-  Narrow both ranges using blueprint P(action|hand).
-
-FLOP (facing action):
-  Narrow villain range using blueprint P(action|hand).
-  Re-solve with narrowed ranges + 4 continuation strategies at leaves.
-  (~268ms measured)
+FLOP:
+  First action → blueprint lookup (instant)
+  Facing action → narrow villain range, GPU re-solve with turn leaf values
 
 TURN:
-  Narrow both ranges from flop actions.
-  Compute river blueprint on-the-fly for this turn card (~200ms).
-  Re-solve with narrowed ranges + 4 continuation strategies.
-  (~400ms total)
+  Narrow ranges from flop actions
+  GPU re-solve with river equity leaf values
 
 RIVER:
-  Narrow both ranges from flop + turn actions.
-  Re-solve with narrowed ranges to showdown.
-  (~186ms)
+  Narrow ranges from turn actions
+  GPU re-solve to showdown (no depth limit)
 ```
-
-## Precomputed Data (EC2)
-
-For each of 27 scenarios × 1,755 flop textures:
-- **Flop root**: P(action|hand) for ~300 hands × 2 players × ~4 actions
-- **Turn roots**: 47 turn cards × P(action|hand) for ~280 hands × 2 players
-
-Storage: ~20 GB raw → ~1 GB LZMA compressed
-EC2 cost: ~$25 (4-8 × c5.4xlarge spot, 12-25 hours)
 
 ## Solver Configuration (matching Pluribus)
 
-- **Algorithm**: Linear CFR = DCFR(alpha=1, beta=1, gamma=1)
-- **Strategy selection**: Final iteration (not average)
-- **Subgame root**: Start of current betting round
-- **Search depth**: End of current betting round
-- **Leaf evaluation**: 4 continuation strategies (unmodified, fold×5, call×5, raise×5)
-  evaluated against current narrowed ranges
-- **Unsafe search**: No gadget game (mitigated by round-rooting + multi-strategy leaves)
-- **Iterations**: Time-budgeted, 200-500 per subgame
+| Setting | Value |
+|---------|-------|
+| Algorithm | Linear CFR (DCFR α=β=γ=1) |
+| Strategy for play | Final iteration |
+| Strategy for narrowing | Weighted average |
+| Bet sizes | [33%, 75%, 150%, all-in] |
+| Max raises | 3 per street |
+| Iterations | 200 per subgame |
+| Leaf evaluation | 4 continuation strategies per remaining player |
+| Off-tree mapping | Pseudoharmonic (Johanson 2013) |
+| Pruning | Regret threshold -10000 (skip 95% of iterations) |
 
-## Measured Performance (solver v2, i7-13700K, single thread, 500 iter)
+## Performance (RTX 3060, 200 hands, 200 iterations)
 
-- River re-solve (80 hands): **180ms** (0.000% exploitability)
-- Turn re-solve (80 hands): **203ms** (precomp 5ms + leaf 97ms + DCFR 102ms)
-- 8 concurrent river solves: **103ms** wall time
-- All decisions under 500ms
+| Street | Time | Nodes |
+|--------|------|-------|
+| River | 67ms | 159 |
+| Flop (cont strats) | 236ms | 1219 |
+| Turn (cont strats) | 269ms | 1219 |
+| 3-player river | 141ms | 1156 |
 
-## Known Gaps
+## Storage Estimates
 
-- Multiway pots: heads-up only. Heuristic adjustment for multiway (v2: real multiplayer solver).
-- Off-tree bet sizes: map to nearest blueprint size for narrowing.
+| Config | Raw | Compressed |
+|--------|-----|------------|
+| 2-player, 27 scenarios | ~1.5 GB | ~200 MB |
+| 6-player, 27 scenarios | ~47 GB | ~6 GB |

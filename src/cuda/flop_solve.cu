@@ -1279,8 +1279,304 @@ extern "C" FS_EXPORT void fs_free_tree(FSTreeData *td) {
     memset(td, 0, sizeof(FSTreeData));
 }
 
+extern "C" FS_EXPORT int fs_solve_gpu_extract_all(
+    FSTreeData *td, int max_iterations, FSOutput *output
+) {
+    /* Run the normal solver first */
+    int rc = fs_solve_gpu(td, max_iterations, output);
+    if (rc != 0) return rc;
+
+    /* The normal solver already freed GPU memory by this point.
+     * We need to re-solve to get the full strategy_sum and cfv arrays.
+     * Instead, let's do a second solve pass that keeps the data. */
+
+    /* Actually: modify approach — re-solve and extract everything.
+     * For efficiency, we'll do a simpler extraction:
+     * Re-run the solver and keep d_strategy_sum + d_cfv on host. */
+
+    int N = td->num_nodes;
+    int nh0 = td->num_hands[0], nh1 = td->num_hands[1];
+    int max_h = nh0 > nh1 ? nh0 : nh1;
+    output->max_hands = max_h;
+
+    /* ── Re-solve to extract all data ────────── */
+    /* (This duplicates some of fs_solve_gpu but keeps the arrays) */
+
+    FSNode *d_nodes;
+    int *d_children, *d_hands, *d_showdown_idx;
+    float *d_regrets, *d_strategy, *d_strategy_sum, *d_cfv, *d_reach;
+    float *d_weights;
+    uint32_t *d_strengths;
+
+    size_t node_sz = N * sizeof(FSNode);
+    size_t child_sz = td->num_children_total * sizeof(int);
+    size_t state_sz = (size_t)N * FS_MAX_ACTIONS * max_h * sizeof(float);
+    size_t cfv_sz = (size_t)N * max_h * sizeof(float);
+    size_t hands_sz = 2 * FS_MAX_HANDS * 2 * sizeof(int);
+    size_t weights_sz = 2 * FS_MAX_HANDS * sizeof(float);
+    size_t strength_sz = (size_t)td->num_showdown_nodes * 2 * FS_MAX_HANDS * sizeof(uint32_t);
+
+    cudaMalloc(&d_nodes, node_sz);
+    cudaMalloc(&d_children, child_sz);
+    cudaMalloc(&d_hands, hands_sz);
+    cudaMalloc(&d_weights, weights_sz);
+    cudaMalloc(&d_regrets, state_sz);
+    cudaMalloc(&d_strategy, state_sz);
+    cudaMalloc(&d_strategy_sum, state_sz);
+    cudaMalloc(&d_cfv, cfv_sz);
+    cudaMalloc(&d_reach, cfv_sz);
+    cudaMalloc(&d_showdown_idx, td->num_showdown_nodes * sizeof(int));
+    cudaMalloc(&d_strengths, strength_sz);
+
+    int *h_hands = (int*)calloc(2 * FS_MAX_HANDS * 2, sizeof(int));
+    float *h_weights = (float*)calloc(2 * FS_MAX_HANDS, sizeof(float));
+    for (int p = 0; p < 2; p++) {
+        for (int h = 0; h < td->num_hands[p]; h++) {
+            h_hands[(p * FS_MAX_HANDS + h) * 2] = td->hands[p][h][0];
+            h_hands[(p * FS_MAX_HANDS + h) * 2 + 1] = td->hands[p][h][1];
+            h_weights[p * FS_MAX_HANDS + h] = td->weights[p][h];
+        }
+    }
+
+    cudaMemcpy(d_nodes, td->nodes, node_sz, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_children, td->children, child_sz, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_hands, h_hands, hands_sz, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weights, h_weights, weights_sz, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_showdown_idx, td->showdown_node_indices,
+               td->num_showdown_nodes * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemset(d_regrets, 0, state_sz);
+    cudaMemset(d_strategy, 0, state_sz);
+    cudaMemset(d_strategy_sum, 0, state_sz);
+
+    /* Precompute strengths */
+    if (td->num_showdown_nodes > 0) {
+        fs_precompute_strengths<<<td->num_showdown_nodes, FS_MAX_HANDS>>>(
+            d_nodes, d_showdown_idx, td->num_showdown_nodes,
+            d_hands, nh0, nh1, d_strengths);
+        cudaDeviceSynchronize();
+    }
+
+    int *sd_local = (int*)calloc(N, sizeof(int));
+    for (int i = 0; i < td->num_showdown_nodes; i++)
+        sd_local[td->showdown_node_indices[i]] = i;
+
+    /* Build level groups */
+    int **level_nodes = (int**)calloc(td->max_depth + 1, sizeof(int*));
+    int *level_counts = (int*)calloc(td->max_depth + 1, sizeof(int));
+    int *level_caps = (int*)calloc(td->max_depth + 1, sizeof(int));
+    for (int i = 0; i < N; i++) {
+        int d = td->node_depth[i];
+        if (level_counts[d] >= level_caps[d]) {
+            level_caps[d] = level_caps[d] ? level_caps[d] * 2 : 256;
+            level_nodes[d] = (int*)realloc(level_nodes[d], level_caps[d] * sizeof(int));
+        }
+        level_nodes[d][level_counts[d]++] = i;
+    }
+
+    int **d_level_nodes = (int**)malloc((td->max_depth + 1) * sizeof(int*));
+    for (int d = 0; d <= td->max_depth; d++) {
+        if (level_counts[d] > 0) {
+            cudaMalloc(&d_level_nodes[d], level_counts[d] * sizeof(int));
+            cudaMemcpy(d_level_nodes[d], level_nodes[d],
+                       level_counts[d] * sizeof(int), cudaMemcpyHostToDevice);
+        } else {
+            d_level_nodes[d] = NULL;
+        }
+    }
+
+    int *d_sd_local;
+    cudaMalloc(&d_sd_local, N * sizeof(int));
+    cudaMemcpy(d_sd_local, sd_local, N * sizeof(int), cudaMemcpyHostToDevice);
+
+    int starting_pot = td->nodes[0].pot;
+
+    int *d_dec_nodes;
+    cudaMalloc(&d_dec_nodes, td->num_decision_nodes * sizeof(int));
+    cudaMemcpy(d_dec_nodes, td->decision_node_indices,
+               td->num_decision_nodes * sizeof(int), cudaMemcpyHostToDevice);
+
+    int *h_fold_nodes = (int*)malloc(N * sizeof(int));
+    int *h_sd_nodes = (int*)malloc(N * sizeof(int));
+    int num_folds = 0, num_sds = 0;
+    for (int i = 0; i < N; i++) {
+        if (td->nodes[i].type == FS_NODE_FOLD) h_fold_nodes[num_folds++] = i;
+        if (td->nodes[i].type == FS_NODE_SHOWDOWN) h_sd_nodes[num_sds++] = i;
+    }
+    int *d_fold_nodes, *d_sd_nodes_list;
+    cudaMalloc(&d_fold_nodes, (num_folds + 1) * sizeof(int));
+    cudaMalloc(&d_sd_nodes_list, (num_sds + 1) * sizeof(int));
+    cudaMemcpy(d_fold_nodes, h_fold_nodes, num_folds * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_sd_nodes_list, h_sd_nodes, num_sds * sizeof(int), cudaMemcpyHostToDevice);
+
+    float *d_opp_weights[2];
+    for (int t = 0; t < 2; t++) {
+        int opp = 1 - t;
+        int n_opp = (opp == 0) ? nh0 : nh1;
+        cudaMalloc(&d_opp_weights[t], n_opp * sizeof(float));
+        cudaMemcpy(d_opp_weights[t], h_weights + opp * FS_MAX_HANDS,
+                   n_opp * sizeof(float), cudaMemcpyHostToDevice);
+    }
+
+    int *d_iter;
+    cudaMalloc(&d_iter, sizeof(int));
+
+    int block_size = 128;
+    if (max_h > 128) block_size = ((max_h + 31) / 32) * 32;
+
+    /* CUDA graph capture for extraction pass */
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+    cudaGraph_t graph = NULL;
+    cudaGraphExec_t graph_exec = NULL;
+
+    {
+        int iter_val = 1;
+        cudaMemcpy(d_iter, &iter_val, sizeof(int), cudaMemcpyHostToDevice);
+        cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+
+        for (int trav = 0; trav < 2; trav++) {
+            int opp = 1 - trav;
+            fs_batch_regret_match<<<td->num_decision_nodes, block_size, 0, stream>>>(
+                d_nodes, d_dec_nodes, td->num_decision_nodes,
+                d_regrets, d_strategy, max_h, nh0, nh1);
+
+            cudaMemsetAsync(d_reach, 0, cfv_sz, stream);
+            cudaMemcpyAsync(d_reach, d_opp_weights[trav],
+                            ((opp == 0) ? nh0 : nh1) * sizeof(float),
+                            cudaMemcpyDeviceToDevice, stream);
+
+            for (int d = 0; d <= td->max_depth; d++) {
+                if (level_counts[d] > 0) {
+                    fs_batch_propagate_reach<<<level_counts[d], block_size, 0, stream>>>(
+                        d_nodes, d_children, d_level_nodes[d], level_counts[d],
+                        d_reach, d_strategy, opp, max_h, nh0, nh1);
+                }
+            }
+
+            cudaMemsetAsync(d_cfv, 0, cfv_sz, stream);
+            if (num_folds > 0)
+                fs_batch_fold_value<<<num_folds, block_size, 0, stream>>>(
+                    d_nodes, d_fold_nodes, num_folds,
+                    d_cfv, d_reach, trav, max_h, nh0, nh1, d_hands, starting_pot);
+            if (num_sds > 0)
+                fs_batch_showdown_value<<<num_sds, block_size, 0, stream>>>(
+                    d_nodes, d_sd_nodes_list, num_sds,
+                    d_cfv, d_reach, trav, max_h, nh0, nh1,
+                    d_hands, d_strengths, d_sd_local, (int*)NULL);
+
+            for (int d = td->max_depth; d >= 0; d--) {
+                if (level_counts[d] > 0) {
+                    fs_batch_propagate_cfv<<<level_counts[d], block_size, 0, stream>>>(
+                        d_nodes, d_children, d_level_nodes[d], level_counts[d],
+                        d_cfv, d_regrets, d_strategy_sum, d_strategy,
+                        trav, max_h, nh0, nh1, d_iter);
+                }
+            }
+        }
+
+        cudaStreamEndCapture(stream, &graph);
+        cudaGraphInstantiate(&graph_exec, graph, NULL, NULL, 0);
+    }
+
+    printf("[FS-ExtractAll] Running %d iterations for extraction...\n", max_iterations);
+    for (int iter = 1; iter <= max_iterations; iter++) {
+        cudaMemcpy(d_iter, &iter, sizeof(int), cudaMemcpyHostToDevice);
+        cudaGraphLaunch(graph_exec, stream);
+        cudaStreamSynchronize(stream);
+    }
+
+    cudaGraphExecDestroy(graph_exec);
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(stream);
+
+    /* Download strategy_sum and cfv for ALL nodes */
+    output->all_avg_strategies = (float*)malloc(state_sz);
+    output->all_cfv = (float*)malloc(cfv_sz);
+    cudaMemcpy(output->all_avg_strategies, d_strategy_sum, state_sz, cudaMemcpyDeviceToHost);
+    cudaMemcpy(output->all_cfv, d_cfv, cfv_sz, cudaMemcpyDeviceToHost);
+
+    /* Normalize strategy_sum to get weighted average at each decision node */
+    for (int di = 0; di < td->num_decision_nodes; di++) {
+        int nidx = td->decision_node_indices[di];
+        int player = td->nodes[nidx].player;
+        int nh = (player == 0) ? nh0 : nh1;
+        int na = td->nodes[nidx].num_children;
+        for (int h = 0; h < nh; h++) {
+            float sum = 0;
+            for (int a = 0; a < na; a++) {
+                float v = output->all_avg_strategies[nidx * FS_MAX_ACTIONS * max_h + a * max_h + h];
+                if (v < 0) v = 0;
+                sum += v;
+            }
+            if (sum > 0) {
+                float inv = 1.0f / sum;
+                for (int a = 0; a < na; a++) {
+                    float v = output->all_avg_strategies[nidx * FS_MAX_ACTIONS * max_h + a * max_h + h];
+                    output->all_avg_strategies[nidx * FS_MAX_ACTIONS * max_h + a * max_h + h] =
+                        (v > 0) ? (v * inv) : 0;
+                }
+            } else {
+                float u = 1.0f / na;
+                for (int a = 0; a < na; a++)
+                    output->all_avg_strategies[nidx * FS_MAX_ACTIONS * max_h + a * max_h + h] = u;
+            }
+        }
+    }
+
+    /* Identify turn root nodes.
+     * A turn root is the first FS_NODE_DECISION child under each flop-end chance node.
+     * Flop-end chance nodes have num_board==3 and type==FS_NODE_CHANCE. */
+    int *turn_roots = (int*)malloc(52 * sizeof(int));
+    int *turn_cards = (int*)malloc(52 * sizeof(int));
+    int num_turn_roots = 0;
+
+    for (int i = 0; i < N; i++) {
+        if (td->nodes[i].type != FS_NODE_CHANCE) continue;
+        if (td->nodes[i].num_board != 3) continue;  /* only flop-end chance nodes */
+
+        /* Each child of this chance node is a turn subtree root */
+        for (int ci = 0; ci < td->nodes[i].num_children; ci++) {
+            int child = td->children[td->nodes[i].first_child + ci];
+            if (td->nodes[child].type == FS_NODE_DECISION) {
+                turn_roots[num_turn_roots] = child;
+                turn_cards[num_turn_roots] = td->nodes[child].board_cards[3]; /* the turn card */
+                num_turn_roots++;
+            }
+        }
+    }
+
+    output->turn_root_indices = turn_roots;
+    output->turn_root_cards = turn_cards;
+    output->num_turn_roots = num_turn_roots;
+
+    printf("[FS-ExtractAll] Found %d turn roots\n", num_turn_roots);
+
+    /* Cleanup GPU */
+    free(h_hands); free(h_weights); free(sd_local);
+    free(h_fold_nodes); free(h_sd_nodes);
+    for (int d = 0; d <= td->max_depth; d++) {
+        if (d_level_nodes[d]) cudaFree(d_level_nodes[d]);
+        if (level_nodes[d]) free(level_nodes[d]);
+    }
+    free(d_level_nodes); free(level_nodes); free(level_counts); free(level_caps);
+    cudaFree(d_nodes); cudaFree(d_children); cudaFree(d_hands);
+    cudaFree(d_weights); cudaFree(d_regrets); cudaFree(d_strategy);
+    cudaFree(d_strategy_sum); cudaFree(d_cfv); cudaFree(d_reach);
+    cudaFree(d_showdown_idx); cudaFree(d_strengths);
+    cudaFree(d_sd_local); cudaFree(d_dec_nodes);
+    cudaFree(d_fold_nodes); cudaFree(d_sd_nodes_list);
+    cudaFree(d_opp_weights[0]); cudaFree(d_opp_weights[1]);
+    cudaFree(d_iter);
+
+    return 0;
+}
+
 extern "C" FS_EXPORT void fs_free_output(FSOutput *out) {
     if (out->root_strategy) free(out->root_strategy);
     if (out->root_ev) free(out->root_ev);
+    if (out->all_avg_strategies) free(out->all_avg_strategies);
+    if (out->all_cfv) free(out->all_cfv);
+    if (out->turn_root_indices) free(out->turn_root_indices);
+    if (out->turn_root_cards) free(out->turn_root_cards);
     memset(out, 0, sizeof(FSOutput));
 }
