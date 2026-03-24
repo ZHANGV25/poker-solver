@@ -152,7 +152,7 @@ def solve_texture(bp_lib, ca_lib, texture_key, board_strs, num_players,
     config = BPConfig()
     bp_lib.bp_default_config(ctypes.byref(config))
     config.num_threads = num_threads
-    config.hash_table_size = (1 << 22)  # 4M slots
+    config.hash_table_size = 0  # 0 = auto (MEDIUM for 3+ players, SMALL for 2)
     config.discount_stop_iter = max(iterations * 35 // 1000, 1000)
     config.discount_interval = max(config.discount_stop_iter // 40, 100)
     config.prune_start_iter = max(iterations * 17 // 1000, 500)

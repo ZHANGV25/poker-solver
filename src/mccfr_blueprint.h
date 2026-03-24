@@ -31,13 +31,14 @@
 #define BP_MAX_ACTIONS    8
 #define BP_MAX_BOARD      5
 
-/* Hash table: must be large enough for ~400M info sets.
- * We use 2^29 = 536M slots. At ~70% load = ~375M info sets.
- * Memory: 536M * (key=20 + set=16 + occupied=4) = ~21.4GB for metadata.
- * Regret arrays are lazily allocated on top of that.
- * For smaller runs, use BP_HASH_SIZE_SMALL. */
-#define BP_HASH_SIZE_LARGE (1 << 29)   /* 536M slots (~21GB metadata) */
-#define BP_HASH_SIZE_SMALL (1 << 22)   /* 4M slots (~160MB metadata) */
+/* Hash table sizing.
+ * Per-texture: ~5-50M info sets depending on player count and bet sizes.
+ * BP_HASH_SIZE_MEDIUM (64M slots) fits ~45M info sets at 70% load.
+ * Memory: 64M * (key=20 + set=16 + occupied=4) = ~2.5GB metadata.
+ * For small test runs, use BP_HASH_SIZE_SMALL. */
+#define BP_HASH_SIZE_LARGE  (1 << 29)   /* 536M slots (~21GB metadata) — full Pluribus */
+#define BP_HASH_SIZE_MEDIUM (1 << 26)   /* 64M slots (~2.5GB metadata) — per-texture */
+#define BP_HASH_SIZE_SMALL  (1 << 22)   /* 4M slots (~160MB metadata) — testing only */
 
 /* Pluribus-matched constants */
 #define BP_REGRET_FLOOR      (-310000000)   /* minimum regret per action */

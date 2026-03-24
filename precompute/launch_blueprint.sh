@@ -176,6 +176,7 @@ echo "Compilation complete."
 
 # Run worker
 echo "Starting solve..."
+export OMP_STACKSIZE=16m
 python3 precompute/blueprint_worker.py \
     --worker-id $worker_id \
     --total-workers $NUM_INSTANCES \

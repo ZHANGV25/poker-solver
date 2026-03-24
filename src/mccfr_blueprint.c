@@ -652,7 +652,7 @@ int bp_init_ex(BPSolver *s, int num_players,
     /* Hash table */
     int ht_size = config->hash_table_size;
     if (ht_size <= 0)
-        ht_size = (num_players > 2) ? BP_HASH_SIZE_LARGE : BP_HASH_SIZE_SMALL;
+        ht_size = (num_players > 2) ? BP_HASH_SIZE_MEDIUM : BP_HASH_SIZE_SMALL;
     info_table_init(&s->info_table, ht_size);
 
     /* RNG states — one per thread */
@@ -692,7 +692,13 @@ int bp_solve(BPSolver *s, int max_iterations) {
 
     int nt = s->num_rng_states;
     #ifdef _OPENMP
-    if (nt > 1) omp_set_num_threads(nt);
+    if (nt > 1) {
+        omp_set_num_threads(nt);
+        /* NOTE: traverse() is deeply recursive (~50+ levels, ~400-byte frames).
+         * Requires OMP_STACKSIZE=16m or GOMP_STACKSIZE=16384 env var.
+         * Set this BEFORE running the program, e.g.:
+         *   export OMP_STACKSIZE=16m */
+    }
     #endif
 
     printf("[BP] Starting %d-player MCCFR: %d iterations, %d threads, "

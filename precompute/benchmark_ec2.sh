@@ -123,6 +123,7 @@ gcc -O2 -fPIC -shared -fopenmp -o build/mccfr_blueprint.so src/mccfr_blueprint.c
 gcc -O2 -fPIC -shared -o build/card_abstraction.so src/card_abstraction.c -I src -lm
 echo "Compiled."
 
+export OMP_STACKSIZE=16m
 python3 precompute/benchmark_run.py
 
 aws s3 sync /tmp/benchmark_output/ s3://$S3_BUCKET/benchmark/ --quiet
