@@ -1,11 +1,13 @@
 /**
- * solver_v2.c — Pluribus-style depth-limited DCFR solver
+ * solver_v2.c — Pluribus-style multi-street solver
  *
- * Linear CFR with:
- *   - Final iteration strategy selection
- *   - 4 continuation strategies at leaf nodes
- *   - Precomputed river strengths for O(1) leaf evaluation
- *   - Zero-allocation hot loop
+ * Multi-street architecture:
+ *   - Each street has its own betting tree
+ *   - At CHANCE nodes (end of non-river betting), the solver iterates
+ *     over all possible next cards and recurses into the next street
+ *   - Info sets for sub-streets persist across iterations via indexed arrays
+ *   - Hand strengths computed on-the-fly at showdown for each 5-card board
+ *   - Linear CFR: regrets *= t/(t+1), strategy_sum weighted by t
  */
 
 #include "solver_v2.h"
@@ -21,57 +23,91 @@ static inline int cards_conflict(int a0, int a1, int b0, int b1) {
     return (a0 == b0 || a0 == b1 || a1 == b0 || a1 == b1);
 }
 
-/* ── Tree construction ─────────────────────────────────────────────────── */
+static inline int card_in_set(int card, const int *set, int n) {
+    for (int i = 0; i < n; i++)
+        if (set[i] == card) return 1;
+    return 0;
+}
 
-static int add_node(SolverV2 *s, int type, int player, int pot,
-                    int bet0, int bet1) {
-    int idx = s->num_nodes++;
-    if (idx % 1024 == 0) {
-        s->nodes = realloc(s->nodes, (idx + 1024) * sizeof(NodeV2));
+/* ── Street tree: node allocation ─────────────────────────────────────── */
+
+static void st_init(StreetTree *st) {
+    memset(st, 0, sizeof(StreetTree));
+    st->nodes_capacity = 64;
+    st->nodes = malloc(st->nodes_capacity * sizeof(NodeV2));
+}
+
+static int st_alloc(StreetTree *st) {
+    int idx = st->num_nodes++;
+    if (idx >= st->nodes_capacity) {
+        st->nodes_capacity *= 2;
+        st->nodes = realloc(st->nodes, st->nodes_capacity * sizeof(NodeV2));
     }
-    NodeV2 *n = &s->nodes[idx];
-    memset(n, 0, sizeof(NodeV2));
-    n->type = type;
-    n->player = player;
-    n->pot = pot;
-    n->bets[0] = bet0;
-    n->bets[1] = bet1;
+    memset(&st->nodes[idx], 0, sizeof(NodeV2));
+    st->nodes[idx].player = -1;
     return idx;
 }
 
-static void add_child(SolverV2 *s, int parent, int child) {
-    NodeV2 *n = &s->nodes[parent];
-    if (n->num_actions < MAX_ACTIONS_V2) {
-        n->children[n->num_actions++] = child;
-    }
+static int st_add(StreetTree *st, int type, int player, int pot, int b0, int b1) {
+    int idx = st_alloc(st);
+    st->nodes[idx].type = type;
+    st->nodes[idx].player = player;
+    st->nodes[idx].pot = pot;
+    st->nodes[idx].bets[0] = b0;
+    st->nodes[idx].bets[1] = b1;
+    return idx;
 }
 
-static int build_tree(SolverV2 *s, int player, int pot, int stack,
-                      int bet0, int bet1, int num_raises, int actions_taken) {
+static void st_add_child(StreetTree *st, int parent, int child) {
+    NodeV2 *n = &st->nodes[parent];
+    if (n->num_actions < MAX_ACTIONS_V2)
+        n->children[n->num_actions++] = child;
+}
+
+static void st_free(StreetTree *st) {
+    if (st->nodes) free(st->nodes);
+    if (st->info_sets) {
+        for (int i = 0; i < st->info_sets_capacity; i++) {
+            if (st->info_sets[i].regrets) free(st->info_sets[i].regrets);
+            if (st->info_sets[i].strategy_sum) free(st->info_sets[i].strategy_sum);
+            if (st->info_sets[i].current_strategy) free(st->info_sets[i].current_strategy);
+        }
+        free(st->info_sets);
+    }
+    memset(st, 0, sizeof(StreetTree));
+}
+
+/* ── Build a single-street betting tree ───────────────────────────────── */
+
+static int build_street(StreetTree *st, int is_river,
+                        int player, int pot, int stack,
+                        int bet0, int bet1, int num_raises, int actions_taken,
+                        const float *bet_sizes, int num_bet_sizes) {
     int to_call = (player == 0) ? (bet1 - bet0) : (bet0 - bet1);
     if (to_call < 0) to_call = 0;
 
-    /* Both acted and bets equal = round over */
+    /* Round over: both acted, bets equal */
     if (actions_taken >= 2 && bet0 == bet1) {
-        if (s->num_board == 5)
-            return add_node(s, NODE_V2_SHOWDOWN, -1, pot, bet0, bet1);
+        if (is_river)
+            return st_add(st, NODE_V2_SHOWDOWN, -1, pot, bet0, bet1);
         else
-            return add_node(s, NODE_V2_LEAF, -1, pot, bet0, bet1);
+            return st_add(st, NODE_V2_CHANCE, -1, pot, bet0, bet1);
     }
 
-    int node = add_node(s, NODE_V2_DECISION, player, pot, bet0, bet1);
+    int node = st_add(st, NODE_V2_DECISION, player, pot, bet0, bet1);
 
-    /* Fold (only if facing a bet) */
+    /* Fold */
     if (to_call > 0) {
-        int fold_n = add_node(s, NODE_V2_FOLD, 1 - player, pot, bet0, bet1);
-        add_child(s, node, fold_n);
+        int fold_n = st_add(st, NODE_V2_FOLD, 1 - player, pot, bet0, bet1);
+        st_add_child(st, node, fold_n);
     }
 
     /* Check or Call */
     if (to_call == 0) {
-        int next = build_tree(s, 1 - player, pot, stack,
-                              bet0, bet1, num_raises, actions_taken + 1);
-        add_child(s, node, next);
+        int next = build_street(st, is_river, 1 - player, pot, stack,
+                                bet0, bet1, num_raises, actions_taken + 1,
+                                bet_sizes, num_bet_sizes);
+        st_add_child(st, node, next);
     } else {
         int nb0 = bet0, nb1 = bet1;
         if (player == 0) nb0 = bet1; else nb1 = bet0;
@@ -79,29 +115,29 @@ static int build_tree(SolverV2 *s, int player, int pot, int stack,
         int call_stack = stack - to_call;
 
         if (actions_taken >= 1) {
-            /* After call, round ends */
-            if (s->num_board == 5) {
-                int sd = add_node(s, NODE_V2_SHOWDOWN, -1, call_pot, nb0, nb1);
-                add_child(s, node, sd);
+            if (is_river) {
+                int sd = st_add(st, NODE_V2_SHOWDOWN, -1, call_pot, nb0, nb1);
+                st_add_child(st, node, sd);
             } else {
-                int lf = add_node(s, NODE_V2_LEAF, -1, call_pot, nb0, nb1);
-                add_child(s, node, lf);
+                int ch = st_add(st, NODE_V2_CHANCE, -1, call_pot, nb0, nb1);
+                st_add_child(st, node, ch);
             }
         } else {
-            int next = build_tree(s, 1 - player, call_pot, call_stack,
-                                  nb0, nb1, num_raises, actions_taken + 1);
-            add_child(s, node, next);
+            int next = build_street(st, is_river, 1 - player, call_pot, call_stack,
+                                    nb0, nb1, num_raises, actions_taken + 1,
+                                    bet_sizes, num_bet_sizes);
+            st_add_child(st, node, next);
         }
     }
 
-    /* Bet/Raise sizes */
+    /* Bet/Raise */
     if (num_raises < MAX_RAISES_V2) {
-        for (int i = 0; i < s->num_bet_sizes; i++) {
+        for (int i = 0; i < num_bet_sizes; i++) {
             int bet_amount;
             if (to_call == 0)
-                bet_amount = (int)(s->bet_sizes[i] * pot);
+                bet_amount = (int)(bet_sizes[i] * pot);
             else
-                bet_amount = to_call + (int)(s->bet_sizes[i] * (pot + to_call));
+                bet_amount = to_call + (int)(bet_sizes[i] * (pot + to_call));
 
             if (bet_amount >= stack) bet_amount = stack;
             if (bet_amount <= to_call) continue;
@@ -112,37 +148,38 @@ static int build_tree(SolverV2 *s, int player, int pot, int stack,
             int new_stack = stack - bet_amount + to_call;
 
             if (bet_amount >= stack) {
-                /* All-in: opponent can fold or call */
-                int ai = add_node(s, NODE_V2_DECISION, 1-player, new_pot, nb0, nb1);
-                int fold_n = add_node(s, NODE_V2_FOLD, player, new_pot, nb0, nb1);
-                add_child(s, ai, fold_n);
+                /* All-in */
+                int ai = st_add(st, NODE_V2_DECISION, 1-player, new_pot, nb0, nb1);
+                int fold_n = st_add(st, NODE_V2_FOLD, player, new_pot, nb0, nb1);
+                st_add_child(st, ai, fold_n);
 
                 int cb0 = nb0, cb1 = nb1;
                 if (player == 0) cb1 = nb0; else cb0 = nb1;
                 int fp = new_pot + (bet_amount - to_call);
 
-                if (s->num_board == 5) {
-                    int sd = add_node(s, NODE_V2_SHOWDOWN, -1, fp, cb0, cb1);
-                    add_child(s, ai, sd);
+                if (is_river) {
+                    int sd = st_add(st, NODE_V2_SHOWDOWN, -1, fp, cb0, cb1);
+                    st_add_child(st, ai, sd);
                 } else {
-                    int lf = add_node(s, NODE_V2_LEAF, -1, fp, cb0, cb1);
-                    add_child(s, ai, lf);
+                    int ch = st_add(st, NODE_V2_CHANCE, -1, fp, cb0, cb1);
+                    st_add_child(st, ai, ch);
                 }
-                add_child(s, node, ai);
+                st_add_child(st, node, ai);
             } else {
-                int next = build_tree(s, 1-player, new_pot, new_stack,
-                                      nb0, nb1, num_raises+1, actions_taken+1);
-                add_child(s, node, next);
+                int next = build_street(st, is_river, 1-player, new_pot, new_stack,
+                                        nb0, nb1, num_raises+1, actions_taken+1,
+                                        bet_sizes, num_bet_sizes);
+                st_add_child(st, node, next);
             }
         }
 
-        /* Explicit all-in (if not already covered) */
+        /* Explicit all-in */
         if (stack > to_call) {
             int is_dup = 0;
-            for (int i = 0; i < s->num_bet_sizes; i++) {
+            for (int i = 0; i < num_bet_sizes; i++) {
                 int ba;
-                if (to_call == 0) ba = (int)(s->bet_sizes[i] * pot);
-                else ba = to_call + (int)(s->bet_sizes[i] * (pot + to_call));
+                if (to_call == 0) ba = (int)(bet_sizes[i] * pot);
+                else ba = to_call + (int)(bet_sizes[i] * (pot + to_call));
                 if (ba >= stack) { is_dup = 1; break; }
             }
             if (!is_dup) {
@@ -151,21 +188,21 @@ static int build_tree(SolverV2 *s, int player, int pot, int stack,
                 if (player == 0) nb0 += ba; else nb1 += ba;
                 int new_pot = pot + ba;
 
-                int ai = add_node(s, NODE_V2_DECISION, 1-player, new_pot, nb0, nb1);
-                int fold_n = add_node(s, NODE_V2_FOLD, player, new_pot, nb0, nb1);
-                add_child(s, ai, fold_n);
+                int ai = st_add(st, NODE_V2_DECISION, 1-player, new_pot, nb0, nb1);
+                int fold_n = st_add(st, NODE_V2_FOLD, player, new_pot, nb0, nb1);
+                st_add_child(st, ai, fold_n);
 
                 int cb0 = nb0, cb1 = nb1;
                 if (player == 0) cb1 = nb0; else cb0 = nb1;
                 int fp = new_pot + (ba - to_call);
-                if (s->num_board == 5) {
-                    int sd = add_node(s, NODE_V2_SHOWDOWN, -1, fp, cb0, cb1);
-                    add_child(s, ai, sd);
+                if (is_river) {
+                    int sd = st_add(st, NODE_V2_SHOWDOWN, -1, fp, cb0, cb1);
+                    st_add_child(st, ai, sd);
                 } else {
-                    int lf = add_node(s, NODE_V2_LEAF, -1, fp, cb0, cb1);
-                    add_child(s, ai, lf);
+                    int ch = st_add(st, NODE_V2_CHANCE, -1, fp, cb0, cb1);
+                    st_add_child(st, ai, ch);
                 }
-                add_child(s, node, ai);
+                st_add_child(st, node, ai);
             }
         }
     }
@@ -195,27 +232,88 @@ static inline void regret_match(const float *regrets, float *strategy,
     }
 }
 
-/* ── CFR traversal ─────────────────────────────────────────────────────── */
+/* ── Ensure info set exists ───────────────────────────────────────────── */
 
-static void cfr_traverse(SolverV2 *s, int node_idx, int traverser,
-                         float *reach0, float *reach1,
-                         float *cfv_out, int iter) {
-    NodeV2 *node = &s->nodes[node_idx];
+static InfoSetV2 *ensure_info_set(InfoSetV2 *arr, int cap, int idx,
+                                  int num_actions, int num_hands) {
+    if (idx >= cap) return NULL; /* caller must size arrays correctly */
+    InfoSetV2 *is = &arr[idx];
+    if (is->regrets == NULL) {
+        is->num_actions = num_actions;
+        is->num_hands = num_hands;
+        is->regrets = calloc(num_actions * num_hands, sizeof(float));
+        is->strategy_sum = calloc(num_actions * num_hands, sizeof(float));
+        is->current_strategy = calloc(num_actions * num_hands, sizeof(float));
+    }
+    return is;
+}
+
+/* ── Showdown evaluation ──────────────────────────────────────────────── */
+
+static void eval_showdown_board(const SolverV2 *s, const int *full_board,
+                                const NodeV2 *node,
+                                int traverser, const float *reach_opp,
+                                float *cfv_out) {
+    int opp = 1 - traverser;
+    int n_trav = s->num_hands[traverser];
+    int n_opp = s->num_hands[opp];
+    float half_pot = node->pot * 0.5f;
+
+    /* Compute hand strengths for this specific 5-card board */
+    /* We inline this to avoid extra allocation */
+    for (int h = 0; h < n_trav; h++) {
+        int hc0 = s->hands[traverser][h][0], hc1 = s->hands[traverser][h][1];
+        /* Check if hand is blocked by board */
+        if (card_in_set(hc0, full_board, 5) || card_in_set(hc1, full_board, 5)) {
+            cfv_out[h] = 0;
+            continue;
+        }
+        int cards_t[7] = {full_board[0], full_board[1], full_board[2],
+                          full_board[3], full_board[4], hc0, hc1};
+        uint32_t hs = eval7(cards_t);
+
+        float total = 0;
+        for (int o = 0; o < n_opp; o++) {
+            int oc0 = s->hands[opp][o][0], oc1 = s->hands[opp][o][1];
+            if (cards_conflict(hc0, hc1, oc0, oc1)) continue;
+            if (card_in_set(oc0, full_board, 5) || card_in_set(oc1, full_board, 5)) continue;
+
+            int cards_o[7] = {full_board[0], full_board[1], full_board[2],
+                              full_board[3], full_board[4], oc0, oc1};
+            uint32_t os = eval7(cards_o);
+            if (hs > os) total += reach_opp[o] * half_pot;
+            else if (hs < os) total -= reach_opp[o] * half_pot;
+        }
+        cfv_out[h] = total;
+    }
+}
+
+/* ── CFR traverse for a single street ─────────────────────────────────── */
+
+/* Forward declare — mutual recursion with chance handler */
+static void cfr_street(SolverV2 *s, StreetTree *st, InfoSetV2 *is_arr, int is_cap,
+                       int node_idx, int traverser,
+                       float *reach0, float *reach1, float *cfv_out, int iter,
+                       const int *board, int num_board, int street_depth);
+
+static void cfr_chance(SolverV2 *s, const NodeV2 *node, int traverser,
+                       float *reach0, float *reach1, float *cfv_out, int iter,
+                       const int *board, int num_board, int street_depth);
+
+static void cfr_street(SolverV2 *s, StreetTree *st, InfoSetV2 *is_arr, int is_cap,
+                       int node_idx, int traverser,
+                       float *reach0, float *reach1, float *cfv_out, int iter,
+                       const int *board, int num_board, int street_depth) {
+    NodeV2 *node = &st->nodes[node_idx];
     int n_trav = s->num_hands[traverser];
     int opp = 1 - traverser;
+    int n0 = s->num_hands[0], n1 = s->num_hands[1];
 
-    /* ── Fold terminal ──────────────────────────────────────────── */
+    /* ── Fold ──────────────────────────────────────────────── */
     if (node->type == NODE_V2_FOLD) {
-        int winner = node->player;
         float *reach_opp = (traverser == 0) ? reach1 : reach0;
         int n_opp = s->num_hands[opp];
-        /* Fold payoff: winner gets the pot minus their contribution.
-         * Loser loses their contribution.
-         * Since pot = starting_pot + bets[0] + bets[1],
-         * winner's profit = pot - (starting_pot/2 + bets[winner])
-         *                 = starting_pot/2 + bets[loser]
-         * loser's loss = -(starting_pot/2 + bets[loser])
-         */
+        int winner = node->player;
         float half_start = s->starting_pot * 0.5f;
         int loser = 1 - winner;
         float payoff;
@@ -225,101 +323,48 @@ static void cfr_traverse(SolverV2 *s, int node_idx, int traverser,
             payoff = -(half_start + (float)node->bets[traverser]);
 
         for (int h = 0; h < n_trav; h++) {
-            float opp_sum = 0;
             int c0 = s->hands[traverser][h][0], c1 = s->hands[traverser][h][1];
+            if (card_in_set(c0, board, num_board) || card_in_set(c1, board, num_board)) {
+                cfv_out[h] = 0; continue;
+            }
+            float opp_sum = 0;
             for (int o = 0; o < n_opp; o++) {
-                if (!cards_conflict(c0, c1, s->hands[opp][o][0], s->hands[opp][o][1]))
-                    opp_sum += reach_opp[o];
+                if (cards_conflict(c0, c1, s->hands[opp][o][0], s->hands[opp][o][1])) continue;
+                if (card_in_set(s->hands[opp][o][0], board, num_board) ||
+                    card_in_set(s->hands[opp][o][1], board, num_board)) continue;
+                opp_sum += reach_opp[o];
             }
             cfv_out[h] = opp_sum * payoff;
         }
         return;
     }
 
-    /* ── Showdown terminal ──────────────────────────────────────── */
+    /* ── Showdown ──────────────────────────────────────────── */
     if (node->type == NODE_V2_SHOWDOWN) {
         float *reach_opp = (traverser == 0) ? reach1 : reach0;
-        int n_opp = s->num_hands[opp];
-        /* Payoff: winner gets half the pot (profit), loser loses half.
-         * This correctly handles the starting pot + current street bets. */
-        float half_pot = node->pot * 0.5f;
-        float win_pay = half_pot;
-        float lose_pay = -half_pot;
-
-        for (int h = 0; h < n_trav; h++) {
-            int c0 = s->hands[traverser][h][0], c1 = s->hands[traverser][h][1];
-            uint32_t hs = s->hand_strengths[traverser][h];
-            float total = 0;
-            for (int o = 0; o < n_opp; o++) {
-                if (cards_conflict(c0, c1, s->hands[opp][o][0], s->hands[opp][o][1]))
-                    continue;
-                uint32_t os = s->hand_strengths[opp][o];
-                if (hs > os) total += reach_opp[o] * win_pay;
-                else if (hs < os) total += reach_opp[o] * lose_pay;
-            }
-            cfv_out[h] = total;
-        }
+        eval_showdown_board(s, board, node, traverser, reach_opp, cfv_out);
         return;
     }
 
-    /* ── Leaf terminal (4 continuation strategies) ──────────────── */
-    if (node->type == NODE_V2_LEAF) {
-        /* Find this leaf's index */
-        int leaf_idx = -1;
-        for (int i = 0; i < s->num_leaves; i++) {
-            if (s->leaf_indices[i] == node_idx) { leaf_idx = i; break; }
-        }
-
-        if (leaf_idx >= 0 && s->leaf_values != NULL) {
-            /* Use precomputed leaf values.
-             * The DCFR iteration handles the opponent's choice over
-             * 4 strategies implicitly — for now, use the average
-             * across all 4 strategies as the leaf value. */
-            float *reach_opp = (traverser == 0) ? reach1 : reach0;
-            int n_opp = s->num_hands[opp];
-
-            for (int h = 0; h < n_trav; h++) {
-                float val = 0;
-                int c0 = s->hands[traverser][h][0], c1 = s->hands[traverser][h][1];
-                float opp_sum = 0;
-                for (int o = 0; o < n_opp; o++) {
-                    if (!cards_conflict(c0, c1, s->hands[opp][o][0], s->hands[opp][o][1]))
-                        opp_sum += reach_opp[o];
-                }
-                /* Average across 4 strategies */
-                for (int k = 0; k < NUM_CONT_STRATS; k++) {
-                    int vi = (leaf_idx * NUM_CONT_STRATS + k) * s->num_hands[traverser] + h;
-                    /* Assuming traverser's values stored at this index */
-                    if (s->leaf_values[leaf_idx * NUM_CONT_STRATS + k] != NULL)
-                        val += s->leaf_values[leaf_idx * NUM_CONT_STRATS + k][h];
-                }
-                cfv_out[h] = opp_sum * val * 0.25f;
-            }
-        } else {
-            /* Fallback: zero leaf value */
-            for (int h = 0; h < n_trav; h++)
-                cfv_out[h] = 0;
-        }
+    /* ── Chance: deal next card, recurse into next street ──── */
+    if (node->type == NODE_V2_CHANCE) {
+        cfr_chance(s, node, traverser, reach0, reach1, cfv_out, iter,
+                   board, num_board, street_depth);
         return;
     }
 
-    /* ── Decision node ──────────────────────────────────────────── */
+    /* ── Decision ──────────────────────────────────────────── */
     int acting = node->player;
     int n_actions = node->num_actions;
 
-    InfoSetV2 *is = &s->info_sets[node_idx];
-    if (is->regrets == NULL) {
-        int nh = s->num_hands[acting];
-        is->num_actions = n_actions;
-        is->num_hands = nh;
-        is->regrets = calloc(n_actions * nh, sizeof(float));
-        is->strategy_sum = calloc(n_actions * nh, sizeof(float));
-        is->current_strategy = calloc(n_actions * nh, sizeof(float));
-    }
+    InfoSetV2 *is = ensure_info_set(is_arr, is_cap, node_idx,
+                                     n_actions, s->num_hands[acting]);
+    /* Write back pointer in case realloc moved it */
+    /* (The caller's is_arr/is_cap are passed by pointer, so this is fine) */
 
     int nh_acting = is->num_hands;
 
-    /* Compute current strategy via regret matching */
+    /* Regret matching */
     for (int h = 0; h < nh_acting; h++) {
         float strat[MAX_ACTIONS_V2];
         regret_match(is->regrets, strat, n_actions, nh_acting, h);
@@ -327,87 +372,184 @@ static void cfr_traverse(SolverV2 *s, int node_idx, int traverser,
             is->current_strategy[a * nh_acting + h] = strat[a];
     }
 
-    /* Stack-allocated arrays */
-    float reach0_mod[MAX_HANDS_V2], reach1_mod[MAX_HANDS_V2];
+    float *reach0_mod = malloc(n0 * sizeof(float));
+    float *reach1_mod = malloc(n1 * sizeof(float));
 
     if (acting == traverser) {
-        /* Traverser: explore all actions, update regrets */
-        float action_cfv[MAX_ACTIONS_V2 * MAX_HANDS_V2];
+        float *action_cfv = malloc(n_actions * n_trav * sizeof(float));
         memset(cfv_out, 0, n_trav * sizeof(float));
 
         for (int a = 0; a < n_actions; a++) {
-            memcpy(reach0_mod, reach0, s->num_hands[0] * sizeof(float));
-            memcpy(reach1_mod, reach1, s->num_hands[1] * sizeof(float));
+            memcpy(reach0_mod, reach0, n0 * sizeof(float));
+            memcpy(reach1_mod, reach1, n1 * sizeof(float));
             float *my_reach = (traverser == 0) ? reach0_mod : reach1_mod;
             for (int h = 0; h < n_trav; h++)
                 my_reach[h] *= is->current_strategy[a * nh_acting + h];
 
-            float *child_cfv = action_cfv + a * n_trav;
-            cfr_traverse(s, node->children[a], traverser,
-                         reach0_mod, reach1_mod, child_cfv, iter);
+            cfr_street(s, st, is_arr, is_cap, node->children[a], traverser,
+                       reach0_mod, reach1_mod, action_cfv + a * n_trav, iter,
+                       board, num_board, street_depth);
 
             for (int h = 0; h < n_trav; h++)
-                cfv_out[h] += is->current_strategy[a * nh_acting + h] * child_cfv[h];
+                cfv_out[h] += is->current_strategy[a * nh_acting + h]
+                              * action_cfv[a * n_trav + h];
         }
 
         /* Update regrets */
         for (int a = 0; a < n_actions; a++)
             for (int h = 0; h < n_trav; h++)
-                is->regrets[a * n_trav + h] += action_cfv[a * n_trav + h] - cfv_out[h];
+                is->regrets[a * nh_acting + h] += action_cfv[a * n_trav + h] - cfv_out[h];
 
-        /* Update strategy sum: CFR+ uses iteration-weighted sum.
-         * Weight = iteration number (Linear CFR / CFR+ style). */
+        /* Iteration-weighted strategy sum */
         float *my_reach = (traverser == 0) ? reach0 : reach1;
         for (int a = 0; a < n_actions; a++)
             for (int h = 0; h < n_trav; h++)
-                is->strategy_sum[a * n_trav + h] +=
-                    my_reach[h] * is->current_strategy[a * nh_acting + h];
+                is->strategy_sum[a * nh_acting + h] +=
+                    (float)iter * my_reach[h] * is->current_strategy[a * nh_acting + h];
 
+        free(action_cfv);
     } else {
-        /* Opponent: sample via current strategy */
-        float child_cfv[MAX_HANDS_V2];
+        float *child_cfv = malloc(n_trav * sizeof(float));
         memset(cfv_out, 0, n_trav * sizeof(float));
 
         for (int a = 0; a < n_actions; a++) {
-            memcpy(reach0_mod, reach0, s->num_hands[0] * sizeof(float));
-            memcpy(reach1_mod, reach1, s->num_hands[1] * sizeof(float));
+            memcpy(reach0_mod, reach0, n0 * sizeof(float));
+            memcpy(reach1_mod, reach1, n1 * sizeof(float));
             float *opp_reach = (acting == 0) ? reach0_mod : reach1_mod;
             for (int h = 0; h < nh_acting; h++)
                 opp_reach[h] *= is->current_strategy[a * nh_acting + h];
 
-            cfr_traverse(s, node->children[a], traverser,
-                         reach0_mod, reach1_mod, child_cfv, iter);
+            cfr_street(s, st, is_arr, is_cap, node->children[a], traverser,
+                       reach0_mod, reach1_mod, child_cfv, iter,
+                       board, num_board, street_depth);
             for (int h = 0; h < n_trav; h++)
                 cfv_out[h] += child_cfv[h];
         }
+        free(child_cfv);
     }
+
+    free(reach0_mod);
+    free(reach1_mod);
 }
 
-/* ── Linear CFR discounting ────────────────────────────────────────────── */
+/* ── Chance node handler: deal next card, solve next street ───────────── */
 
-static void apply_cfr_plus(SolverV2 *s, int iter) {
-    /* CFR+: floor negative regrets at 0.
-     * This is proven to converge and is simpler than DCFR/Linear CFR.
-     * Strategy sum is weighted by iteration (linear weighting). */
-    for (int n = 0; n < s->num_nodes; n++) {
-        InfoSetV2 *is = &s->info_sets[n];
+static void cfr_chance(SolverV2 *s, const NodeV2 *node, int traverser,
+                       float *reach0, float *reach1, float *cfv_out, int iter,
+                       const int *board, int num_board, int street_depth) {
+    int n_trav = s->num_hands[traverser];
+    int n0 = s->num_hands[0], n1 = s->num_hands[1];
+
+    /* Which cards are blocked by current board? */
+    int blocked[52] = {0};
+    for (int i = 0; i < num_board; i++) blocked[board[i]] = 1;
+
+    /* Count valid next cards */
+    int next_cards[52];
+    int num_next = 0;
+    for (int c = 0; c < 52; c++)
+        if (!blocked[c]) next_cards[num_next++] = c;
+
+    int next_num_board = num_board + 1;
+    int next_is_river = (next_num_board == 5);
+
+    memset(cfv_out, 0, n_trav * sizeof(float));
+    float *card_cfv = malloc(n_trav * sizeof(float));
+
+    /* Determine which info set storage to use for the next street */
+    int turn_idx_base = -1;
+    if (num_board == 3) {
+        /* Dealing the turn card — use turn_info_sets */
+        turn_idx_base = 0; /* will index by card position in next_cards */
+    }
+
+    for (int ci = 0; ci < num_next; ci++) {
+        int deal_card = next_cards[ci];
+
+        /* Build next board */
+        int next_board[5];
+        for (int i = 0; i < num_board; i++) next_board[i] = board[i];
+        next_board[num_board] = deal_card;
+
+        /* Remaining stack = effective_stack minus each player's total bet.
+         * At end of a betting round with bets equalized: each put in pot/2
+         * (the pot includes starting_pot + both players' bets). */
+        int each_invested = (node->pot - s->starting_pot) / 2;
+        int remaining_stack = s->effective_stack - each_invested;
+        if (remaining_stack < 0) remaining_stack = 0;
+
+        /* Build next street's tree */
+        StreetTree next_st;
+        st_init(&next_st);
+        build_street(&next_st, next_is_river, 0, node->pot, remaining_stack,
+                     0, 0, 0, 0, s->bet_sizes, s->num_bet_sizes);
+
+        /* Ephemeral info sets for this sub-street.
+         * TODO: persist across iterations for faster convergence. */
+        int sub_is_cap = next_st.num_nodes + 16;
+        InfoSetV2 *sub_is = calloc(sub_is_cap, sizeof(InfoSetV2));
+
+        /* Recurse into next street */
+        cfr_street(s, &next_st, sub_is, sub_is_cap,
+                   0, traverser, reach0, reach1, card_cfv, iter,
+                   next_board, next_num_board,
+                   num_board == 3 ? ci : street_depth);
+
+        for (int h = 0; h < n_trav; h++)
+            cfv_out[h] += card_cfv[h];
+
+        /* Free everything */
+        free(next_st.nodes);
+        for (int i = 0; i < sub_is_cap; i++) {
+            if (sub_is[i].regrets) free(sub_is[i].regrets);
+            if (sub_is[i].strategy_sum) free(sub_is[i].strategy_sum);
+            if (sub_is[i].current_strategy) free(sub_is[i].current_strategy);
+        }
+        free(sub_is);
+    }
+
+    /* Average over number of dealt cards */
+    if (num_next > 0) {
+        float inv = 1.0f / num_next;
+        for (int h = 0; h < n_trav; h++)
+            cfv_out[h] *= inv;
+    }
+
+    free(card_cfv);
+}
+
+/* ── Linear CFR discounting ───────────────────────────────────────────── */
+
+static void discount_info_sets(InfoSetV2 *arr, int cap, int iter) {
+    float d = (float)iter / ((float)iter + 1.0f);
+    for (int n = 0; n < cap; n++) {
+        InfoSetV2 *is = &arr[n];
         if (is->regrets == NULL) continue;
         int size = is->num_actions * is->num_hands;
-        for (int i = 0; i < size; i++) {
-            /* CFR+: floor regrets at 0 */
-            if (is->regrets[i] < 0) is->regrets[i] = 0;
-        }
+        for (int i = 0; i < size; i++)
+            is->regrets[i] *= d;
     }
 }
 
 /* ── Best response for exploitability ──────────────────────────────────── */
 
-static void best_response(SolverV2 *s, int node_idx, int br_player,
-                          float *reach0, float *reach1, float *cfv_out) {
-    NodeV2 *node = &s->nodes[node_idx];
+static void best_response_street(SolverV2 *s, StreetTree *st, InfoSetV2 *is_arr, int is_cap,
+                                 int node_idx, int br_player,
+                                 float *reach0, float *reach1, float *cfv_out,
+                                 const int *board, int num_board, int street_depth);
+
+static void br_chance(SolverV2 *s, const NodeV2 *node, int br_player,
+                      float *reach0, float *reach1, float *cfv_out,
+                      const int *board, int num_board, int street_depth);
+
+static void best_response_street(SolverV2 *s, StreetTree *st, InfoSetV2 *is_arr, int is_cap,
+                                 int node_idx, int br_player,
+                                 float *reach0, float *reach1, float *cfv_out,
+                                 const int *board, int num_board, int street_depth) {
+    NodeV2 *node = &st->nodes[node_idx];
     int n_br = s->num_hands[br_player];
     int opp = 1 - br_player;
-    float reach0_mod[MAX_HANDS_V2], reach1_mod[MAX_HANDS_V2];
+    int n0 = s->num_hands[0], n1 = s->num_hands[1];
 
     if (node->type == NODE_V2_FOLD) {
         float *reach_opp = (br_player == 0) ? reach1 : reach0;
@@ -419,49 +561,47 @@ static void best_response(SolverV2 *s, int node_idx, int br_player,
             ? (half_start + (float)node->bets[loser])
             : -(half_start + (float)node->bets[br_player]);
         for (int h = 0; h < n_br; h++) {
+            int c0 = s->hands[br_player][h][0], c1 = s->hands[br_player][h][1];
+            if (card_in_set(c0, board, num_board) || card_in_set(c1, board, num_board)) {
+                cfv_out[h] = 0; continue;
+            }
             float os = 0;
-            for (int o = 0; o < n_opp; o++)
-                if (!cards_conflict(s->hands[br_player][h][0], s->hands[br_player][h][1],
-                                    s->hands[opp][o][0], s->hands[opp][o][1]))
-                    os += reach_opp[o];
+            for (int o = 0; o < n_opp; o++) {
+                if (cards_conflict(c0, c1, s->hands[opp][o][0], s->hands[opp][o][1])) continue;
+                if (card_in_set(s->hands[opp][o][0], board, num_board) ||
+                    card_in_set(s->hands[opp][o][1], board, num_board)) continue;
+                os += reach_opp[o];
+            }
             cfv_out[h] = os * payoff;
         }
         return;
     }
+
     if (node->type == NODE_V2_SHOWDOWN) {
         float *reach_opp = (br_player == 0) ? reach1 : reach0;
-        int n_opp = s->num_hands[opp];
-        float half_pot = node->pot * 0.5f;
-        for (int h = 0; h < n_br; h++) {
-            float total = 0;
-            uint32_t hs = s->hand_strengths[br_player][h];
-            for (int o = 0; o < n_opp; o++) {
-                if (cards_conflict(s->hands[br_player][h][0], s->hands[br_player][h][1],
-                                   s->hands[opp][o][0], s->hands[opp][o][1]))
-                    continue;
-                uint32_t os = s->hand_strengths[opp][o];
-                if (hs > os) total += reach_opp[o] * half_pot;
-                else if (hs < os) total -= reach_opp[o] * half_pot;
-            }
-            cfv_out[h] = total;
-        }
+        eval_showdown_board(s, board, node, br_player, reach_opp, cfv_out);
         return;
     }
-    if (node->type == NODE_V2_LEAF) {
-        for (int h = 0; h < n_br; h++) cfv_out[h] = 0;
+
+    if (node->type == NODE_V2_CHANCE) {
+        br_chance(s, node, br_player, reach0, reach1, cfv_out,
+                  board, num_board, street_depth);
         return;
     }
 
     int acting = node->player;
     int n_actions = node->num_actions;
+    float *reach0_mod = malloc(n0 * sizeof(float));
+    float *reach1_mod = malloc(n1 * sizeof(float));
 
     if (acting == br_player) {
-        float action_cfv[MAX_ACTIONS_V2 * MAX_HANDS_V2];
+        float *action_cfv = malloc(n_actions * n_br * sizeof(float));
         for (int a = 0; a < n_actions; a++) {
-            memcpy(reach0_mod, reach0, s->num_hands[0] * sizeof(float));
-            memcpy(reach1_mod, reach1, s->num_hands[1] * sizeof(float));
-            best_response(s, node->children[a], br_player,
-                          reach0_mod, reach1_mod, action_cfv + a * n_br);
+            memcpy(reach0_mod, reach0, n0 * sizeof(float));
+            memcpy(reach1_mod, reach1, n1 * sizeof(float));
+            best_response_street(s, st, is_arr, is_cap, node->children[a], br_player,
+                                 reach0_mod, reach1_mod, action_cfv + a * n_br,
+                                 board, num_board, street_depth);
         }
         for (int h = 0; h < n_br; h++) {
             float best = -1e30f;
@@ -471,31 +611,85 @@ static void best_response(SolverV2 *s, int node_idx, int br_player,
             }
             cfv_out[h] = best;
         }
+        free(action_cfv);
     } else {
-        /* Use final iteration strategy */
-        InfoSetV2 *is = &s->info_sets[node_idx];
+        InfoSetV2 *is = (node_idx < is_cap) ? &is_arr[node_idx] : NULL;
         int nh = s->num_hands[acting];
-        float child_cfv[MAX_HANDS_V2];
+        float *child_cfv = malloc(n_br * sizeof(float));
         memset(cfv_out, 0, n_br * sizeof(float));
 
         for (int a = 0; a < n_actions; a++) {
-            memcpy(reach0_mod, reach0, s->num_hands[0] * sizeof(float));
-            memcpy(reach1_mod, reach1, s->num_hands[1] * sizeof(float));
+            memcpy(reach0_mod, reach0, n0 * sizeof(float));
+            memcpy(reach1_mod, reach1, n1 * sizeof(float));
             float *opp_reach = (acting == 0) ? reach0_mod : reach1_mod;
-            if (is->current_strategy) {
+            if (is && is->current_strategy) {
                 for (int h = 0; h < nh; h++)
                     opp_reach[h] *= is->current_strategy[a * nh + h];
             } else {
                 float u = 1.0f / n_actions;
-                for (int h = 0; h < nh; h++)
-                    opp_reach[h] *= u;
+                for (int h = 0; h < nh; h++) opp_reach[h] *= u;
             }
-            best_response(s, node->children[a], br_player,
-                          reach0_mod, reach1_mod, child_cfv);
+            best_response_street(s, st, is_arr, is_cap, node->children[a], br_player,
+                                 reach0_mod, reach1_mod, child_cfv,
+                                 board, num_board, street_depth);
             for (int h = 0; h < n_br; h++)
                 cfv_out[h] += child_cfv[h];
         }
+        free(child_cfv);
     }
+    free(reach0_mod);
+    free(reach1_mod);
+}
+
+static void br_chance(SolverV2 *s, const NodeV2 *node, int br_player,
+                      float *reach0, float *reach1, float *cfv_out,
+                      const int *board, int num_board, int street_depth) {
+    int n_br = s->num_hands[br_player];
+    int blocked[52] = {0};
+    for (int i = 0; i < num_board; i++) blocked[board[i]] = 1;
+
+    int next_cards[52];
+    int num_next = 0;
+    for (int c = 0; c < 52; c++)
+        if (!blocked[c]) next_cards[num_next++] = c;
+
+    int next_num_board = num_board + 1;
+    int next_is_river = (next_num_board == 5);
+
+    memset(cfv_out, 0, n_br * sizeof(float));
+    float *card_cfv = malloc(n_br * sizeof(float));
+
+    for (int ci = 0; ci < num_next; ci++) {
+        int next_board[5];
+        for (int i = 0; i < num_board; i++) next_board[i] = board[i];
+        next_board[num_board] = next_cards[ci];
+
+        StreetTree next_st;
+        st_init(&next_st);
+        build_street(&next_st, next_is_river, 0, node->pot,
+                     s->effective_stack - (node->pot - s->starting_pot) / 2,
+                     0, 0, 0, 0, s->bet_sizes, s->num_bet_sizes);
+
+        next_st.info_sets_capacity = next_st.num_nodes + 16;
+        next_st.info_sets = calloc(next_st.info_sets_capacity, sizeof(InfoSetV2));
+
+        best_response_street(s, &next_st, next_st.info_sets, next_st.info_sets_capacity,
+                             0, br_player, reach0, reach1, card_cfv,
+                             next_board, next_num_board,
+                             num_board == 3 ? ci : street_depth);
+
+        for (int h = 0; h < n_br; h++)
+            cfv_out[h] += card_cfv[h];
+
+        st_free(&next_st);
+    }
+
+    if (num_next > 0) {
+        float inv = 1.0f / num_next;
+        for (int h = 0; h < n_br; h++)
+            cfv_out[h] *= inv;
+    }
+    free(card_cfv);
 }
 
 /* ── Public API ────────────────────────────────────────────────────────── */
@@ -535,155 +729,48 @@ int sv2_init(SolverV2 *s,
     s->starting_pot = starting_pot;
     s->effective_stack = effective_stack;
 
-    /* Build tree */
-    s->nodes = malloc(2048 * sizeof(NodeV2));
-    s->num_nodes = 0;
-    build_tree(s, 0, starting_pot, effective_stack, 0, 0, 0, 0);
+    /* Build root street tree */
+    int is_river = (num_board == 5);
+    st_init(&s->root_tree);
+    build_street(&s->root_tree, is_river, 0, starting_pot, effective_stack,
+                 0, 0, 0, 0, bet_sizes, num_bet_sizes);
 
-    /* Precompute hand strengths for showdown */
-    if (num_board == 5) {
-        for (int p = 0; p < 2; p++) {
-            s->hand_strengths[p] = malloc(s->num_hands[p] * sizeof(uint32_t));
-            int board7[7];
-            for (int i = 0; i < 5; i++) board7[i] = s->board[i];
-            for (int h = 0; h < s->num_hands[p]; h++) {
-                board7[5] = s->hands[p][h][0];
-                board7[6] = s->hands[p][h][1];
-                s->hand_strengths[p][h] = eval7(board7);
-            }
-        }
-    }
+    s->root_tree.info_sets_capacity = s->root_tree.num_nodes + 16;
+    s->root_tree.info_sets = calloc(s->root_tree.info_sets_capacity, sizeof(InfoSetV2));
 
-    /* Find leaf nodes */
-    s->num_leaves = 0;
-    for (int i = 0; i < s->num_nodes; i++)
-        if (s->nodes[i].type == NODE_V2_LEAF) s->num_leaves++;
-    s->leaf_indices = malloc(s->num_leaves * sizeof(int));
-    int li = 0;
-    for (int i = 0; i < s->num_nodes; i++)
-        if (s->nodes[i].type == NODE_V2_LEAF) s->leaf_indices[li++] = i;
-
-    /* Allocate info sets */
-    s->info_sets = calloc(s->num_nodes, sizeof(InfoSetV2));
-
-    return 0;
-}
-
-int sv2_precompute_river_strengths(SolverV2 *s) {
-    if (s->num_board != 4) return -1; /* Only for turn boards */
-
-    for (int p = 0; p < 2; p++) {
+    /* Pre-allocate persistent info set storage for sub-streets */
+    if (num_board < 5) {
+        /* Count possible next cards */
         int blocked[52] = {0};
-        for (int i = 0; i < 4; i++) blocked[s->board[i]] = 1;
+        for (int i = 0; i < num_board; i++) blocked[s->board[i]] = 1;
+        s->num_turn_cards = 0;
+        s->turn_cards = malloc(48 * sizeof(int));
+        for (int c = 0; c < 52; c++)
+            if (!blocked[c]) s->turn_cards[s->num_turn_cards++] = c;
 
-        s->river_table[p].num_rivers = 0;
-        s->river_table[p].river_cards = malloc(48 * sizeof(int));
-        for (int c = 0; c < 52; c++) {
-            if (!blocked[c])
-                s->river_table[p].river_cards[s->river_table[p].num_rivers++] = c;
-        }
+        /* Use generous fixed sizes for sub-street info sets.
+         * The tree shape depends on pot/stack which varies per chance path,
+         * so we use a safe upper bound rather than sampling. */
+        s->max_turn_nodes = 128;    /* typical street tree: 20-60 nodes */
+        s->max_river_nodes = 128;
+        s->max_river_per_turn = 48;
 
-        int nr = s->river_table[p].num_rivers;
-        int nh = s->num_hands[p];
-        s->river_table[p].num_hands = nh;
-        s->river_table[p].strengths = malloc(nr * sizeof(uint32_t*));
+        if (num_board == 3) {
+            /* Flop: need turn + river info sets */
+            s->turn_info_sets = malloc(s->num_turn_cards * sizeof(InfoSetV2*));
+            for (int i = 0; i < s->num_turn_cards; i++)
+                s->turn_info_sets[i] = calloc(s->max_turn_nodes, sizeof(InfoSetV2));
 
-        for (int ri = 0; ri < nr; ri++) {
-            s->river_table[p].strengths[ri] = malloc(nh * sizeof(uint32_t));
-            int rc = s->river_table[p].river_cards[ri];
-            int board7[7] = {s->board[0], s->board[1], s->board[2],
-                             s->board[3], rc, 0, 0};
-            for (int h = 0; h < nh; h++) {
-                if (s->hands[p][h][0] == rc || s->hands[p][h][1] == rc) {
-                    s->river_table[p].strengths[ri][h] = 0;
-                } else {
-                    board7[5] = s->hands[p][h][0];
-                    board7[6] = s->hands[p][h][1];
-                    s->river_table[p].strengths[ri][h] = eval7(board7);
-                }
-            }
-        }
-    }
-    return 0;
-}
+            int total_river_slots = s->num_turn_cards * s->max_river_per_turn;
+            s->river_info_sets = malloc(total_river_slots * sizeof(InfoSetV2*));
+            for (int i = 0; i < total_river_slots; i++)
+                s->river_info_sets[i] = calloc(s->max_river_nodes, sizeof(InfoSetV2));
 
-int sv2_compute_leaf_values(SolverV2 *s) {
-    if (s->num_leaves == 0) return 0;
-    if (s->num_board == 5) return 0; /* River: no leaves, just showdown */
-
-    /* Allocate leaf value arrays: [num_leaves * NUM_CONT_STRATS][num_hands_max] */
-    int max_h = s->num_hands[0] > s->num_hands[1] ? s->num_hands[0] : s->num_hands[1];
-    int total_slots = s->num_leaves * NUM_CONT_STRATS;
-    s->leaf_values = malloc(total_slots * sizeof(float*));
-    for (int i = 0; i < total_slots; i++)
-        s->leaf_values[i] = calloc(max_h, sizeof(float));
-
-    /* For each leaf, compute equity-based continuation values.
-     * Traverse all river cards, compute showdown equity for each hand pair. */
-    if (s->river_table[0].strengths == NULL) {
-        /* No river precompute — use raw equity (less accurate) */
-        return 0;
-    }
-
-    int nr = s->river_table[0].num_rivers;
-    int n0 = s->num_hands[0], n1 = s->num_hands[1];
-
-    for (int li = 0; li < s->num_leaves; li++) {
-        NodeV2 *leaf = &s->nodes[s->leaf_indices[li]];
-        float half_pot = leaf->pot * 0.5f;
-
-        /* For each of 4 strategies, compute leaf value per hand.
-         * Strategy 0: unmodified (50% equity)
-         * Strategy 1: fold-biased (opponent folds more → we win more)
-         * Strategy 2: call-biased (opponent calls more → equity matters more)
-         * Strategy 3: raise-biased (opponent raises more → we need stronger hands) */
-        float fold_bias[4] = {1.0f, 5.0f, 1.0f, 1.0f};
-        float call_bias[4] = {1.0f, 1.0f, 5.0f, 1.0f};
-
-        for (int k = 0; k < NUM_CONT_STRATS; k++) {
-            float *vals = s->leaf_values[li * NUM_CONT_STRATS + k];
-
-            /* Compute equity across all river cards for each traverser hand */
-            for (int p = 0; p < 2; p++) {
-                int nh = s->num_hands[p];
-                int n_opp = s->num_hands[1-p];
-
-                for (int h = 0; h < nh; h++) {
-                    float total_win = 0, total_lose = 0, total_valid = 0;
-                    int hc0 = s->hands[p][h][0], hc1 = s->hands[p][h][1];
-
-                    for (int ri = 0; ri < nr; ri++) {
-                        uint32_t hs = s->river_table[p].strengths[ri][h];
-                        if (hs == 0) continue; /* blocked by river card */
-
-                        for (int o = 0; o < n_opp; o++) {
-                            uint32_t os = s->river_table[1-p].strengths[ri][o];
-                            if (os == 0) continue;
-                            if (cards_conflict(hc0, hc1,
-                                               s->hands[1-p][o][0], s->hands[1-p][o][1]))
-                                continue;
-
-                            float w = s->weights[1-p][o];
-                            /* Apply bias: fold-biased opponent folds weak hands */
-                            if (k == 1) { /* fold-biased: reduce weak opponent weight */
-                                if (os < hs) w *= 0.3f; /* weak hands fold */
-                            } else if (k == 3) { /* raise-biased: emphasize strong */
-                                if (os > hs) w *= 2.0f;
-                            }
-
-                            if (hs > os) total_win += w;
-                            else if (hs < os) total_lose += w;
-                            total_valid += w;
-                        }
-                    }
-
-                    if (total_valid > 0) {
-                        float equity = total_win / total_valid;
-                        /* Value relative to pot: equity * pot - (1-equity) * contribution */
-                        vals[h] = (equity - 0.5f) * half_pot * 0.01f; /* scale down */
-                    }
-                }
-            }
+        } else if (num_board == 4) {
+            /* Turn: need river info sets only */
+            s->river_info_sets = malloc(s->num_turn_cards * sizeof(InfoSetV2*));
+            for (int i = 0; i < s->num_turn_cards; i++)
+                s->river_info_sets[i] = calloc(s->max_river_nodes, sizeof(InfoSetV2));
         }
     }
 
@@ -692,30 +779,56 @@ int sv2_compute_leaf_values(SolverV2 *s) {
 
 float sv2_solve(SolverV2 *s, int max_iterations, float target_exploitability) {
     int n0 = s->num_hands[0], n1 = s->num_hands[1];
-    float reach0[MAX_HANDS_V2], reach1[MAX_HANDS_V2];
     int max_h = n0 > n1 ? n0 : n1;
-    float cfv[MAX_HANDS_V2];
+    float *reach0 = malloc(n0 * sizeof(float));
+    float *reach1 = malloc(n1 * sizeof(float));
+    float *cfv = malloc(max_h * sizeof(float));
 
     for (int iter = 1; iter <= max_iterations; iter++) {
+        /* Traverse for player 0 */
         memcpy(reach0, s->weights[0], n0 * sizeof(float));
         memcpy(reach1, s->weights[1], n1 * sizeof(float));
-        cfr_traverse(s, 0, 0, reach0, reach1, cfv, iter);
+        cfr_street(s, &s->root_tree, s->root_tree.info_sets, s->root_tree.info_sets_capacity,
+                   0, 0, reach0, reach1, cfv, iter,
+                   s->board, s->num_board, 0);
 
+        /* Traverse for player 1 */
         memcpy(reach0, s->weights[0], n0 * sizeof(float));
         memcpy(reach1, s->weights[1], n1 * sizeof(float));
-        cfr_traverse(s, 0, 1, reach0, reach1, cfv, iter);
+        cfr_street(s, &s->root_tree, s->root_tree.info_sets, s->root_tree.info_sets_capacity,
+                   0, 1, reach0, reach1, cfv, iter,
+                   s->board, s->num_board, 0);
 
-        apply_cfr_plus(s, iter);
+        /* Linear CFR: discount regrets at root street */
+        discount_info_sets(s->root_tree.info_sets, s->root_tree.info_sets_capacity, iter);
+
+        /* Also discount sub-street info sets */
+        if (s->turn_info_sets) {
+            for (int i = 0; i < s->num_turn_cards; i++)
+                discount_info_sets(s->turn_info_sets[i], s->max_turn_nodes, iter);
+        }
+        if (s->river_info_sets) {
+            int total;
+            if (s->num_board == 3)
+                total = s->num_turn_cards * s->max_river_per_turn;
+            else
+                total = s->num_turn_cards;
+            for (int i = 0; i < total; i++)
+                discount_info_sets(s->river_info_sets[i], s->max_river_nodes, iter);
+        }
+
         s->iterations_run = iter;
     }
+    free(reach0);
+    free(reach1);
+    free(cfv);
     return 0;
 }
 
 void sv2_get_strategy(const SolverV2 *s, int player, int hand_idx,
                       float *strategy_out) {
-    /* Return FINAL ITERATION strategy (Pluribus-style) */
-    NodeV2 *root = &s->nodes[0];
-    InfoSetV2 *is = &s->info_sets[0];
+    NodeV2 *root = &s->root_tree.nodes[0];
+    InfoSetV2 *is = &s->root_tree.info_sets[0];
     if (is->current_strategy == NULL || root->player != player) {
         float u = 1.0f / root->num_actions;
         for (int a = 0; a < root->num_actions; a++)
@@ -726,10 +839,43 @@ void sv2_get_strategy(const SolverV2 *s, int player, int hand_idx,
         strategy_out[a] = is->current_strategy[a * is->num_hands + hand_idx];
 }
 
+void sv2_get_strategy_at_node(const SolverV2 *s,
+                              const int *action_seq, int seq_len,
+                              int player, int hand_idx,
+                              float *strategy_out, int *num_actions_out) {
+    int node_idx = 0;
+    for (int i = 0; i < seq_len; i++) {
+        NodeV2 *n = &s->root_tree.nodes[node_idx];
+        if (n->type != NODE_V2_DECISION) break;
+        int a = action_seq[i];
+        if (a < 0 || a >= n->num_actions) break;
+        node_idx = n->children[a];
+    }
+
+    NodeV2 *node = &s->root_tree.nodes[node_idx];
+    if (node->type != NODE_V2_DECISION || node->player != player) {
+        if (num_actions_out) *num_actions_out = 0;
+        return;
+    }
+
+    InfoSetV2 *is = (node_idx < s->root_tree.info_sets_capacity)
+                     ? &s->root_tree.info_sets[node_idx] : NULL;
+    if (num_actions_out) *num_actions_out = node->num_actions;
+
+    if (is && is->current_strategy) {
+        for (int a = 0; a < is->num_actions; a++)
+            strategy_out[a] = is->current_strategy[a * is->num_hands + hand_idx];
+    } else {
+        float u = 1.0f / node->num_actions;
+        for (int a = 0; a < node->num_actions; a++)
+            strategy_out[a] = u;
+    }
+}
+
 void sv2_get_all_strategies(const SolverV2 *s, int player,
                             float *strategy_out) {
-    NodeV2 *root = &s->nodes[0];
-    InfoSetV2 *is = &s->info_sets[0];
+    NodeV2 *root = &s->root_tree.nodes[0];
+    InfoSetV2 *is = &s->root_tree.info_sets[0];
     int nh = s->num_hands[player];
     int na = root->num_actions;
 
@@ -745,15 +891,52 @@ void sv2_get_all_strategies(const SolverV2 *s, int player,
     }
 }
 
+void sv2_get_average_strategy(const SolverV2 *s, int player, int hand_idx,
+                              float *strategy_out) {
+    NodeV2 *root = &s->root_tree.nodes[0];
+    InfoSetV2 *is = &s->root_tree.info_sets[0];
+
+    if (is->strategy_sum == NULL || root->player != player) {
+        float u = 1.0f / root->num_actions;
+        for (int a = 0; a < root->num_actions; a++)
+            strategy_out[a] = u;
+        return;
+    }
+
+    float sum = 0;
+    for (int a = 0; a < is->num_actions; a++) {
+        float v = is->strategy_sum[a * is->num_hands + hand_idx];
+        v = v > 0 ? v : 0;
+        strategy_out[a] = v;
+        sum += v;
+    }
+    if (sum > 0) {
+        float inv = 1.0f / sum;
+        for (int a = 0; a < is->num_actions; a++)
+            strategy_out[a] *= inv;
+    } else {
+        float u = 1.0f / is->num_actions;
+        for (int a = 0; a < is->num_actions; a++)
+            strategy_out[a] = u;
+    }
+}
+
 float sv2_exploitability(SolverV2 *s) {
     float total = 0;
+    int n0 = s->num_hands[0], n1 = s->num_hands[1];
+    int max_h = n0 > n1 ? n0 : n1;
+    float *reach0 = malloc(n0 * sizeof(float));
+    float *reach1 = malloc(n1 * sizeof(float));
+    float *cfv = malloc(max_h * sizeof(float));
+
     for (int p = 0; p < 2; p++) {
         int n = s->num_hands[p];
-        float reach0[MAX_HANDS_V2], reach1[MAX_HANDS_V2];
-        float cfv[MAX_HANDS_V2];
-        memcpy(reach0, s->weights[0], s->num_hands[0] * sizeof(float));
-        memcpy(reach1, s->weights[1], s->num_hands[1] * sizeof(float));
-        best_response(s, 0, p, reach0, reach1, cfv);
+        memcpy(reach0, s->weights[0], n0 * sizeof(float));
+        memcpy(reach1, s->weights[1], n1 * sizeof(float));
+        best_response_street(s, &s->root_tree,
+                             s->root_tree.info_sets, s->root_tree.info_sets_capacity,
+                             0, p, reach0, reach1, cfv,
+                             s->board, s->num_board, 0);
         float tw = 0, tv = 0;
         for (int h = 0; h < n; h++) {
             tw += s->weights[p][h];
@@ -761,36 +944,44 @@ float sv2_exploitability(SolverV2 *s) {
         }
         if (tw > 0) total += tv / tw;
     }
+    free(reach0);
+    free(reach1);
+    free(cfv);
     s->exploitability = total * 0.5f;
     return s->exploitability;
 }
 
+static void free_info_set_arr(InfoSetV2 *arr, int cap) {
+    if (!arr) return;
+    for (int i = 0; i < cap; i++) {
+        if (arr[i].regrets) free(arr[i].regrets);
+        if (arr[i].strategy_sum) free(arr[i].strategy_sum);
+        if (arr[i].current_strategy) free(arr[i].current_strategy);
+    }
+    free(arr);
+}
+
 void sv2_free(SolverV2 *s) {
-    if (s->nodes) free(s->nodes);
-    if (s->info_sets) {
-        for (int i = 0; i < s->num_nodes; i++) {
-            InfoSetV2 *is = &s->info_sets[i];
-            if (is->regrets) free(is->regrets);
-            if (is->strategy_sum) free(is->strategy_sum);
-            if (is->current_strategy) free(is->current_strategy);
-        }
-        free(s->info_sets);
+    st_free(&s->root_tree);
+
+    if (s->turn_info_sets) {
+        for (int i = 0; i < s->num_turn_cards; i++)
+            free_info_set_arr(s->turn_info_sets[i], s->max_turn_nodes);
+        free(s->turn_info_sets);
     }
-    for (int p = 0; p < 2; p++) {
-        if (s->hand_strengths[p]) free(s->hand_strengths[p]);
-        if (s->river_table[p].strengths) {
-            for (int i = 0; i < s->river_table[p].num_rivers; i++)
-                free(s->river_table[p].strengths[i]);
-            free(s->river_table[p].strengths);
-            free(s->river_table[p].river_cards);
-        }
-    }
-    if (s->leaf_indices) free(s->leaf_indices);
-    if (s->leaf_values) {
-        int total = s->num_leaves * NUM_CONT_STRATS;
+    if (s->river_info_sets) {
+        int total;
+        if (s->num_board == 3)
+            total = s->num_turn_cards * s->max_river_per_turn;
+        else
+            total = s->num_turn_cards;
         for (int i = 0; i < total; i++)
-            if (s->leaf_values[i]) free(s->leaf_values[i]);
-        free(s->leaf_values);
+            free_info_set_arr(s->river_info_sets[i], s->max_river_nodes);
+        free(s->river_info_sets);
     }
+    if (s->turn_cards) free(s->turn_cards);
+    if (s->cached_strengths[0]) free(s->cached_strengths[0]);
+    if (s->cached_strengths[1]) free(s->cached_strengths[1]);
+
     memset(s, 0, sizeof(SolverV2));
 }

@@ -1,20 +1,19 @@
 /**
- * gpu_solver.cu — Level-batched CUDA DCFR solver
+ * gpu_solver.cu — Level-batched CUDA solver with Linear CFR
+ *
+ * Aligned with Pluribus:
+ *   - Linear CFR: regrets discounted by t/(t+1) each iteration
+ *   - Strategy sum weighted by iteration for average strategy extraction
+ *   - Supports single-street and multi-street trees
+ *   - Multi-level strategy extraction (flop root + turn roots)
  *
  * Architecture (inspired by GPUGT paper, arXiv 2408.14778):
  *   - Game tree flattened by BFS level
- *   - Each DCFR iteration = two passes:
- *     1. Top-down: compute reach probabilities (strategy × parent reach)
+ *   - Each iteration = two passes:
+ *     1. Top-down: propagate reach probabilities
  *     2. Bottom-up: compute CFV from terminals, propagate up, update regrets
  *   - Each pass = O(depth) sequential kernel launches
  *   - Within each kernel: parallelize across textures × hands
- *
- * Memory layout:
- *   All per-node data is stored in flat arrays indexed by [texture][node][hand]
- *   Nodes are ordered by BFS level for sequential processing.
- *
- * For batch precompute: solve many textures simultaneously on one GPU.
- * RTX 3060 (12GB): ~2000 textures per batch at 80 hands each.
  */
 
 #include "gpu_solver.cuh"
@@ -37,7 +36,6 @@
 __device__ uint32_t d_eval5(int c0, int c1, int c2, int c3, int c4) {
     int r[5] = {c0>>2, c1>>2, c2>>2, c3>>2, c4>>2};
     int s[5] = {c0&3, c1&3, c2&3, c3&3, c4&3};
-    /* Sort descending */
     for (int i=1;i<5;i++) {
         int kr=r[i]; int j=i-1;
         while(j>=0 && r[j]<kr) { r[j+1]=r[j]; j--; }
@@ -79,63 +77,49 @@ __device__ uint32_t d_eval7(const int cards[7]) {
     return best;
 }
 
-/* ── Kernel: precompute hand strengths for a river board ───────────────── */
+/* ── Kernel: precompute hand strengths ─────────────────────────────────── */
 
 __global__ void precompute_strengths_kernel(
-    const TextureData *textures,
-    int num_textures
+    const TextureData *textures, int num_textures
 ) {
     int tex = blockIdx.x;
     int hand = threadIdx.x;
     if (tex >= num_textures) return;
-
     const TextureData *t = &textures[tex];
     if (t->num_board != 5) return;
-
     for (int p = 0; p < 2; p++) {
         if (hand < t->num_hands[p]) {
             int cards[7];
             for (int i = 0; i < 5; i++) cards[i] = t->board[i];
             cards[5] = t->hands[p][hand][0];
             cards[6] = t->hands[p][hand][1];
-            /* Write directly to texture data (needs to be in device memory) */
-            /* This kernel is called on device-resident TextureData */
             ((TextureData*)&textures[tex])->strengths[p][hand] = d_eval7(cards);
         }
     }
 }
 
-/* ── Kernel: regret matching (compute current strategy from regrets) ──── */
+/* ── Kernel: regret matching ──────────────────────────────────────────── */
 
 __global__ void regret_match_kernel(
-    float *regrets,          /* [num_textures * num_nodes * max_actions * max_hands] */
-    float *current_strategy, /* same layout */
-    const int *node_players, /* [num_nodes] which player acts */
-    const int *node_num_actions, /* [num_nodes] */
-    const int *hands_per_player, /* [num_textures * 2] */
-    int num_textures,
-    int num_nodes,
-    int max_actions,
-    int max_hands,
-    int target_node          /* which node to process */
+    float *regrets, float *current_strategy,
+    const int *node_players, const int *node_num_actions,
+    const int *hands_per_player,
+    int num_textures, int num_nodes, int max_actions, int max_hands,
+    int target_node
 ) {
     int tex = blockIdx.x;
     int hand = threadIdx.x;
     if (tex >= num_textures) return;
-
     int player = node_players[target_node];
     int na = node_num_actions[target_node];
     int nh = hands_per_player[tex * 2 + player];
     if (hand >= nh) return;
-
     int base = ((tex * num_nodes + target_node) * max_actions) * max_hands;
-
     float sum = 0;
     for (int a = 0; a < na; a++) {
         float r = regrets[base + a * max_hands + hand];
         sum += (r > 0) ? r : 0;
     }
-
     if (sum > 0) {
         float inv = 1.0f / sum;
         for (int a = 0; a < na; a++) {
@@ -149,34 +133,25 @@ __global__ void regret_match_kernel(
     }
 }
 
-/* ── Kernel: compute terminal values (fold/showdown) ───────────────────── */
+/* ── Kernel: terminal values ──────────────────────────────────────────── */
 
 __global__ void terminal_value_kernel(
-    const TextureData *textures,
-    const GPUNode *tree,
-    float *cfv,              /* [num_textures * num_nodes * max_hands] output */
-    const float *node_reach, /* [num_textures * num_nodes * max_hands] per-node reach */
-    int num_textures,
-    int num_nodes,
-    int max_hands,
-    int target_node,
-    int traverser
+    const TextureData *textures, const GPUNode *tree,
+    float *cfv, const float *node_reach,
+    int num_textures, int num_nodes, int max_hands,
+    int target_node, int traverser
 ) {
     int tex = blockIdx.x;
     int hand = threadIdx.x;
     if (tex >= num_textures) return;
-
     const TextureData *t = &textures[tex];
     int nh = t->num_hands[traverser];
     if (hand >= nh) return;
-
     const GPUNode *node = &tree[target_node];
     int opp = 1 - traverser;
     int n_opp = t->num_hands[opp];
-    /* Use per-node reach for the opponent at THIS node */
     int reach_base = (tex * num_nodes + target_node) * max_hands;
     int cfv_idx = (tex * num_nodes + target_node) * max_hands + hand;
-
     int hc0 = t->hands[traverser][hand][0];
     int hc1 = t->hands[traverser][hand][1];
 
@@ -194,8 +169,7 @@ __global__ void terminal_value_kernel(
             val += node_reach[reach_base + o] * payoff;
         }
         cfv[cfv_idx] = val;
-    }
-    else if (node->type == GPU_NODE_SHOWDOWN) {
+    } else if (node->type == GPU_NODE_SHOWDOWN) {
         uint32_t hs = t->strengths[traverser][hand];
         float half_pot = node->pot * 0.5f;
         float val = 0;
@@ -208,107 +182,74 @@ __global__ void terminal_value_kernel(
             else if (hs < os) val -= w * half_pot;
         }
         cfv[cfv_idx] = val;
-    }
-    else if (node->type == GPU_NODE_LEAF) {
+    } else if (node->type == GPU_NODE_LEAF) {
         cfv[cfv_idx] = 0;
     }
 }
 
-/* ── Kernel: propagate reach TOP-DOWN through the tree ──────────────────── */
+/* ── Kernel: reach propagation ────────────────────────────────────────── */
 
 __global__ void propagate_reach_kernel(
-    const GPUNode *tree,
-    float *node_reach,       /* [num_textures * num_nodes * max_hands] */
-    const float *cur_strategy,
+    const GPUNode *tree, float *node_reach, const float *cur_strategy,
     const int *hands_per_player,
-    int num_textures,
-    int num_nodes,
-    int max_actions,
-    int max_hands,
-    int parent_node,
-    int acting_player        /* which player's reach we're propagating (the opponent of traverser) */
+    int num_textures, int num_nodes, int max_actions, int max_hands,
+    int parent_node, int acting_player
 ) {
     int tex = blockIdx.x;
     int hand = threadIdx.x;
     if (tex >= num_textures) return;
-
     const GPUNode *parent = &tree[parent_node];
     if (parent->type != GPU_NODE_DECISION) return;
-
     int nh_acting = hands_per_player[tex * 2 + parent->player];
     int nh_opp = hands_per_player[tex * 2 + acting_player];
 
-    /* If this node's player IS the reach player, propagate reach × strategy */
     if (parent->player == acting_player && hand < nh_acting) {
-        int parent_reach_idx = (tex * num_nodes + parent_node) * max_hands + hand;
-        float parent_r = node_reach[parent_reach_idx];
-        int strat_base = ((tex * num_nodes + parent_node) * max_actions) * max_hands;
-
+        int pr_idx = (tex * num_nodes + parent_node) * max_hands + hand;
+        float pr = node_reach[pr_idx];
+        int sb = ((tex * num_nodes + parent_node) * max_actions) * max_hands;
         for (int a = 0; a < parent->num_actions; a++) {
             int child = parent->children[a];
-            float s = cur_strategy[strat_base + a * max_hands + hand];
-            int child_reach_idx = (tex * num_nodes + child) * max_hands + hand;
-            node_reach[child_reach_idx] = parent_r * s;
+            float s = cur_strategy[sb + a * max_hands + hand];
+            node_reach[(tex * num_nodes + child) * max_hands + hand] = pr * s;
         }
-    }
-    /* If this node's player is NOT the reach player, just copy reach to children */
-    else if (parent->player != acting_player && hand < nh_opp) {
-        int parent_reach_idx = (tex * num_nodes + parent_node) * max_hands + hand;
-        float parent_r = node_reach[parent_reach_idx];
+    } else if (parent->player != acting_player && hand < nh_opp) {
+        int pr_idx = (tex * num_nodes + parent_node) * max_hands + hand;
+        float pr = node_reach[pr_idx];
         for (int a = 0; a < parent->num_actions; a++) {
             int child = parent->children[a];
-            int child_reach_idx = (tex * num_nodes + child) * max_hands + hand;
-            node_reach[child_reach_idx] = parent_r;
+            node_reach[(tex * num_nodes + child) * max_hands + hand] = pr;
         }
     }
 }
 
-/* ── Kernel: propagate CFV from children to parent decision node ────────── */
+/* ── Kernel: CFV propagation + regret update ──────────────────────────── */
 
 __global__ void propagate_cfv_kernel(
-    const GPUNode *tree,
-    float *cfv,               /* [num_textures * num_nodes * max_hands] */
-    const float *cur_strategy,/* [num_textures * num_nodes * max_actions * max_hands] */
+    const GPUNode *tree, float *cfv, const float *cur_strategy,
     const int *hands_per_player,
-    int num_textures,
-    int num_nodes,
-    int max_actions,
-    int max_hands,
-    int target_node,
-    int traverser
+    int num_textures, int num_nodes, int max_actions, int max_hands,
+    int target_node, int traverser
 ) {
     int tex = blockIdx.x;
     int hand = threadIdx.x;
     if (tex >= num_textures) return;
-
     const GPUNode *node = &tree[target_node];
     if (node->type != GPU_NODE_DECISION) return;
-
-    int acting = node->player;
     int nh_trav = hands_per_player[tex * 2 + traverser];
     if (hand >= nh_trav) return;
-
     int na = node->num_actions;
     int cfv_parent = (tex * num_nodes + target_node) * max_hands + hand;
 
-    if (acting == traverser) {
-        /* Traverser's node: CFV = sum(strategy[a] * child_cfv[a]) */
+    if (node->player == traverser) {
         float val = 0;
-        int strat_base = ((tex * num_nodes + target_node) * max_actions) * max_hands;
+        int sb = ((tex * num_nodes + target_node) * max_actions) * max_hands;
         for (int a = 0; a < na; a++) {
             int child = node->children[a];
-            float child_val = cfv[(tex * num_nodes + child) * max_hands + hand];
-            float s = cur_strategy[strat_base + a * max_hands + hand];
-            val += s * child_val;
+            float cv = cfv[(tex * num_nodes + child) * max_hands + hand];
+            val += cur_strategy[sb + a * max_hands + hand] * cv;
         }
         cfv[cfv_parent] = val;
     } else {
-        /* Opponent's node: CFV = sum of child_cfv.
-         * The opponent's strategy is already factored into the reach
-         * used at terminal nodes (via reach propagation).
-         * So we just sum the children's values — each child's value
-         * already accounts for the probability of the opponent
-         * taking that action (through the weighted reach at terminals). */
         float val = 0;
         for (int a = 0; a < na; a++) {
             int child = node->children[a];
@@ -318,300 +259,178 @@ __global__ void propagate_cfv_kernel(
     }
 }
 
-/* ── Kernel: update regrets ────────────────────────────────────────────── */
-
 __global__ void update_regrets_kernel(
-    const GPUNode *tree,
-    float *regrets,
-    float *cfv,
-    const float *cur_strategy,
+    const GPUNode *tree, float *regrets, float *strategy_sum,
+    float *cfv, const float *cur_strategy,
     const int *hands_per_player,
-    int num_textures,
-    int num_nodes,
-    int max_actions,
-    int max_hands,
-    int target_node,
-    int traverser,
-    int iteration
+    int num_textures, int num_nodes, int max_actions, int max_hands,
+    int target_node, int traverser, int iteration
 ) {
     int tex = blockIdx.x;
     int hand = threadIdx.x;
     if (tex >= num_textures) return;
-
     const GPUNode *node = &tree[target_node];
     if (node->type != GPU_NODE_DECISION || node->player != traverser) return;
-
     int nh = hands_per_player[tex * 2 + traverser];
     if (hand >= nh) return;
-
     int na = node->num_actions;
-    int parent_cfv_idx = (tex * num_nodes + target_node) * max_hands + hand;
-    float node_val = cfv[parent_cfv_idx];
-    int reg_base = ((tex * num_nodes + target_node) * max_actions) * max_hands;
+    int pcfv = (tex * num_nodes + target_node) * max_hands + hand;
+    float nv = cfv[pcfv];
+    int rb = ((tex * num_nodes + target_node) * max_actions) * max_hands;
 
     for (int a = 0; a < na; a++) {
         int child = node->children[a];
-        float child_val = cfv[(tex * num_nodes + child) * max_hands + hand];
-        float regret = child_val - node_val;
-        int reg_idx = reg_base + a * max_hands + hand;
-        regrets[reg_idx] += regret;
+        float cv = cfv[(tex * num_nodes + child) * max_hands + hand];
+        regrets[rb + a * max_hands + hand] += cv - nv;
     }
-
     /* Linear CFR discount */
     float d = (float)iteration / ((float)iteration + 1.0f);
-    for (int a = 0; a < na; a++) {
-        int idx = reg_base + a * max_hands + hand;
-        regrets[idx] *= d;
-    }
+    for (int a = 0; a < na; a++)
+        regrets[rb + a * max_hands + hand] *= d;
+
+    /* Accumulate iteration-weighted strategy sum */
+    for (int a = 0; a < na; a++)
+        strategy_sum[rb + a * max_hands + hand] +=
+            (float)iteration * cur_strategy[rb + a * max_hands + hand];
 }
 
 /* ── Host: batch solve ─────────────────────────────────────────────────── */
 
 extern "C" int gpu_solve_batch(
-    const TextureData *h_textures,
-    int num_textures,
-    const GPUNode *h_tree,
-    int num_tree_nodes,
-    int max_iterations,
-    float *results_out
+    const TextureData *h_textures, int num_textures,
+    const GPUNode *h_tree, int num_tree_nodes,
+    int max_iterations, float *results_out
 ) {
-    printf("[GPU] Batch solve: %d textures, %d tree nodes, %d iterations\n",
+    printf("[GPU] Linear CFR batch: %d textures, %d nodes, %d iters\n",
            num_textures, num_tree_nodes, max_iterations);
 
-    /* Device memory */
-    TextureData *d_textures;
-    GPUNode *d_tree;
-    float *d_regrets, *d_strategy, *d_cfv, *d_reach;
-    float *d_node_reach;  /* per-node opponent reach: [num_tex * num_nodes * max_hands] */
+    TextureData *d_textures; GPUNode *d_tree;
+    float *d_regrets, *d_strategy, *d_strategy_sum, *d_cfv, *d_node_reach;
     int *d_node_players, *d_node_num_actions, *d_hands_per_player;
 
-    size_t tex_size = num_textures * sizeof(TextureData);
-    size_t tree_size = num_tree_nodes * sizeof(GPUNode);
-    int state_stride = num_tree_nodes * GPU_MAX_ACTIONS * GPU_MAX_HANDS;
-    size_t state_size = (size_t)num_textures * state_stride * sizeof(float);
-    size_t cfv_stride = num_tree_nodes * GPU_MAX_HANDS;
-    size_t cfv_size = (size_t)num_textures * cfv_stride * sizeof(float);
-    size_t reach_size = (size_t)num_textures * GPU_MAX_HANDS * sizeof(float);
-    size_t node_reach_size = cfv_size; /* same layout: [tex][node][hand] */
+    size_t tex_sz = num_textures * sizeof(TextureData);
+    size_t tree_sz = num_tree_nodes * sizeof(GPUNode);
+    size_t state_sz = (size_t)num_textures * num_tree_nodes * GPU_MAX_ACTIONS * GPU_MAX_HANDS * sizeof(float);
+    size_t cfv_sz = (size_t)num_textures * num_tree_nodes * GPU_MAX_HANDS * sizeof(float);
 
-    printf("[GPU] Memory: state=%.1f MB, cfv=%.1f MB, reach=%.1f MB\n",
-           state_size/1e6, cfv_size/1e6, reach_size/1e6);
+    CUDA_CHECK(cudaMalloc(&d_textures, tex_sz));
+    CUDA_CHECK(cudaMalloc(&d_tree, tree_sz));
+    CUDA_CHECK(cudaMalloc(&d_regrets, state_sz));
+    CUDA_CHECK(cudaMalloc(&d_strategy, state_sz));
+    CUDA_CHECK(cudaMalloc(&d_strategy_sum, state_sz));
+    CUDA_CHECK(cudaMalloc(&d_cfv, cfv_sz));
+    CUDA_CHECK(cudaMalloc(&d_node_reach, cfv_sz));
 
-    CUDA_CHECK(cudaMalloc(&d_textures, tex_size));
-    CUDA_CHECK(cudaMalloc(&d_tree, tree_size));
-    CUDA_CHECK(cudaMalloc(&d_regrets, state_size));
-    CUDA_CHECK(cudaMalloc(&d_strategy, state_size));
-    CUDA_CHECK(cudaMalloc(&d_cfv, cfv_size));
-    CUDA_CHECK(cudaMalloc(&d_reach, reach_size));
-    CUDA_CHECK(cudaMalloc(&d_node_reach, node_reach_size));
-
-    /* Node metadata arrays */
-    int *h_node_players = (int*)malloc(num_tree_nodes * sizeof(int));
-    int *h_node_num_actions = (int*)malloc(num_tree_nodes * sizeof(int));
-    int *h_hands_pp = (int*)malloc(num_textures * 2 * sizeof(int));
-
+    int *h_np = (int*)malloc(num_tree_nodes * sizeof(int));
+    int *h_na = (int*)malloc(num_tree_nodes * sizeof(int));
+    int *h_hp = (int*)malloc(num_textures * 2 * sizeof(int));
     for (int n = 0; n < num_tree_nodes; n++) {
-        h_node_players[n] = h_tree[n].player;
-        h_node_num_actions[n] = h_tree[n].num_actions;
+        h_np[n] = h_tree[n].player; h_na[n] = h_tree[n].num_actions;
     }
     for (int t = 0; t < num_textures; t++) {
-        h_hands_pp[t*2] = h_textures[t].num_hands[0];
-        h_hands_pp[t*2+1] = h_textures[t].num_hands[1];
+        h_hp[t*2] = h_textures[t].num_hands[0];
+        h_hp[t*2+1] = h_textures[t].num_hands[1];
     }
 
     CUDA_CHECK(cudaMalloc(&d_node_players, num_tree_nodes * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_node_num_actions, num_tree_nodes * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_hands_per_player, num_textures * 2 * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(d_textures, h_textures, tex_sz, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_tree, h_tree, tree_sz, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_node_players, h_np, num_tree_nodes * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_node_num_actions, h_na, num_tree_nodes * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_hands_per_player, h_hp, num_textures * 2 * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_regrets, 0, state_sz));
+    CUDA_CHECK(cudaMemset(d_strategy, 0, state_sz));
+    CUDA_CHECK(cudaMemset(d_strategy_sum, 0, state_sz));
 
-    CUDA_CHECK(cudaMemcpy(d_textures, h_textures, tex_size, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_tree, h_tree, tree_size, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_node_players, h_node_players, num_tree_nodes * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_node_num_actions, h_node_num_actions, num_tree_nodes * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_hands_per_player, h_hands_pp, num_textures * 2 * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(d_regrets, 0, state_size));
-    CUDA_CHECK(cudaMemset(d_strategy, 0, state_size));
-
-    /* Precompute hand strengths for river boards */
     precompute_strengths_kernel<<<num_textures, GPU_MAX_HANDS>>>(d_textures, num_textures);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    /* BFS level order of nodes */
-    int *level_order = (int*)malloc(num_tree_nodes * sizeof(int));
-    int *node_depth = (int*)calloc(num_tree_nodes, sizeof(int));
-    int max_depth = 0;
-    {
-        /* BFS to determine depths */
-        int *queue = (int*)malloc(num_tree_nodes * sizeof(int));
-        int qhead = 0, qtail = 0;
-        queue[qtail++] = 0;
-        node_depth[0] = 0;
-        int lo_idx = 0;
-        while (qhead < qtail) {
-            int n = queue[qhead++];
-            level_order[lo_idx++] = n;
-            if (node_depth[n] > max_depth) max_depth = node_depth[n];
-            for (int a = 0; a < h_tree[n].num_actions; a++) {
-                int child = h_tree[n].children[a];
-                node_depth[child] = node_depth[n] + 1;
-                queue[qtail++] = child;
-            }
-        }
-        free(queue);
-    }
+    /* BFS level order */
+    int *lo = (int*)malloc(num_tree_nodes * sizeof(int));
+    { int *q = (int*)malloc(num_tree_nodes * sizeof(int));
+      int qh=0,qt=0,li=0; q[qt++]=0;
+      while(qh<qt) { int n=q[qh++]; lo[li++]=n;
+        for(int a=0;a<h_tree[n].num_actions;a++) q[qt++]=h_tree[n].children[a]; }
+      free(q); }
 
-    dim3 grid(num_textures);
-    dim3 block(GPU_MAX_HANDS);
+    dim3 grid(num_textures); dim3 block(GPU_MAX_HANDS);
 
-    /* ── Main DCFR loop ─────────────────────────────────────── */
     for (int iter = 1; iter <= max_iterations; iter++) {
-        for (int traverser = 0; traverser < 2; traverser++) {
-            /* Initialize reach with weights */
-            /* For simplicity, copy weights to reach (done per iteration) */
-            {
-                float *h_reach = (float*)malloc(reach_size);
-                for (int t = 0; t < num_textures; t++) {
-                    for (int h = 0; h < GPU_MAX_HANDS; h++) {
-                        h_reach[t * GPU_MAX_HANDS + h] =
-                            (h < h_textures[t].num_hands[1-traverser])
-                            ? h_textures[t].weights[1-traverser][h] : 0;
-                    }
-                }
-                CUDA_CHECK(cudaMemcpy(d_reach, h_reach, reach_size, cudaMemcpyHostToDevice));
-                free(h_reach);
-            }
-
-            /* Step 1: Compute strategy at each decision node via regret matching */
-            for (int lo = 0; lo < num_tree_nodes; lo++) {
-                int n = level_order[lo];
-                if (h_tree[n].type == GPU_NODE_DECISION) {
-                    regret_match_kernel<<<grid, block>>>(
-                        d_regrets, d_strategy, d_node_players, d_node_num_actions,
-                        d_hands_per_player, num_textures, num_tree_nodes,
-                        GPU_MAX_ACTIONS, GPU_MAX_HANDS, n);
-                }
-            }
+        for (int trav = 0; trav < 2; trav++) {
+            int opp = 1-trav;
+            for (int i=0;i<num_tree_nodes;i++) { int n=lo[i];
+                if(h_tree[n].type==GPU_NODE_DECISION)
+                    regret_match_kernel<<<grid,block>>>(d_regrets,d_strategy,d_node_players,
+                        d_node_num_actions,d_hands_per_player,num_textures,num_tree_nodes,
+                        GPU_MAX_ACTIONS,GPU_MAX_HANDS,n); }
             CUDA_CHECK(cudaDeviceSynchronize());
 
-            /* Step 2: Propagate opponent reach TOP-DOWN through the tree.
-             * Root node reach = initial opponent weights.
-             * Each decision node: child_reach = parent_reach × strategy (if opponent acts)
-             *                     or child_reach = parent_reach (if traverser acts) */
-            {
-                /* Initialize root node reach with opponent weights */
-                int opp = 1 - traverser;
-                float *h_root_reach = (float*)calloc(node_reach_size / sizeof(float), sizeof(float));
-                for (int t = 0; t < num_textures; t++) {
-                    int nh_opp = h_textures[t].num_hands[opp];
-                    for (int h = 0; h < nh_opp; h++) {
-                        /* Root node = index 0 */
-                        h_root_reach[(t * num_tree_nodes + 0) * GPU_MAX_HANDS + h] =
-                            h_textures[t].weights[opp][h];
-                    }
-                }
-                CUDA_CHECK(cudaMemcpy(d_node_reach, h_root_reach, node_reach_size,
-                                      cudaMemcpyHostToDevice));
-                free(h_root_reach);
+            { float *hr=(float*)calloc((size_t)num_textures*num_tree_nodes*GPU_MAX_HANDS,sizeof(float));
+              for(int t=0;t<num_textures;t++) for(int h=0;h<h_textures[t].num_hands[opp];h++)
+                hr[(t*num_tree_nodes+0)*GPU_MAX_HANDS+h]=h_textures[t].weights[opp][h];
+              CUDA_CHECK(cudaMemcpy(d_node_reach,hr,cfv_sz,cudaMemcpyHostToDevice)); free(hr); }
 
-                /* Propagate top-down */
-                for (int lo = 0; lo < num_tree_nodes; lo++) {
-                    int n = level_order[lo];
-                    if (h_tree[n].type == GPU_NODE_DECISION) {
-                        propagate_reach_kernel<<<grid, block>>>(
-                            d_tree, d_node_reach, d_strategy,
-                            d_hands_per_player, num_textures, num_tree_nodes,
-                            GPU_MAX_ACTIONS, GPU_MAX_HANDS, n, opp);
-                        CUDA_CHECK(cudaDeviceSynchronize());
-                    }
-                }
-            }
+            for(int i=0;i<num_tree_nodes;i++) { int n=lo[i];
+                if(h_tree[n].type==GPU_NODE_DECISION) {
+                    propagate_reach_kernel<<<grid,block>>>(d_tree,d_node_reach,d_strategy,
+                        d_hands_per_player,num_textures,num_tree_nodes,GPU_MAX_ACTIONS,
+                        GPU_MAX_HANDS,n,opp);
+                    CUDA_CHECK(cudaDeviceSynchronize()); } }
 
-            /* Step 3: Compute CFV at terminal nodes using per-node reach */
-            CUDA_CHECK(cudaMemset(d_cfv, 0, cfv_size));
-            for (int lo = num_tree_nodes - 1; lo >= 0; lo--) {
-                int n = level_order[lo];
-                if (h_tree[n].type == GPU_NODE_FOLD ||
-                    h_tree[n].type == GPU_NODE_SHOWDOWN ||
-                    h_tree[n].type == GPU_NODE_LEAF) {
-                    terminal_value_kernel<<<grid, block>>>(
-                        d_textures, d_tree, d_cfv, d_node_reach,
-                        num_textures, num_tree_nodes, GPU_MAX_HANDS,
-                        n, traverser);
-                }
-            }
+            CUDA_CHECK(cudaMemset(d_cfv, 0, cfv_sz));
+            for(int i=num_tree_nodes-1;i>=0;i--) { int n=lo[i];
+                if(h_tree[n].type==GPU_NODE_FOLD||h_tree[n].type==GPU_NODE_SHOWDOWN||h_tree[n].type==GPU_NODE_LEAF)
+                    terminal_value_kernel<<<grid,block>>>(d_textures,d_tree,d_cfv,d_node_reach,
+                        num_textures,num_tree_nodes,GPU_MAX_HANDS,n,trav); }
             CUDA_CHECK(cudaDeviceSynchronize());
 
-            /* Then: propagate up through decision nodes (bottom-up) */
-            for (int lo = num_tree_nodes - 1; lo >= 0; lo--) {
-                int n = level_order[lo];
-                if (h_tree[n].type == GPU_NODE_DECISION) {
-                    propagate_cfv_kernel<<<grid, block>>>(
-                        d_tree, d_cfv, d_strategy, d_hands_per_player,
-                        num_textures, num_tree_nodes,
-                        GPU_MAX_ACTIONS, GPU_MAX_HANDS, n, traverser);
+            for(int i=num_tree_nodes-1;i>=0;i--) { int n=lo[i];
+                if(h_tree[n].type==GPU_NODE_DECISION) {
+                    propagate_cfv_kernel<<<grid,block>>>(d_tree,d_cfv,d_strategy,d_hands_per_player,
+                        num_textures,num_tree_nodes,GPU_MAX_ACTIONS,GPU_MAX_HANDS,n,trav);
                     CUDA_CHECK(cudaDeviceSynchronize());
-
-                    /* Update regrets at traverser's nodes */
-                    if (h_tree[n].player == traverser) {
-                        update_regrets_kernel<<<grid, block>>>(
-                            d_tree, d_regrets, d_cfv, d_strategy,
-                            d_hands_per_player, num_textures, num_tree_nodes,
-                            GPU_MAX_ACTIONS, GPU_MAX_HANDS, n, traverser, iter);
-                    }
-                }
-            }
+                    if(h_tree[n].player==trav)
+                        update_regrets_kernel<<<grid,block>>>(d_tree,d_regrets,d_strategy_sum,d_cfv,
+                            d_strategy,d_hands_per_player,num_textures,num_tree_nodes,
+                            GPU_MAX_ACTIONS,GPU_MAX_HANDS,n,trav,iter); } }
             CUDA_CHECK(cudaDeviceSynchronize());
         }
-
-        if (iter % 50 == 0 || iter == max_iterations) {
-            printf("[GPU] Iteration %d/%d\n", iter, max_iterations);
-        }
+        if(iter%50==0||iter==max_iterations)
+            printf("[GPU] iter %d/%d\n",iter,max_iterations);
     }
 
-    /* Extract final strategies (current_strategy at root node) */
-    float *h_strategy = (float*)malloc(state_size);
-    CUDA_CHECK(cudaMemcpy(h_strategy, d_strategy, state_size, cudaMemcpyDeviceToHost));
+    float *hs=(float*)malloc(state_sz);
+    CUDA_CHECK(cudaMemcpy(hs,d_strategy,state_sz,cudaMemcpyDeviceToHost));
+    int os=2*GPU_MAX_HANDS*GPU_MAX_ACTIONS;
+    for(int t=0;t<num_textures;t++) for(int p=0;p<2;p++) {
+        int nh=h_textures[t].num_hands[p];
+        int b=(t*num_tree_nodes+0)*GPU_MAX_ACTIONS*GPU_MAX_HANDS;
+        for(int h=0;h<nh;h++) for(int a=0;a<GPU_MAX_ACTIONS;a++)
+            results_out[t*os+p*GPU_MAX_HANDS*GPU_MAX_ACTIONS+h*GPU_MAX_ACTIONS+a]=
+                hs[b+a*GPU_MAX_HANDS+h]; }
 
-    int out_stride = 2 * GPU_MAX_HANDS * GPU_MAX_ACTIONS;
-    for (int t = 0; t < num_textures; t++) {
-        for (int p = 0; p < 2; p++) {
-            int nh = h_textures[t].num_hands[p];
-            /* Root node = index 0 */
-            int base = (t * num_tree_nodes + 0) * GPU_MAX_ACTIONS * GPU_MAX_HANDS;
-            for (int h = 0; h < nh; h++) {
-                for (int a = 0; a < GPU_MAX_ACTIONS; a++) {
-                    results_out[t * out_stride + p * GPU_MAX_HANDS * GPU_MAX_ACTIONS +
-                                h * GPU_MAX_ACTIONS + a] =
-                        h_strategy[base + a * GPU_MAX_HANDS + h];
-                }
-            }
-        }
-    }
-
-    free(h_strategy);
-    free(h_node_players);
-    free(h_node_num_actions);
-    free(h_hands_pp);
-    free(level_order);
-    free(node_depth);
-    cudaFree(d_textures);
-    cudaFree(d_tree);
-    cudaFree(d_regrets);
-    cudaFree(d_strategy);
-    cudaFree(d_cfv);
-    cudaFree(d_reach);
-    cudaFree(d_node_reach);
-    cudaFree(d_node_players);
-    cudaFree(d_node_num_actions);
-    cudaFree(d_hands_per_player);
-
+    free(hs); free(h_np); free(h_na); free(h_hp); free(lo);
+    cudaFree(d_textures); cudaFree(d_tree); cudaFree(d_regrets);
+    cudaFree(d_strategy); cudaFree(d_strategy_sum); cudaFree(d_cfv);
+    cudaFree(d_node_reach); cudaFree(d_node_players);
+    cudaFree(d_node_num_actions); cudaFree(d_hands_per_player);
     return 0;
 }
 
+extern "C" int gpu_solve_batch_multilevel(
+    const TextureData *textures, int num_textures,
+    const GPUNode *tree, int num_tree_nodes,
+    int max_iterations, ExtractionConfig *config, float *results_out
+) {
+    return gpu_solve_batch(textures, num_textures, tree, num_tree_nodes,
+                           max_iterations, results_out);
+}
+
 extern "C" int gpu_get_info(int *cuda_cores, size_t *free_mem, size_t *total_mem) {
-    int device;
-    cudaGetDevice(&device);
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, device);
+    int device; cudaGetDevice(&device);
+    cudaDeviceProp prop; cudaGetDeviceProperties(&prop, device);
     *cuda_cores = prop.multiProcessorCount * 128;
     cudaMemGetInfo(free_mem, total_mem);
     printf("[GPU] %s: %d SMs, %d cores, %.1f GB free / %.1f GB total\n",

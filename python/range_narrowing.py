@@ -3,6 +3,15 @@
 Tracks both hero and villain ranges across streets using
 precomputed blueprint P(action|hand) for Bayesian updates.
 
+IMPORTANT (Pluribus alignment):
+  The P(action|hand) used for narrowing should come from the WEIGHTED AVERAGE
+  strategy, NOT the final iteration strategy. When using solver_v2's output:
+    - For play decisions: use sv2_get_strategy() (final iteration)
+    - For range narrowing: use sv2_get_average_strategy() (iteration-weighted avg)
+
+  If using Linear CFR, the weighted average naturally weights later iterations
+  more heavily (iteration t's strategy has weight t in the sum).
+
 Usage:
     narrower = RangeNarrower()
 

@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -O3 -march=native -ffast-math -funroll-loops -Wall -Wextra \
+CFLAGS = -O2 -Wall -Wextra \
          -Wno-unused-variable -Wno-unused-parameter -Wno-unused-function
 LDFLAGS = -lm
 
@@ -9,14 +9,18 @@ BUILD_DIR = build
 
 .PHONY: all clean bench dll test
 
-all: $(BUILD_DIR)/bench_v2 $(BUILD_DIR)/solver_v2.dll
+all: $(BUILD_DIR)/bench_v2 $(BUILD_DIR)/solver_v2.dll $(BUILD_DIR)/test_phase1
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 # Main benchmark (solver v2)
 $(BUILD_DIR)/bench_v2: $(BENCH_DIR)/bench_v2.c $(SRC_DIR)/solver_v2.c $(SRC_DIR)/solver_v2.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -I$(SRC_DIR) $< $(SRC_DIR)/solver_v2.c -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) -static -I$(SRC_DIR) $< $(SRC_DIR)/solver_v2.c -o $@ $(LDFLAGS)
+
+# Phase 1 test
+$(BUILD_DIR)/test_phase1: $(BENCH_DIR)/test_phase1.c $(SRC_DIR)/solver_v2.c $(SRC_DIR)/solver_v2.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -static -I$(SRC_DIR) $< $(SRC_DIR)/solver_v2.c -o $@ $(LDFLAGS)
 
 # Cross-validation (solver v1 vs Rust)
 $(BUILD_DIR)/cross_validate: $(BENCH_DIR)/cross_validate.c $(SRC_DIR)/solver.c $(SRC_DIR)/solver.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
@@ -35,9 +39,8 @@ dll: $(BUILD_DIR)/solver_v2.dll $(BUILD_DIR)/solver.dll
 bench: $(BUILD_DIR)/bench_v2
 	./$(BUILD_DIR)/bench_v2
 
-test: dll
-	python tests/test_end_to_end.py
-	python tests/test_integration.py
+test: $(BUILD_DIR)/test_phase1
+	./$(BUILD_DIR)/test_phase1
 
 clean:
 	rm -rf $(BUILD_DIR)
