@@ -50,6 +50,7 @@
 /* Info set key */
 typedef struct {
     int player;
+    int street;              /* 1=flop, 2=turn, 3=river */
     uint64_t board_hash;
     uint64_t action_hash;
 } BPInfoKey;
@@ -202,6 +203,48 @@ BP_EXPORT int bp_get_strategy(const BPSolver *s, int player,
 
 BP_EXPORT int bp_num_info_sets(const BPSolver *s);
 BP_EXPORT void bp_free(BPSolver *s);
+
+/**
+ * Export ALL info set strategies to a binary buffer.
+ *
+ * For each occupied slot in the hash table, writes:
+ *   BPInfoKey (player, board_hash, action_hash)  — 20 bytes
+ *   uint8 num_actions                             — 1 byte
+ *   uint8 num_hands                               — 1 byte (actually num_buckets)
+ *   uint8[num_actions * num_hands] strategy       — quantized to 0-255
+ *
+ * Strategies are derived from regrets via regret matching (not raw regrets).
+ * Quantization: strategy[a] * 255, rounded, clamped to [0, 255].
+ *
+ * Args:
+ *   s: solved state
+ *   buf: output buffer (must be pre-allocated)
+ *   buf_size: size of buf in bytes
+ *   bytes_written: output, actual bytes written
+ *
+ * Returns 0 on success, -1 if buffer too small.
+ * Call with buf=NULL to query required buffer size via bytes_written.
+ */
+BP_EXPORT int bp_export_strategies(const BPSolver *s,
+                                    unsigned char *buf, size_t buf_size,
+                                    size_t *bytes_written);
+
+/**
+ * Export EHS values and bucket assignments for all hands.
+ *
+ * Writes per-hand: float32 EHS, int32 bucket_index
+ * Total: num_hands * 8 bytes
+ *
+ * Args:
+ *   s: solver state (after bp_set_buckets)
+ *   street: which street's bucketing (1=flop, 2=turn, 3=river)
+ *   player: which player
+ *   bucket_out: [num_hands] bucket assignments
+ *
+ * Returns num_hands.
+ */
+BP_EXPORT int bp_export_buckets(const BPSolver *s, int street, int player,
+                                 int *bucket_out);
 
 #ifdef __cplusplus
 }

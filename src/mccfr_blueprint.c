@@ -89,6 +89,7 @@ static int info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
                                       int num_actions, int num_hands) {
     uint64_t h = hash_combine(key.board_hash, key.action_hash);
     h = hash_combine(h, (uint64_t)key.player);
+    h = hash_combine(h, (uint64_t)key.street);
     int slot = (int)(h % (uint64_t)t->table_size);
 
     for (int probe = 0; probe < 4096; probe++) {
@@ -98,6 +99,7 @@ static int info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
         if (state == 1) {
             /* Slot is ready — check if it's our key */
             if (t->keys[idx].player == key.player &&
+                t->keys[idx].street == key.street &&
                 t->keys[idx].board_hash == key.board_hash &&
                 t->keys[idx].action_hash == key.action_hash) {
                 return idx;  /* Fast path: existing entry */
@@ -136,6 +138,7 @@ static int info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
             if (__atomic_load_n(&t->occupied[idx], __ATOMIC_ACQUIRE) == 1) {
                 /* Now ready — check key */
                 if (t->keys[idx].player == key.player &&
+                    t->keys[idx].street == key.street &&
                     t->keys[idx].board_hash == key.board_hash &&
                     t->keys[idx].action_hash == key.action_hash) {
                     return idx;
@@ -462,6 +465,7 @@ static float traverse(TraversalState *ts, int acting_order_idx,
 
     BPInfoKey key;
     key.player = ap;
+    key.street = street;
     key.board_hash = compute_board_hash(ts->board, ts->num_board);
     key.action_hash = compute_action_hash(ts->action_history, ts->history_len);
 
@@ -838,17 +842,20 @@ int bp_get_strategy(const BPSolver *s, int player,
                      float *strategy_out, int hand_idx) {
     BPInfoKey key;
     key.player = player;
+    key.street = (num_board <= 3) ? 1 : (num_board == 4) ? 2 : 3;
     key.board_hash = compute_board_hash(board, num_board);
     key.action_hash = compute_action_hash(action_seq, seq_len);
 
     uint64_t h = hash_combine(key.board_hash, key.action_hash);
     h = hash_combine(h, (uint64_t)key.player);
+    h = hash_combine(h, (uint64_t)key.street);
     int slot = (int)(h % (uint64_t)s->info_table.table_size);
 
     for (int probe = 0; probe < 1024; probe++) {
         int idx = (slot + probe) % s->info_table.table_size;
         if (!s->info_table.occupied[idx]) return 0;
         if (s->info_table.keys[idx].player == key.player &&
+            s->info_table.keys[idx].street == key.street &&
             s->info_table.keys[idx].board_hash == key.board_hash &&
             s->info_table.keys[idx].action_hash == key.action_hash) {
             BPInfoSet *is = &s->info_table.sets[idx];
@@ -887,4 +894,105 @@ void bp_free(BPSolver *s) {
     info_table_free(&s->info_table);
     if (s->rng_states) free(s->rng_states);
     memset(s, 0, sizeof(BPSolver));
+}
+
+/* ── Full strategy export ────────────────────────────────────────── */
+
+int bp_export_strategies(const BPSolver *s,
+                          unsigned char *buf, size_t buf_size,
+                          size_t *bytes_written) {
+    const BPInfoTable *t = &s->info_table;
+
+    /* First pass: compute required size */
+    size_t total = 0;
+    int count = 0;
+    /* Header: 4 bytes magic + 4 bytes num_entries + 4 bytes num_players */
+    total += 12;
+    for (int i = 0; i < t->table_size; i++) {
+        if (!t->occupied[i] || t->occupied[i] != 1) continue;
+        BPInfoSet *is = &t->sets[i];
+        /* Key: player(1) + street(1) + board_hash(8) + action_hash(8) = 18 bytes */
+        /* Meta: num_actions(1) + num_hands(2) = 3 bytes */
+        /* Strategy: num_actions * num_hands * 1 byte (uint8 quantized) */
+        total += 18 + 3 + is->num_actions * is->num_hands;
+        count++;
+    }
+
+    *bytes_written = total;
+    if (buf == NULL) return 0; /* Size query only */
+    if (buf_size < total) return -1; /* Buffer too small */
+
+    unsigned char *p = buf;
+
+    /* Header */
+    memcpy(p, "BPS2", 4); p += 4;
+    memcpy(p, &count, 4); p += 4;
+    int np = s->num_players;
+    memcpy(p, &np, 4); p += 4;
+
+    /* Strategies */
+    float strategy_buf[BP_MAX_ACTIONS];
+    for (int i = 0; i < t->table_size; i++) {
+        if (!t->occupied[i] || t->occupied[i] != 1) continue;
+        BPInfoKey *key = &t->keys[i];
+        BPInfoSet *is = &t->sets[i];
+        int na = is->num_actions;
+        int nh = is->num_hands;
+
+        /* Key */
+        unsigned char player_byte = (unsigned char)key->player;
+        unsigned char street_byte = (unsigned char)key->street;
+        memcpy(p, &player_byte, 1); p += 1;
+        memcpy(p, &street_byte, 1); p += 1;
+        memcpy(p, &key->board_hash, 8); p += 8;
+        memcpy(p, &key->action_hash, 8); p += 8;
+
+        /* Meta */
+        unsigned char na_byte = (unsigned char)na;
+        unsigned short nh_short = (unsigned short)nh;
+        memcpy(p, &na_byte, 1); p += 1;
+        memcpy(p, &nh_short, 2); p += 2;
+
+        /* Quantized strategies for each hand/bucket */
+        for (int h = 0; h < nh; h++) {
+            /* Regret match to get strategy */
+            if (is->strategy_sum) {
+                /* Use weighted average from strategy_sum */
+                float sum = 0;
+                for (int a = 0; a < na; a++) {
+                    float v = is->strategy_sum[a * nh + h];
+                    strategy_buf[a] = (v > 0) ? v : 0;
+                    sum += strategy_buf[a];
+                }
+                if (sum > 0) {
+                    for (int a = 0; a < na; a++) strategy_buf[a] /= sum;
+                } else {
+                    for (int a = 0; a < na; a++) strategy_buf[a] = 1.0f / na;
+                }
+            } else {
+                /* Use regret-matched strategy */
+                regret_match_int(is->regrets, strategy_buf, na, nh, h);
+            }
+
+            /* Quantize to uint8 */
+            for (int a = 0; a < na; a++) {
+                int q = (int)(strategy_buf[a] * 255.0f + 0.5f);
+                if (q < 0) q = 0;
+                if (q > 255) q = 255;
+                *p++ = (unsigned char)q;
+            }
+        }
+    }
+
+    return 0;
+}
+
+int bp_export_buckets(const BPSolver *s, int street, int player,
+                       int *bucket_out) {
+    if (street < 0 || street > 3 || player < 0 || player >= s->num_players)
+        return 0;
+    int nh = s->num_hands[player];
+    for (int h = 0; h < nh; h++)
+        bucket_out[h] = s->bucket_map[street][player][h];
+    return nh;
 }

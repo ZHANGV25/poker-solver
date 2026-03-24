@@ -189,7 +189,37 @@ def solve_texture(bp_lib, ca_lib, texture_key, board_strs, num_players,
 
     n_is = bp_lib.bp_num_info_sets(solver)
 
-    # Extract root strategies for all buckets
+    # ── Export ALL strategies (binary, quantized uint8) ──────────────
+    bp_lib.bp_export_strategies.restype = ctypes.c_int
+    bp_lib.bp_export_strategies.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_size_t)
+    ]
+    bp_lib.bp_export_buckets.restype = ctypes.c_int
+
+    # Query required buffer size
+    needed = ctypes.c_size_t(0)
+    bp_lib.bp_export_strategies(solver, None, 0, ctypes.byref(needed))
+    strat_size = needed.value
+
+    # Allocate and export
+    strat_buf = (ctypes.c_char * strat_size)()
+    written = ctypes.c_size_t(0)
+    ret = bp_lib.bp_export_strategies(solver, strat_buf, strat_size, ctypes.byref(written))
+    if ret != 0:
+        print(f"  [WARN] bp_export_strategies failed for {texture_key}")
+        strat_data = b''
+    else:
+        strat_data = bytes(strat_buf[:written.value])
+
+    # Export bucket assignments for all players on flop street
+    bucket_data = {}
+    for p in range(num_players):
+        b_out = (ctypes.c_int * BP_MAX_HANDS)()
+        n = bp_lib.bp_export_buckets(solver, 1, p, b_out)
+        bucket_data[p] = [b_out[h] for h in range(n)]
+
+    # Extract root strategies for quick inspection (keep for summary)
     strat_out = (ctypes.c_float * BP_MAX_ACTIONS)()
     root_strategies = {}
     for b in range(actual_buckets):
@@ -206,27 +236,59 @@ def solve_texture(bp_lib, ca_lib, texture_key, board_strs, num_players,
 
     elapsed = time.time() - t_start
 
+    # ── Save binary blueprint file (.bps) ────────────────────────────
+    # Format: header + LZMA-compressed strategy data + metadata JSON
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+        import lzma
+        import struct
+
+        # Compress strategy data with LZMA
+        compressed = lzma.compress(strat_data, preset=3)
+
+        # Metadata (small, stored as JSON at the end)
+        meta = {
+            "texture": texture_key,
+            "board": board_strs,
+            "flop_ints": flop_ints,
+            "num_players": num_players,
+            "num_hands": nh,
+            "num_buckets": actual_buckets,
+            "num_info_sets": n_is,
+            "iterations": iterations,
+            "ehs_time_s": round(ehs_time, 2),
+            "solve_time_s": round(solve_time, 2),
+            "total_time_s": round(elapsed, 2),
+            "bet_sizes": BLUEPRINT_BET_SIZES,
+            "root_strategies": root_strategies,
+            "bucket_assignments": {str(p): bucket_data[p] for p in bucket_data},
+        }
+        meta_bytes = json.dumps(meta, separators=(',', ':')).encode('utf-8')
+
+        # Binary file: [magic 4B][strat_compressed_size 4B][meta_size 4B]
+        #              [compressed_strategies][meta_json]
+        out_path = os.path.join(output_dir, f"{texture_key}.bps")
+        with open(out_path, 'wb') as f:
+            f.write(b'BPS2')
+            f.write(struct.pack('<II', len(compressed), len(meta_bytes)))
+            f.write(compressed)
+            f.write(meta_bytes)
+
+        strat_raw_mb = len(strat_data) / 1024 / 1024
+        strat_comp_mb = len(compressed) / 1024 / 1024
+        file_mb = (12 + len(compressed) + len(meta_bytes)) / 1024 / 1024
+
     result = {
         "texture": texture_key,
-        "board": board_strs,
-        "flop_ints": flop_ints,
-        "num_players": num_players,
-        "num_hands": nh,
-        "num_buckets": actual_buckets,
         "num_info_sets": n_is,
-        "iterations": iterations,
         "ehs_time_s": round(ehs_time, 2),
         "solve_time_s": round(solve_time, 2),
         "total_time_s": round(elapsed, 2),
-        "root_strategies": root_strategies,
-        "bet_sizes": BLUEPRINT_BET_SIZES,
+        "strat_raw_mb": round(strat_raw_mb, 1) if output_dir else 0,
+        "strat_compressed_mb": round(strat_comp_mb, 1) if output_dir else 0,
+        "file_mb": round(file_mb, 1) if output_dir else 0,
     }
-
-    if output_dir:
-        out_path = os.path.join(output_dir, f"{texture_key}.json")
-        os.makedirs(output_dir, exist_ok=True)
-        with open(out_path, 'w') as f:
-            json.dump(result, f, separators=(',', ':'))
 
     return result
 
