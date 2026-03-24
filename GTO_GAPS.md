@@ -3,70 +3,62 @@
 ## Category A: Architectural Gaps (Pluribus features)
 
 - [x] **A1** N-player street solver — extend street_solve.cu from 2 to N players
-  - N-player tree builder, N-player CFR traversal, N-player showdown
   - Status: DONE (2026-03-24) — tested 2-player + 3-player river
-  - 3-player river: 1156 nodes, 141ms for 200 iterations
 - [x] **A2** N-player blueprint — external-sampling MCCFR for 2-6 players
   - `src/mccfr_blueprint.c` + `.h`, compiled to `build/mccfr_blueprint.dll`
-  - Tested: 2-player (50K iter, 5.3s, 2M infosets), 3-player (30K iter, 1.4s, 685K infosets)
-  - Status: DONE (2026-03-24) — needs integration into precompute pipeline
-- [~] **A3** Strategy freezing — freeze own strategy at passed nodes for actual hand
-  - Python tracking infrastructure added (_hero_actions_this_street)
-  - CUDA frozen_mask kernel change needed to actually enforce
-  - Status: PARTIAL — tracking in place, enforcement TODO
-- [ ] **A4** Warm-start — persist regrets between solves of same street
-  - Need init_regrets parameter in ss_solve_gpu
-  - Status: NOT STARTED (requires CUDA API change)
-- [x] **A5** Run precompute — pipeline ready, needs EC2 execution
-  - `precompute/run_all.py` implemented
-  - `src/mccfr_blueprint.c` for N-player precompute also available
-  - Status: READY TO RUN
-
-## Category B: Necessary Abstractions (practical solver tradeoffs)
-
-- [x] **B1** Bet sizes — 3+all-in (0.33, 0.75, 1.5)
-  - Configurable via DEFAULT_BET_SIZES
-  - Status: DONE
-- [x] **B2** Max raises per street — 3 (adequate)
-- [x] **B3** Max hands per player — 200 exact (better than Pluribus's 200 lossy buckets)
-- [x] **B4** CFR iterations — 200 (similar to Pluribus time budget)
-- [ ] **B5** Preflop ranges — semi-binary (0/0.5/1.0), need continuous weights
+  - Rewritten 2026-03-24: OpenMP, int32 regrets, pruning, card abstraction, payoff fixes
+  - Status: DONE — production-ready for EC2
+- [~] **A3** Strategy freezing — freeze own strategy at passed nodes
+  - Python tracking infrastructure added
+  - CUDA frozen_mask kernel change needed
+  - Status: PARTIAL
+- [ ] **A4** Warm-start — persist regrets between solves
   - Status: NOT STARTED
-- [x] **B6** Off-tree bet mapping — pseudoharmonic (same as Pluribus)
+- [x] **A5** Run precompute — pipeline ready with blueprint_worker.py + launch_blueprint.sh
+  - Status: READY TO RUN (needs preflop integration first)
+- [x] **A6** Card abstraction — 200-bucket EHS percentile bucketing
+  - `src/card_abstraction.c` + `.h`, fast C implementation
+  - Status: DONE (2026-03-24)
+- [ ] **A7** 6-player preflop solver — extend from 2-player to all positions simultaneously
+  - Current: 2-player CFR+ over 169 classes (preflop_solver.c)
+  - Needed: Full 6-position tree with all actions
+  - Status: NOT STARTED
 
-## Category C: Leaf Value Approximations
+## Category B: Necessary Abstractions
 
-- [ ] **C1** Turn leaf river sampling — 12/46 cards sampled for equity
-  - Need GPU equity kernel for all 46 cards
-  - Status: CPU WORKAROUND (12 sampled)
+- [x] **B1** Bet sizes — configurable, currently [0.5, 1.0] for blueprint
+- [x] **B2** Max raises per street — 3
+- [x] **B3** Max hands per player — 1326 (all combos), bucketed to 200
+- [x] **B4** CFR iterations — configurable, ~1M+ needed for convergence
+- [ ] **B5** Preflop ranges — currently semi-binary pairwise, need continuous 6-player
+- [x] **B6** Off-tree bet mapping — pseudoharmonic
+
+## Category C: Research (Completed)
+
+- [x] **C1** GPU batch outcome-sampling MCCFR — novel research
+  - Built, tested, benchmarked (17M traj/s on RTX 3060)
+  - Finding: CPU external sampling is superior for blueprints
+  - GPU MCCFR useful for research, not production blueprint
+  - Status: DONE, documented as research finding
 
 ## Category D: Minor/Cosmetic
 
 - [x] **D1** Weight floor 0.005 — acceptable
-- [x] **D2** float32 precision — acceptable
+- [x] **D2** float32 precision — acceptable (int32 regrets in blueprint)
 - [ ] **D3** No exploitability check — could add adaptive stopping
 - [x] **D4** Normalization max=1.0 — mathematically equivalent
-- [ ] **D5** Process exit segfault — cosmetic, harmless
 
 ## Summary
 
 | Category | Total | Done | Remaining |
 |----------|-------|------|-----------|
-| A: Architecture | 5 | 3 (A1,A2,A5) | A3 partial, A4 not started |
+| A: Architecture | 7 | 4 (A1,A2,A5,A6) | A3 partial, A4/A7 not started |
 | B: Abstractions | 6 | 5 | B5 not started |
-| C: Leaf Values | 1 | 0 | C1 workaround |
-| D: Minor | 5 | 3 | D3, D5 minor |
+| C: Research | 1 | 1 | — |
+| D: Minor | 4 | 3 | D3 |
 
-**Major completed this session:**
-- A1: N-player GPU solver (2-6 players, CUDA)
-- A2: N-player MCCFR blueprint (external sampling, CPU)
-- Regret-based pruning in GPU solver (5x speedup on river)
-- 3 bet sizes + all-in
-
-**Remaining work for full Pluribus parity:**
-1. A3: CUDA frozen_mask enforcement
-2. A4: Warm-start (persist regrets)
-3. A5: Run precompute on EC2
-4. B5: Proper GTO preflop ranges
-5. C1: GPU equity kernel for turn leaves
-6. Wire MCCFR blueprint into precompute pipeline
+## Critical Path to Working Blueprint
+1. **A7**: 6-player preflop solver (outputs mixed frequencies for all positions)
+2. **B5**: Wire preflop strategy → postflop starting ranges
+3. **A5**: Run EC2 blueprint generation (1,755 textures × 6-player MCCFR)
+4. Wire blueprint leaf values into GPU real-time search (street_solve.cu)
