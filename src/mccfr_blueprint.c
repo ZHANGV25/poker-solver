@@ -118,7 +118,7 @@ static int info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
                 t->sets[idx].num_hands = num_hands;
                 t->sets[idx].regrets = (int*)calloc(num_actions * num_hands, sizeof(int));
                 t->sets[idx].strategy_sum = NULL;
-                t->sets[idx].current_strategy = (float*)calloc(num_actions * num_hands, sizeof(float));
+                t->sets[idx].current_strategy = NULL; /* computed on-the-fly, not stored */
                 t->keys[idx] = key;
                 __atomic_fetch_add(&t->num_entries, 1, __ATOMIC_RELAXED);
                 /* Publish: set occupied to 1 (ready) with release semantics */
@@ -167,7 +167,7 @@ static void info_table_free(BPInfoTable *t) {
         if (t->occupied[i]) {
             free(t->sets[i].regrets);
             if (t->sets[i].strategy_sum) free(t->sets[i].strategy_sum);
-            free(t->sets[i].current_strategy);
+            if (t->sets[i].current_strategy) free(t->sets[i].current_strategy);
         }
     }
     free(t->keys);

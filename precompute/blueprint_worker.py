@@ -316,22 +316,10 @@ def run_smoke_test(bp_lib, ca_lib, num_players):
         print("  FAILED: 0 info sets (card conflict rejection?)")
         return False
 
-    # Check strategies are non-uniform
-    strats = result["root_strategies"]
-    uniform_count = 0
-    for b, s in strats.items():
-        if len(s) > 0 and all(abs(v - 1.0/len(s)) < 0.01 for v in s):
-            uniform_count += 1
-
-    non_uniform_pct = 100 * (1 - uniform_count / max(len(strats), 1))
-
-    print(f"  Hands: {result['num_hands']}, Buckets: {result['num_buckets']}")
     print(f"  Info sets: {result['num_info_sets']:,}")
     print(f"  EHS time: {result['ehs_time_s']:.1f}s, Solve time: {result['solve_time_s']:.1f}s")
-    print(f"  Non-uniform strategies: {non_uniform_pct:.0f}%")
-
-    if non_uniform_pct < 10:
-        print("  WARNING: Most strategies are uniform (may need more iterations)")
+    if result.get("file_mb", 0) > 0:
+        print(f"  File: {result['file_mb']} MB")
 
     print("  PASSED")
     return True
