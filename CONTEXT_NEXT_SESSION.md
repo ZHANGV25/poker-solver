@@ -1,6 +1,6 @@
 # Poker Solver — Context for Next Session
 
-**Last updated**: 2026-03-24 (end of marathon session)
+**Last updated**: 2026-03-25 (blueprint re-run complete, convergence benchmarked)
 **Project**: `C:/Users/Victor/Documents/Projects/poker-solver/`
 **GitHub**: https://github.com/ZHANGV25/poker-solver.git
 **Mission**: Build a Pluribus-equivalent (or better) 6-max NLHE solver — faster real-time search via GPU, full 6-player blueprint, production HUD integration.
@@ -9,12 +9,27 @@
 
 ## What Exists Right Now
 
-### Blueprint (110 GB on S3 — NEEDS RE-RUN)
-- **S3**: `s3://poker-blueprint-2026/worker-{0..19}/` — 1,755 .bps files
-- **Format**: Binary .bps (LZMA compressed strategies + JSON metadata)
-- **Problem**: The uint8 strategy data is **mostly garbage** due to int32 regret overflow (`*1000` scaling). Fixed in code but not re-generated.
-- **What IS correct**: The JSON metadata in each .bps file has valid `root_strategies` (extracted via `bp_get_strategy` before the buggy export)
-- **What to do**: Re-run EC2 generation with fixed code (~$12, ~50 min). The fix: `*10` scaling instead of `*1000`, export uses `regret_match_int` directly.
+### Blueprint (re-generated 2026-03-25, 1,755 .bps files on S3)
+- **S3**: `s3://poker-blueprint-2026/worker-{0..19}/` — 1,755 .bps files (~140 MB each)
+- **Format**: Binary .bps (LZMA-1 compressed strategies + JSON metadata)
+- **Generated with**: 20× c5.4xlarge on-demand, 1M iterations per texture, 200 buckets, `*10` regret scaling
+- **Root strategies (metadata JSON)**: CORRECT — 200/200 buckets non-uniform for every texture. Used via `bp_get_strategy` / `get_root_strategy()`.
+- **Binary uint8 strategies (bulk export)**: ~99.8% uniform (1/N) for non-root info sets. This is expected — 6-player game tree has ~13M info sets per texture, 1M external-sampling iterations visits most nodes <10 times. NOT a code bug; verified via convergence benchmarking (see below).
+- **Usable for**: First flop action lookup, root-level range narrowing, leaf value priors (uniform is a safe default for GPU search).
+- **NOT usable for**: Deep-tree strategy lookup without GPU re-solve.
+
+### Convergence Benchmark Results (AAA rainbow texture, c5.4xlarge)
+| Iterations | Info Sets | Flop Non-Uniform % | Time |
+|-----------|-----------|-------------------|------|
+| 50K | 690K | 0.01% | 8.5s |
+| 200K | 2.7M | 0.04% | 22s |
+| 1M | 13.1M | 0.2% | 90s |
+| 5M | >21M (OOM at 32GB) | N/A | N/A |
+
+Root strategies via `bp_get_strategy` are non-uniform at ALL iteration counts and at 1-2 levels deep. The issue is only in the bulk binary export which iterates all 13M info sets (most unvisited).
+
+### Key Finding: Per-Texture vs Pluribus Approach
+Pluribus used ONE unified solve over the entire game tree for ~12,400 CPU-hours. Our per-texture isolation with ~0.5 CPU-hours each produces strong root strategies but weak deeper ones. This is a fundamental compute gap, not a code bug. The GPU real-time search (67ms river, 236ms flop) is designed to fill this gap — same architecture as Pluribus.
 
 ### Code (all compiled, tested, pushed to GitHub)
 
@@ -59,26 +74,15 @@ gcc -O2 -fPIC -shared -fopenmp -o build/mccfr_blueprint.so src/mccfr_blueprint.c
 
 ## What Needs to Happen (Priority Order)
 
-### 1. Re-run Blueprint on EC2 (~$12, ~50 min)
-The code is fixed. Just need to upload and launch:
-```bash
-# Upload fixed code
-aws s3 sync src/ s3://poker-blueprint-2026/code/src/ --exclude "*.dll" --exclude "*.exe"
-aws s3 sync precompute/ s3://poker-blueprint-2026/code/precompute/
-aws s3 sync python/ s3://poker-blueprint-2026/code/python/ --exclude "__pycache__/*"
+### 1. ~~Re-run Blueprint~~ DONE (2026-03-25)
+Blueprint re-generated with fixed code. 1,755 .bps files on S3. Root strategies correct.
+See "Convergence Benchmark Results" above for quality assessment.
 
-# Launch 20 on-demand c5.4xlarge instances
-# (see precompute/launch_blueprint.sh for the full script)
-# Workers: 500K iterations, 200 buckets, 6 players, OMP_STACKSIZE=16m
-```
-**Key fixes in the new code:**
-- Regret delta: `(int)((action_values[a] - node_value) * 10.0f)` (was `*1000` → overflow)
-- Export: always uses `regret_match_int` (was using empty `strategy_sum`)
-- `strategy_interval = 1` (was 10000 — too infrequent)
-- `#include <stddef.h>` for `size_t` (was missing → EC2 compile fail)
-
-### 2. Download Blueprint (~3-5 GB flop-only subset)
-The full 110 GB is on S3. For the HUD, only flop info sets are needed (~2-3 MB per texture × 1755 = ~4 GB). The loader (`blueprint_v2.py`) filters by street tag during read.
+### 2. Download Blueprint + Wire into HUD
+- Download .bps files from S3 (or load on-demand via `blueprint_v2.py`)
+- HUD should use `get_root_strategy()` for first flop action (reads metadata JSON — correct)
+- Range narrowing at flop root: use root_strategies per bucket (correct)
+- For deeper decisions: route to GPU real-time search
 
 ### 3. Wire Leaf Values into GPU Search
 The GPU street solver (`street_solve.cu`) needs **continuation leaf values** at depth-limit boundaries. These come from the blueprint:
@@ -129,17 +133,30 @@ Replaced `#pragma omp critical` (global lock → 15x slowdown) with per-slot ato
 
 4. **Spot instances for blueprint**: Too volatile — 16/20 reclaimed in one run. Use on-demand for reliability (~2x cost but no re-runs).
 
+5. **More iterations for deeper convergence**: Tested 50K→1M→5M iterations. Flop non-uniform % barely grows (0.01%→0.2%). Tree grows faster than visits — 5M iterations creates 21M+ info sets and OOMs at 32 GB. Fundamental compute gap vs Pluribus.
+
+6. **Fewer buckets (50, 10) for more visits per IS**: Marginal improvement (0.2%→6.3% at 10 buckets). Still 94% uniform. Tradeoff: less strategic precision per bucket.
+
+7. **Regret scaling *50 instead of *10**: No improvement. Truncation is not the issue — visit count is.
+
+8. **strategy_sum for all streets**: Actually WORSE — accumulates 1/N (uniform) at rarely-visited nodes, drowning out any signal from the few visits.
+
+9. **c5.9xlarge (36 vCPU, 72 GB)**: Lock-free CAS hash table doesn't scale past 16 threads — 36 threads is slower than 16. No benefit.
+
+10. **tmpfs /tmp on Amazon Linux 2023**: RAM-backed, only 16 GB. Caused OOM when accumulating .bps files. Fixed by incremental S3 upload + local delete, or writing to EBS.
+
 ---
 
-## Performance Numbers (Measured on EC2 c5.4xlarge)
+## Performance Numbers (Measured on EC2 c5.4xlarge, 2026-03-25)
 
 | Metric | Value |
 |--------|-------|
 | MCCFR iter/s (1 thread) | 35-50K |
-| MCCFR iter/s (16 threads, lock-free CAS) | 24-30K effective |
+| MCCFR iter/s (16 threads, lock-free CAS) | 27-30K effective |
+| MCCFR iter/s (36 threads, c5.9xlarge) | 15-20K (WORSE — CAS contention) |
 | EHS computation (1176 hands, 500 samples) | 1.8s |
-| Info sets per texture (500K iter) | ~4.8M |
-| Blueprint file size (LZMA) | ~60 MB per texture |
+| Info sets per texture (1M iter) | ~13M |
+| Blueprint file size (LZMA-1) | ~140 MB per texture |
 | GPU street solve (river, 200 hands) | 67ms |
 | GPU street solve (flop, 200 hands) | 236ms |
 

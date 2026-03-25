@@ -21,11 +21,11 @@ set -euo pipefail
 # ── Defaults ─────────────────────────────────────────────────────────────
 
 REGION="${AWS_REGION:-us-east-1}"
-INSTANCE_TYPE="${INSTANCE_TYPE:-c5.4xlarge}"  # 16 vCPU, 32 GB, ~$0.28/hr spot
+INSTANCE_TYPE="${INSTANCE_TYPE:-c5.4xlarge}"  # 16 vCPU, 32 GB, ~$0.68/hr on-demand
 KEY_NAME="${KEY_NAME:-poker-solver-key}"
 SECURITY_GROUP="${SECURITY_GROUP:-poker-solver-sg}"
-S3_BUCKET="${S3_BUCKET:-poker-solver-blueprints}"
-PROFILE_NAME="poker-solver-instance-profile"
+S3_BUCKET="${S3_BUCKET:-poker-blueprint-2026}"
+PROFILE_NAME="poker-solver-profile"
 
 NUM_INSTANCES=20
 NUM_PLAYERS=6
@@ -106,17 +106,11 @@ TEXTURES_PER_WORKER=$(( (1755 + NUM_INSTANCES - 1) / NUM_INSTANCES ))
 echo "Textures per worker: ~$TEXTURES_PER_WORKER"
 echo ""
 
-# ── Spot price check ─────────────────────────────────────────────────────
+# ── Cost estimate (on-demand) ────────────────────────────────────────────
 
-SPOT_PRICE=$(aws ec2 describe-spot-price-history \
-    --region "$REGION" \
-    --instance-types "$INSTANCE_TYPE" \
-    --product-descriptions "Linux/UNIX" \
-    --max-items 1 \
-    --query "SpotPriceHistory[0].SpotPrice" \
-    --output text 2>/dev/null || echo "unknown")
-echo "Current spot price: \$$SPOT_PRICE/hr"
-echo "Estimated total cost: ~\$$(echo "$NUM_INSTANCES * $SPOT_PRICE * 2" | bc 2>/dev/null || echo '?') (assuming ~2hr)"
+OD_PRICE="0.68"
+echo "On-demand price: \$$OD_PRICE/hr per instance"
+echo "Estimated total cost: ~\$$(echo "$NUM_INSTANCES * $OD_PRICE * 2" | bc 2>/dev/null || echo '27') (assuming ~2hr)"
 echo ""
 
 if [ "$DRY_RUN" = "1" ]; then
@@ -215,7 +209,6 @@ for i in $(seq 0 $((NUM_INSTANCES - 1))); do
         --instance-type "$INSTANCE_TYPE" \
         --key-name "$KEY_NAME" \
         --security-groups "$SECURITY_GROUP" \
-        --instance-market-options '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"one-time"}}' \
         --iam-instance-profile "Name=$PROFILE_NAME" \
         --user-data "$USERDATA_B64" \
         --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=bp-worker-$i},{Key=Project,Value=poker-solver},{Key=WorkerId,Value=$i}]" \
@@ -243,7 +236,7 @@ echo "  Logs:     aws s3 ls s3://$S3_BUCKET/logs/"
 echo "  Results:  aws s3 ls s3://$S3_BUCKET/worker-0/ | head"
 echo "  Download: $0 --download"
 echo ""
-echo "  Kill all: aws ec2 terminate-instances --instance-ids$INSTANCE_IDS"
+echo "  Kill all: aws ec2 terminate-instances --instance-ids $INSTANCE_IDS"
 
 # Save state
 echo "$INSTANCE_IDS" > /tmp/blueprint_instance_ids.txt

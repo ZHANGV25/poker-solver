@@ -21,6 +21,7 @@ import argparse
 import ctypes
 import json
 import os
+import subprocess
 import sys
 import time
 import traceback
@@ -245,7 +246,7 @@ def solve_texture(bp_lib, ca_lib, texture_key, board_strs, num_players,
         import struct
 
         # Compress strategy data with LZMA
-        compressed = lzma.compress(strat_data, preset=3)
+        compressed = lzma.compress(strat_data, preset=1)
 
         # Metadata (small, stored as JSON at the end)
         meta = {
@@ -396,6 +397,19 @@ def main():
                     "solve_s": result["solve_time_s"],
                     "total_s": result["total_time_s"],
                 })
+
+                # Upload .bps to S3 immediately and delete local copy
+                # to prevent disk/tmpfs from filling up
+                if args.s3_bucket and args.output_dir:
+                    bps_path = os.path.join(args.output_dir, f"{tex_key}.bps")
+                    if os.path.exists(bps_path):
+                        s3_dest = f"s3://{args.s3_bucket}/worker-{args.worker_id}/{tex_key}.bps"
+                        subprocess.run(
+                            ["aws", "s3", "cp", bps_path, s3_dest, "--quiet"],
+                            check=False
+                        )
+                        os.remove(bps_path)
+
                 elapsed_total = time.time() - t_batch_start
                 avg_per = elapsed_total / (idx + 1)
                 remaining = avg_per * (len(my_textures) - idx - 1)
@@ -444,9 +458,8 @@ def main():
     with open(summary_path, 'w') as f:
         json.dump(summary, f, indent=2)
 
-    # Upload to S3
+    # Upload remaining files to S3 (e.g. summary)
     if args.s3_bucket:
-        import subprocess
         s3_prefix = f"s3://{args.s3_bucket}/worker-{args.worker_id}/"
         print(f"\nUploading to {s3_prefix}...")
         subprocess.run(["aws", "s3", "sync", args.output_dir, s3_prefix, "--quiet"],

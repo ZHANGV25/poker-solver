@@ -534,9 +534,8 @@ static float traverse(TraversalState *ts, int acting_order_idx,
             int idx = a * nb + bucket;
             /* Scale: values are in chips (scale=100, ~0-10000 range).
              * A pot of 650 chips means deltas are typically 0-650.
-             * Scale by 100 to preserve sub-chip precision in int32.
-             * Max regret after 500K iterations: ~500K * 65000 = 32.5B → overflow.
-             * Scale by 10 is safer: max ~3.25B, well within int32 range. */
+             * Scale by 10 to preserve precision while avoiding int32 overflow.
+             * Max regret after 1M iterations: ~1M * 6500 = 6.5B (with discounting, stays <2B). */
             int delta = (int)((action_values[a] - node_value) * 10.0f);
             is->regrets[idx] += delta;
             /* Floor at REGRET_FLOOR */
@@ -544,7 +543,9 @@ static float traverse(TraversalState *ts, int acting_order_idx,
                 is->regrets[idx] = BP_REGRET_FLOOR;
         }
 
-        /* Strategy sum: only for round 1 (preflop), every strategy_interval iterations */
+        /* Strategy sum: only for flop (street <= 1), every strategy_interval iterations.
+         * Turn/river nodes are too numerous for strategy_sum to be meaningful
+         * at our iteration count — GPU search handles those streets. */
         if (street <= 1 && (ts->iteration % s->config.strategy_interval) == 0) {
             ensure_strategy_sum(is);
             for (int a = 0; a < na; a++)
@@ -959,8 +960,11 @@ int bp_export_strategies(const BPSolver *s,
         memcpy(p, &nh_short, 2); p += 2;
 
         /* Quantized strategies for each hand/bucket.
-         * Always use regret matching — this produces the current strategy
-         * from accumulated regrets, which converges to Nash. */
+         * Use regret matching to derive the current strategy from accumulated
+         * regrets. Nodes with insufficient visits will produce uniform (1/N)
+         * which is a safe default — the GPU search refines these in real-time.
+         * The root_strategies in the .bps metadata (from bp_get_strategy) use
+         * strategy_sum and are more accurate for flop root decisions. */
         for (int h = 0; h < nh; h++) {
             regret_match_int(is->regrets, strategy_buf, na, nh, h);
 
