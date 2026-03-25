@@ -532,7 +532,12 @@ static float traverse(TraversalState *ts, int acting_order_idx,
         /* Update integer regrets (Hogwild: no lock needed) */
         for (int a = 0; a < na; a++) {
             int idx = a * nb + bucket;
-            int delta = (int)((action_values[a] - node_value) * 1000.0f);
+            /* Scale: values are in chips (scale=100, ~0-10000 range).
+             * A pot of 650 chips means deltas are typically 0-650.
+             * Scale by 100 to preserve sub-chip precision in int32.
+             * Max regret after 500K iterations: ~500K * 65000 = 32.5B → overflow.
+             * Scale by 10 is safer: max ~3.25B, well within int32 range. */
+            int delta = (int)((action_values[a] - node_value) * 10.0f);
             is->regrets[idx] += delta;
             /* Floor at REGRET_FLOOR */
             if (is->regrets[idx] < BP_REGRET_FLOOR)
@@ -953,26 +958,11 @@ int bp_export_strategies(const BPSolver *s,
         memcpy(p, &na_byte, 1); p += 1;
         memcpy(p, &nh_short, 2); p += 2;
 
-        /* Quantized strategies for each hand/bucket */
+        /* Quantized strategies for each hand/bucket.
+         * Always use regret matching — this produces the current strategy
+         * from accumulated regrets, which converges to Nash. */
         for (int h = 0; h < nh; h++) {
-            /* Regret match to get strategy */
-            if (is->strategy_sum) {
-                /* Use weighted average from strategy_sum */
-                float sum = 0;
-                for (int a = 0; a < na; a++) {
-                    float v = is->strategy_sum[a * nh + h];
-                    strategy_buf[a] = (v > 0) ? v : 0;
-                    sum += strategy_buf[a];
-                }
-                if (sum > 0) {
-                    for (int a = 0; a < na; a++) strategy_buf[a] /= sum;
-                } else {
-                    for (int a = 0; a < na; a++) strategy_buf[a] = 1.0f / na;
-                }
-            } else {
-                /* Use regret-matched strategy */
-                regret_match_int(is->regrets, strategy_buf, na, nh, h);
-            }
+            regret_match_int(is->regrets, strategy_buf, na, nh, h);
 
             /* Quantize to uint8 */
             for (int a = 0; a < na; a++) {

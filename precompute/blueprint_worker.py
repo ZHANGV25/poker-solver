@@ -156,7 +156,7 @@ def solve_texture(bp_lib, ca_lib, texture_key, board_strs, num_players,
     config.discount_stop_iter = max(iterations * 35 // 1000, 1000)
     config.discount_interval = max(config.discount_stop_iter // 40, 100)
     config.prune_start_iter = max(iterations * 17 // 1000, 500)
-    config.strategy_interval = 10000
+    config.strategy_interval = 1  # Update strategy_sum every iteration for usable avg strategies
 
     ret = bp_lib.bp_init_ex(
         solver, num_players,
