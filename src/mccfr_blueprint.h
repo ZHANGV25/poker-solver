@@ -23,6 +23,7 @@
 #define MCCFR_BLUEPRINT_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 /* ── Limits ──────────────────────────────────────────────────────────── */
 
