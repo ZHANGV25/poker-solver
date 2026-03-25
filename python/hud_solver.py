@@ -71,11 +71,12 @@ class HUDSolver:
     DEFAULT_BET_SIZES = [0.33, 0.75, 1.5]
 
     def __init__(self, blueprint_dir=None, blueprint_store_dir=None,
-                 solver_pool=None):
+                 blueprint_v2_dir=None, solver_pool=None):
         """
         Args:
             blueprint_dir: path to old JSON flop_solutions/ (backward compat)
             blueprint_store_dir: path to new binary blueprints/ directory
+            blueprint_v2_dir: path to v2 .bps blueprint files (6-player MCCFR)
             solver_pool: SolverPool for CPU fallback
         """
         # Old JSON blueprint (backward compat)
@@ -84,6 +85,19 @@ class HUDSolver:
         # New binary blueprint store
         self._bp_stores = {}  # scenario_id -> BlueprintStore
         self._bp_store_dir = blueprint_store_dir
+
+        # V2 blueprint (6-player MCCFR .bps files)
+        self.blueprint_v2 = None
+        if blueprint_v2_dir:
+            try:
+                from blueprint_v2 import BlueprintV2
+                self.blueprint_v2 = BlueprintV2(blueprint_v2_dir, streets_to_load=[1])
+            except ImportError:
+                try:
+                    from python.blueprint_v2 import BlueprintV2
+                    self.blueprint_v2 = BlueprintV2(blueprint_v2_dir, streets_to_load=[1])
+                except ImportError:
+                    pass
 
         self.pool = solver_pool or SolverPool(max_workers=2)
 
@@ -293,7 +307,30 @@ class HUDSolver:
         if actual_bet_frac is not None:
             return self._compute_off_tree_probs(player, actual_bet_frac)
 
-        # 3. Blueprint fallback
+        # 3. V2 blueprint (6-player MCCFR)
+        if self.blueprint_v2 and self._board and len(self._board) >= 3:
+            board_ints = [card_to_int(c) if isinstance(c, str) else c
+                          for c in self._board[:3]]
+            canonical = self.blueprint_v2.get_canonical_board(board_ints)
+            if canonical:
+                all_strats = self.blueprint_v2.get_all_bucket_strategies(
+                    canonical, [], 0, street=1)
+                if all_strats is not None:
+                    # Map action name to action index
+                    action_idx = self._action_name_to_idx(action)
+                    if action_idx is not None and action_idx < all_strats.shape[1]:
+                        probs = {}
+                        meta = self.blueprint_v2.get_metadata(
+                            self.blueprint_v2._file_index and
+                            next(iter(self.blueprint_v2._textures), None))
+                        # Return P(action) per bucket as a proxy
+                        # TODO: proper bucket→hand mapping
+                        for b in range(all_strats.shape[0]):
+                            probs[b] = float(all_strats[b, action_idx])
+                        if any(v > 0 for v in probs.values()):
+                            return probs
+
+        # 4. Old blueprint fallback
         if self.blueprint and self.scenario_id and self._board:
             if player == "villain":
                 bp_player = "oop" if self.hero_player == "ip" else "ip"
@@ -304,6 +341,24 @@ class HUDSolver:
             if probs:
                 return probs
 
+        return None
+
+    @staticmethod
+    def _action_name_to_idx(action):
+        """Map action name string to index in blueprint action array."""
+        action_lower = action.lower().strip()
+        if "check" in action_lower or "fold" in action_lower:
+            return 0
+        elif "50" in action_lower or "half" in action_lower:
+            return 1
+        elif "pot" in action_lower or "100" in action_lower:
+            return 2
+        elif "all" in action_lower or "shove" in action_lower:
+            return 3
+        elif "call" in action_lower:
+            return 0  # call maps to check/call action
+        elif "bet" in action_lower or "raise" in action_lower:
+            return 1  # generic bet
         return None
 
     def _compute_off_tree_probs(self, player, actual_bet_frac):
