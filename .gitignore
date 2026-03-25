@@ -15,3 +15,5 @@ flop_solutions/
 .vscode/
 .idea/
 *.log
+blueprint_output/
+/tmp/
