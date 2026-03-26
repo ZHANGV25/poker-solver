@@ -1,6 +1,6 @@
 # Poker Solver — Full Context for Next Session
 
-**Last updated**: 2026-03-25
+**Last updated**: 2026-03-26
 **Project**: `C:/Users/Victor/Documents/Projects/poker-solver/`
 **GitHub**: https://github.com/ZHANGV25/poker-solver.git
 **Mission**: Build an exact Pluribus replica — 6-player unified preflop-through-river MCCFR blueprint + GPU real-time subgame search at runtime.
@@ -120,41 +120,54 @@ An exact copy of Pluribus (Brown & Sandholm, Science 2019):
 
 ---
 
-## WHERE WE ARE RIGHT NOW
+## WHERE WE ARE RIGHT NOW (2026-03-26)
 
-### Just completed:
-1. Implemented unified 6-player preflop-through-river MCCFR (`bp_init_unified`)
-2. Precomputed 200 EHS postflop buckets for all 1,755 flop textures
-3. Fixed paired-board flush draw canonicalization bug
-4. Added regret table save/load (`bp_save_regrets` / `bp_load_regrets`) for checkpoint/resume
-5. Built checkpoint system in Python worker (strategy .bps + regret .bin to S3)
-6. Built watchdog.sh for auto-restart on spot reclaim
+### COMPUTE IS RUNNING:
+- **Solver:** `i-005296cd4dac967d5` (c5.18xlarge spot, 72 cores, us-east-1a)
+- **Watchdog:** `i-050adbd722d07e654` (t3.micro on-demand, auto-relaunches solver on spot reclaim)
+- **S3 bucket:** `poker-blueprint-unified` — checkpoints every 1M iterations
+- **Expected completion:** ~April 3, 2026 (192h from launch)
+- **Cost estimate:** ~$191 total
 
-### Test that was running when session ended:
-- Regret save/load test: run 500 iters → save → new solver → load → run 500 more → compare
-- This test takes ~3-5 min because of EHS precompute for 1,755 textures (single-threaded, 500 MC samples each)
-- The test was launched as background task `bz0ou8l34` but PC restarted before it completed
-- **Re-run this test first** to verify save/load works
+### Full audit completed (2026-03-26):
+All show-stoppers, abstraction quality issues, runtime bugs, and infrastructure problems fixed.
 
-### What needs to happen before launch:
+**Blueprint engine fixes:**
+1. S1: Bucket-in-key info set refactor (memory 1.3TB → 35GB)
+2. S2: --num-threads 0 iteration estimation bug fixed
+3. S3: River pruning logic fixed (never prune river/fold per Pluribus)
+4. G1: K-means bucketing wired (EHS + positive/negative potential)
+5. G2: Per-street bucket recomputation for turn/river
+6. Hash table increased to 1B slots (300M IS in 8M iters was overflowing 536M)
+7. Checkpoint crash fixed (deferred .bps export, BPS3 uint64 format)
 
-1. **Verify regret save/load works** — re-run the test above
-2. **Compile final DLL** — `gcc -O2 -shared -fopenmp -static -o build/mccfr_blueprint.dll src/mccfr_blueprint.c -I src -lm`
-3. **Test on Linux** — the EC2 compilation uses `-fPIC -shared -fopenmp` without `-static`; verify it works
-4. **Launch sequence**:
-   a. Launch t3.micro watchdog instance (on-demand, ~$0.01/hr)
-   b. Deploy watchdog.sh + code to it
-   c. Watchdog launches c5.metal spot instance with solver
-   d. Solver runs, checkpoints to S3 every 1M iterations
-   e. If spot reclaimed, watchdog detects in ≤5 min, launches new instance with --resume
-   f. After 8 days (192h) total compute, solver saves "final" checkpoint and shuts down
-   g. Watchdog detects "final" label and stops
+**Runtime fixes (GPU + Python):**
+8. R1: N-player showdown — exact enumeration in GPU
+9. R2: N-player leaf values — 4^N continuation combos
+10. R3: A3 strategy freezing in GPU CFR (frozen_action kernel)
+11. R4: V2 blueprint range narrowing (bucket→hand mapping)
+12. R5: Texture key suits, action index, frozen-action tree walk
 
-### Cost estimate:
-- c5.metal spot: ~$1.22/hr × 192h = **~$234** (if never interrupted)
-- With interruptions + relaunch overhead: ~$250-300
-- Watchdog t3.micro: ~$1.70 for 8 days
-- **Total: ~$235-300**
+**Infrastructure:**
+13. Spot pricing, S3 retries, atomic writes, --resume on initial launch
+14. Watchdog with @reboot cron, IAM EC2FullAccess for describe/launch
+
+### Compilation (CHANGED — requires both .c files):
+```bash
+gcc -O2 -shared -fopenmp -static -o build/mccfr_blueprint.dll src/mccfr_blueprint.c src/card_abstraction.c -I src -lm
+```
+
+### Key learnings from first run:
+- K-means texture precompute: ~45-60 min single-threaded (one-time)
+- 8M iters → 300M info sets, 1750-2950 iter/s on 72 cores
+- Regret checkpoint at 300M IS = 10.9 GB
+- .bps strategy export too slow for intermediate checkpoints (deferred to final)
+
+### What to do when compute finishes (~April 3):
+1. Download final blueprint: `aws s3 sync s3://poker-blueprint-unified/ blueprint_unified/`
+2. Terminate both EC2 instances
+3. Wire blueprint into runtime: update blueprint_v2.py to load unified .bps
+4. Test full HUD pipeline: preflop blueprint → GPU re-solve → strategy output
 
 ---
 
