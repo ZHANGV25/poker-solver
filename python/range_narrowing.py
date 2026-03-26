@@ -59,6 +59,20 @@ class RangeNarrower:
         self._ranges[player] = list(hands)
         self._action_log[player] = []
 
+    def set_uniform_range(self, player):
+        """Set all 1326 possible hands with uniform weight (Pluribus-style).
+
+        Pluribus starts with P(hand) = 1/1326 for all hands and narrows via
+        Bayesian updates from the first action onwards. This matches the exact
+        Pluribus belief initialization.
+        """
+        hands = []
+        for c0 in range(52):
+            for c1 in range(c0 + 1, 52):
+                hands.append((c0, c1, 1.0))
+        self._ranges[player] = hands
+        self._action_log[player] = []
+
     def update(self, player, action, blueprint_probs):
         """Narrow a player's range based on an observed action.
 

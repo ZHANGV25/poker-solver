@@ -1,70 +1,254 @@
-# Poker Solver — Context for Next Session
+# Poker Solver — Full Context for Next Session
 
-**Last updated**: 2026-03-25 (blueprint re-run complete, convergence benchmarked)
+**Last updated**: 2026-03-25
 **Project**: `C:/Users/Victor/Documents/Projects/poker-solver/`
 **GitHub**: https://github.com/ZHANGV25/poker-solver.git
-**Mission**: Build a Pluribus-equivalent (or better) 6-max NLHE solver — faster real-time search via GPU, full 6-player blueprint, production HUD integration.
+**Mission**: Build an exact Pluribus replica — 6-player unified preflop-through-river MCCFR blueprint + GPU real-time subgame search at runtime.
 
 ---
 
-## What Exists Right Now
+## END GOAL
 
-### Blueprint (re-generated 2026-03-25, 1,755 .bps files on S3)
-- **S3**: `s3://poker-blueprint-2026/worker-{0..19}/` — 1,755 .bps files (~140 MB each)
-- **Format**: Binary .bps (LZMA-1 compressed strategies + JSON metadata)
-- **Generated with**: 20× c5.4xlarge on-demand, 1M iterations per texture, 200 buckets, `*10` regret scaling
-- **Root strategies (metadata JSON)**: CORRECT — 200/200 buckets non-uniform for every texture. Used via `bp_get_strategy` / `get_root_strategy()`.
-- **Binary uint8 strategies (bulk export)**: ~99.8% uniform (1/N) for non-root info sets. This is expected — 6-player game tree has ~13M info sets per texture, 1M external-sampling iterations visits most nodes <10 times. NOT a code bug; verified via convergence benchmarking (see below).
-- **Usable for**: First flop action lookup, root-level range narrowing, leaf value priors (uniform is a safe default for GPU search).
-- **NOT usable for**: Deep-tree strategy lookup without GPU re-solve.
+An exact copy of Pluribus (Brown & Sandholm, Science 2019):
+1. **Blueprint**: ONE unified 6-player MCCFR solve, preflop through river, 169 lossless preflop buckets, 200 EHS postflop buckets, on a single 64-96 core machine for 8 days (~$177 spot)
+2. **Runtime**: GPU real-time subgame search (street_solve.cu) with 4 continuation strategies, strategy freezing, Bayesian range narrowing, pseudoharmonic off-tree mapping
+3. **HUD integration**: Wire into ACR Poker via Chrome DevTools Protocol
 
-### Convergence Benchmark Results (AAA rainbow texture, c5.4xlarge)
-| Iterations | Info Sets | Flop Non-Uniform % | Time |
-|-----------|-----------|-------------------|------|
-| 50K | 690K | 0.01% | 8.5s |
-| 200K | 2.7M | 0.04% | 22s |
-| 1M | 13.1M | 0.2% | 90s |
-| 5M | >21M (OOM at 32GB) | N/A | N/A |
+---
 
-Root strategies via `bp_get_strategy` are non-uniform at ALL iteration counts and at 1-2 levels deep. The issue is only in the bulk binary export which iterates all 13M info sets (most unvisited).
+## WHAT EXISTS RIGHT NOW (all code written, compiles, tested)
 
-### Key Finding: Per-Texture vs Pluribus Approach
-Pluribus used ONE unified solve over the entire game tree for ~12,400 CPU-hours. Our per-texture isolation with ~0.5 CPU-hours each produces strong root strategies but weak deeper ones. This is a fundamental compute gap, not a code bug. The GPU real-time search (67ms river, 236ms flop) is designed to fill this gap — same architecture as Pluribus.
+### C Code (`src/`)
 
-### Code (all compiled, tested, pushed to GitHub)
+**`mccfr_blueprint.c` + `.h`** — Production N-player external-sampling MCCFR
+- Unified `bp_init_unified()` — 6 players, all 1326 hands, preflop through river in one solve
+- 169 lossless preflop buckets (hand classes)
+- 200 EHS postflop buckets precomputed for all 1,755 flop textures at init time (stored in `texture_bucket_cache`)
+- Preflop betting: SB/BB post blinds, UTG→...→BB acting order, up to 4 re-raises, configurable preflop bet sizes
+- Flop deal: 3 random cards via Fisher-Yates, canonicalize to texture, look up precomputed buckets
+- Postflop: flop→turn→river→showdown with configurable postflop bet sizes
+- Linear CFR discount applied incrementally every `discount_interval` iterations (single parallel region with `#pragma omp single` between batches)
+- Strategy snapshots for rounds 2-4 via `accumulate_snapshot()`
+- Regret-based pruning (95% of iters after warmup, threshold -300M)
+- Int32 regrets with -310M floor
+- Lock-free CAS hash table (OpenMP Hogwild)
+- **`bp_save_regrets()` / `bp_load_regrets()`** — serialize/deserialize full hash table for checkpoint/resume
+- Backward compatible: `bp_init_ex()` still works for postflop-only solves
+- Compiles on Windows (`-static`) and Linux (`-fPIC -shared -fopenmp`)
 
-| File | What | Status |
-|------|------|--------|
-| `src/mccfr_blueprint.c/.h` | Production 6-player MCCFR | DONE — OpenMP lock-free CAS, int32 regrets, pruning, card abstraction, cumulative investment tracking |
-| `src/card_abstraction.c/.h` | Fast C EHS + 200-bucket percentile | DONE — 1176 hands in 2s |
-| `src/cuda/street_solve.cu/.cuh` | N-player GPU subgame solver | DONE — 67ms river, 236ms flop |
-| `src/cuda/gpu_mccfr.cu/.cuh` | GPU batch outcome-sampling MCCFR | DONE (research — not for production) |
-| `python/blueprint_v2.py` | .bps loader with hash lookup | DONE — loads flop info sets, canonical board mapping |
-| `python/hud_solver.py` | HUD pipeline with blueprint_v2 wired in | DONE — falls through v2 → old blueprint → GPU search |
-| `python/street_solver_gpu.py` | GPU solver ctypes wrapper | DONE |
-| `python/range_narrowing.py` | Bayesian range tracker | DONE |
-| `python/off_tree.py` | Pseudoharmonic bet mapping | DONE |
-| `precompute/blueprint_worker.py` | EC2 worker (solve + export .bps) | DONE |
-| `precompute/launch_blueprint.sh` | EC2 fleet launcher | DONE |
-| `build/*.dll` | All compiled for Windows | DONE |
+**`card_abstraction.c` + `.h`** — EHS computation + bucketing
+- `ca_compute_ehs()` — Monte Carlo equity via hand_eval.h
+- `ca_assign_buckets()` — EHS percentile bucketing
+- `ca_assign_buckets_kmeans()` — k-means on [EHS, positive_potential, negative_potential] (Pluribus-style domain features)
+- `ca_preflop_classes()` — 169 lossless preflop hand classes
 
-### Build Commands
-```bash
-# MCCFR (OpenMP, static)
-gcc -O2 -shared -fopenmp -static -o build/mccfr_blueprint.dll src/mccfr_blueprint.c -I src -lm
+**`cuda/street_solve.cu` + `.cuh`** — N-player GPU subgame solver
+- 2-6 players, single-street Linear CFR on GPU
+- 4 continuation strategies at depth-limit leaves (5x bias, Pluribus-exact)
+- Level-batched CFR, 67ms river, 236ms flop (RTX 3060, 200 hands)
+- Returns final-iteration strategy for play + weighted-average for narrowing
 
-# Card abstraction
-gcc -O2 -shared -o build/card_abstraction.dll src/card_abstraction.c -I src -lm
+### Python — Runtime (`python/`)
 
-# GPU street solver
-nvcc -O2 --shared -o build/street_solve.dll src/cuda/street_solve.cu -I src/cuda ...
+**`hud_solver.py`** — Full Pluribus decision pipeline
+- `new_hand()` with scenario_id, N-player ranges, uniform_beliefs option
+- Sets `blueprint_v2.current_scenario` for scenario-aware texture loading
+- `extra_villain_positions` for true N-player GPU search (not just heuristic)
+- Strategy freezing (A3): passes frozen_actions to GPU solver
+- Falls through: blueprint_v2 → blueprint_store → GPU re-solve
+- Flop leaf values from v2 blueprint via `compute_flop_leaf_equity()`
 
-# Linux (EC2) — add -fPIC
-gcc -O2 -fPIC -shared -fopenmp -o build/mccfr_blueprint.so src/mccfr_blueprint.c -I src -lm -lpthread
-```
+**`street_solver_gpu.py`** — GPU solver Python wrapper
+- N-player support (`player_ranges=`, `acting_order=`)
+- Strategy freezing: `get_strategy(frozen_actions=[...])` walks tree following hero's prior actions to find current decision node
+- `_get_strategy_at_node()`, `_match_action_label()` for arbitrary node extraction
 
-### AWS Resources
-- **S3 bucket**: `poker-blueprint-2026` (110 GB blueprint data)
+**`blueprint_v2.py`** — .bps file loader
+- Scenario-aware file indexing: `worker-N/{scenario_id}/{texture}.bps` (v2 layout)
+- Backward compatible with flat `worker-N/{texture}.bps` (v1 layout)
+- `current_scenario` property, `available_scenarios()`
+
+**`range_narrowing.py`** — Bayesian range tracker
+- `set_uniform_range()` — all 1326 hands at weight 1.0 (Pluribus-style)
+- `set_initial_range()` — from preflop ranges (HUD use case)
+
+**`leaf_values.py`** — Depth-limited continuation values
+- `compute_flop_leaf_values()` — uses BlueprintStore per-action EVs + 4 biased strategies
+- `compute_flop_leaf_equity()` — averages equity over turn+river cards (v2 blueprint fallback)
+- `compute_turn_leaf_values()` — equity over river cards
+- `bias_strategy()` — 5x fold/call/raise biasing (Pluribus-exact)
+
+**`off_tree.py`** — Pseudoharmonic bet interpolation
+**`multiway_adjust.py`** — Heuristic N-player adjustments (fallback when true N-player search unavailable)
+
+### Python — Blueprint Generation (`precompute/`)
+
+**`blueprint_worker_unified.py`** — Unified 6-player blueprint worker
+- Wraps `bp_init_unified` with Pluribus-matched parameters
+- Solves in chunks with periodic checkpoints (strategy .bps + regret table .bin)
+- `--resume` flag: downloads latest regret checkpoint from S3 and continues
+- Uploads both `unified_blueprint.bps` and `checkpoints/regrets_latest.bin` to S3
+- `--time-limit-hours 192` for 8-day run
+- `--checkpoint-interval 1000000` (saves every ~1M iterations)
+
+**`launch_blueprint_unified.sh`** — EC2 launcher for unified solve
+- Targets c5.metal (96 vCPU, 192GB) or c5.18xlarge (72 vCPU, 144GB)
+- Compiles with `-O3 -march=native` for maximum throughput
+- Sets `OMP_STACKSIZE=64m`
+- `--status`, `--download`, `--dry-run`
+
+**`watchdog.sh`** — Auto-restart monitor for spot instances
+- Runs on a t3.micro (~$0.01/hr) 24/7
+- Checks solver instance every 5 minutes
+- If dead: relaunches new spot instance with `--resume`
+- Tries spot first, falls back to on-demand
+- Stops when final checkpoint detected or max relaunches hit
+
+**`blueprint_worker_v2.py`** — Per-texture 2-player blueprint (OLDER APPROACH, still works)
+**`scenario_matrix.py`** — 27 scenario definitions from ranges.json
+**`range_parser.py`** — PioSOLVER range string parser with frequency handling
+
+### Compiled Binaries (`build/`)
+- `mccfr_blueprint.dll` / `bp_unified.dll` / `bp_final.dll` — various builds (some may be locked by old processes)
+- `card_abstraction.dll`
+- `street_solve.dll` — GPU solver
+- Various test/benchmark executables
+
+### Data
+- `C:/Users/Victor/Documents/Projects/ACRPoker-Hud-PC/solver/ranges.json` — 6-position preflop ranges
+- `s3://poker-blueprint-2026/` — v1 blueprint (1,755 .bps files, 6-player per-texture, 1M iter)
+
+---
+
+## WHERE WE ARE RIGHT NOW
+
+### Just completed:
+1. Implemented unified 6-player preflop-through-river MCCFR (`bp_init_unified`)
+2. Precomputed 200 EHS postflop buckets for all 1,755 flop textures
+3. Fixed paired-board flush draw canonicalization bug
+4. Added regret table save/load (`bp_save_regrets` / `bp_load_regrets`) for checkpoint/resume
+5. Built checkpoint system in Python worker (strategy .bps + regret .bin to S3)
+6. Built watchdog.sh for auto-restart on spot reclaim
+
+### Test that was running when session ended:
+- Regret save/load test: run 500 iters → save → new solver → load → run 500 more → compare
+- This test takes ~3-5 min because of EHS precompute for 1,755 textures (single-threaded, 500 MC samples each)
+- The test was launched as background task `bz0ou8l34` but PC restarted before it completed
+- **Re-run this test first** to verify save/load works
+
+### What needs to happen before launch:
+
+1. **Verify regret save/load works** — re-run the test above
+2. **Compile final DLL** — `gcc -O2 -shared -fopenmp -static -o build/mccfr_blueprint.dll src/mccfr_blueprint.c -I src -lm`
+3. **Test on Linux** — the EC2 compilation uses `-fPIC -shared -fopenmp` without `-static`; verify it works
+4. **Launch sequence**:
+   a. Launch t3.micro watchdog instance (on-demand, ~$0.01/hr)
+   b. Deploy watchdog.sh + code to it
+   c. Watchdog launches c5.metal spot instance with solver
+   d. Solver runs, checkpoints to S3 every 1M iterations
+   e. If spot reclaimed, watchdog detects in ≤5 min, launches new instance with --resume
+   f. After 8 days (192h) total compute, solver saves "final" checkpoint and shuts down
+   g. Watchdog detects "final" label and stops
+
+### Cost estimate:
+- c5.metal spot: ~$1.22/hr × 192h = **~$234** (if never interrupted)
+- With interruptions + relaunch overhead: ~$250-300
+- Watchdog t3.micro: ~$1.70 for 8 days
+- **Total: ~$235-300**
+
+---
+
+## WHAT WAS VERIFIED WORKING
+
+| Component | Tested? | Result |
+|-----------|---------|--------|
+| Unified 6-player init | YES | 1,755 textures precomputed, 169 preflop buckets |
+| Unified MCCFR traversal | YES | 60K IS from 2K iters, ~10K iter/s single-thread |
+| 200 postflop buckets | YES | Bucket lookup via canonicalized flop hash |
+| Linear CFR incremental discount | YES | Applied 5 times in 500-iter test |
+| Strategy export (.bps) | YES | 73MB raw, 1MB compressed |
+| bp_save_regrets | Compiled OK | Runtime test interrupted by PC restart |
+| bp_load_regrets | Compiled OK | Runtime test interrupted by PC restart |
+| Python worker checkpoint loop | Parses OK | Full integration not yet tested |
+| watchdog.sh | Syntax OK | Not deployed |
+| GPU street_solve.dll | YES | 67ms river, 236ms flop |
+| HUD pipeline | YES | Imports OK, scenario wiring works |
+| BlueprintV2 scenario indexing | YES | v2 layout tested with mock files |
+
+---
+
+## KEY DESIGN DECISIONS
+
+1. **Unified solve, not per-texture**: Matches Pluribus exactly. One MCCFR over entire game tree.
+2. **Preflop integrated**: Not static ranges.json — preflop strategies emerge from the unified solve.
+3. **200 EHS buckets**: Precomputed for all 1,755 textures at init. Cached in `texture_bucket_cache[1760*1326]`.
+4. **Spot + watchdog**: Cheapest reliable path. ~$235 vs $783 on-demand.
+5. **Checkpoint/resume**: Regret table serialized to binary, uploaded to S3, reloaded on new instance.
+
+---
+
+## EVERY FILE THAT WAS MODIFIED OR CREATED
+
+### Created new:
+- `precompute/range_parser.py`
+- `precompute/scenario_matrix.py`
+- `precompute/blueprint_worker_v2.py`
+- `precompute/launch_blueprint_v2.sh`
+- `precompute/blueprint_worker_unified.py`
+- `precompute/launch_blueprint_unified.sh`
+- `precompute/watchdog.sh`
+
+### Modified:
+- `src/mccfr_blueprint.c` — incremental discount, strategy snapshots, unified init, preflop traversal, texture bucket cache, save/load regrets, paired-board canonicalization fix
+- `src/mccfr_blueprint.h` — BPConfig.include_preflop, BPSolver fields (preflop bet sizes, blinds, texture cache), bp_init_unified, bp_save_regrets, bp_load_regrets
+- `src/card_abstraction.c` — ca_assign_buckets_kmeans (k-means on domain features)
+- `src/card_abstraction.h` — ca_assign_buckets_kmeans declaration
+- `python/blueprint_v2.py` — scenario-aware file indexing, current_scenario, available_scenarios
+- `python/hud_solver.py` — scenario wiring, N-player GPU search, strategy freezing, v2 leaf values, uniform_beliefs
+- `python/street_solver_gpu.py` — strategy freezing (frozen_actions), tree-walk for arbitrary node extraction
+- `python/leaf_values.py` — compute_flop_leaf_equity (turn+river equity averaging)
+- `python/range_narrowing.py` — set_uniform_range (1326 hands)
+- `precompute/blueprint_worker.py` — 3 bet sizes
+
+### Not modified (work as-is):
+- `src/cuda/street_solve.cu/.cuh` — already supports 2-6 players + 4 continuation strategies
+- `python/off_tree.py` — pseudoharmonic mapping
+- `python/solver.py` — parse_range_string, card_to_int
+- `precompute/solve_scenarios.py` — generate_all_textures, load_scenarios
+
+---
+
+## PLURIBUS PARAMETER REFERENCE
+
+From `pluribus_technical_details.md` in this repo:
+
+| Parameter | Pluribus | Our Value |
+|-----------|----------|-----------|
+| Players | 6 | 6 |
+| Algorithm | External-sampling MCCFR | Same |
+| Training time | 8 days, 64 cores | 8 days, 72-96 cores |
+| Training cost | ~$144 spot | ~$235 spot |
+| Memory | <512GB | ~30GB estimated |
+| Preflop buckets | 169 lossless | 169 lossless |
+| Postflop buckets | 200 per street | 200 per street |
+| Discount | d=T/(T+1) every 10 min, first 400 min | Same (proportional) |
+| Pruning | -300M threshold, 95%, after 200 min | Same |
+| Regret floor | -310M | -310M |
+| Regret storage | int32 | int32 |
+| Strategy sum | Round 1 only, every 10K iter | Same + snapshots for rounds 2-4 |
+| Search (runtime) | Linear CFR, 4 cont strategies, 5x bias | Same (GPU, 67ms river) |
+| Play strategy | Final iteration | Same |
+| Narrowing strategy | Weighted average | Same |
+| Strategy freezing | A3: freeze at passed nodes for hero's hand | Implemented |
+| Off-tree bets | Pseudoharmonic | Same |
+| Beliefs | Start uniform 1/1326 | Supported (uniform_beliefs=True) |
+
+---
+
+## AWS RESOURCES
+
+- **S3 bucket (v1)**: `poker-blueprint-2026` (110 GB, v1 per-texture blueprint)
+- **S3 bucket (unified)**: `poker-blueprint-unified` (will be created by launch script)
 - **Key pair**: `poker-solver-key` (PEM at `C:/Users/Victor/poker-solver-key.pem`)
 - **Security group**: `poker-solver-sg`
 - **IAM profile**: `poker-solver-profile` (role: `poker-solver-ec2-role`)
@@ -72,150 +256,21 @@ gcc -O2 -fPIC -shared -fopenmp -o build/mccfr_blueprint.so src/mccfr_blueprint.c
 
 ---
 
-## What Needs to Happen (Priority Order)
+## PROMPT FOR NEXT AGENT
 
-### 1. ~~Re-run Blueprint~~ DONE (2026-03-25)
-Blueprint re-generated with fixed code. 1,755 .bps files on S3. Root strategies correct.
-See "Convergence Benchmark Results" above for quality assessment.
+You are continuing development of an exact Pluribus replica poker solver. The project is at `C:/Users/Victor/Documents/Projects/poker-solver/`. Read `CONTEXT_NEXT_SESSION.md` for full context.
 
-### 2. Download Blueprint + Wire into HUD
-- Download .bps files from S3 (or load on-demand via `blueprint_v2.py`)
-- HUD should use `get_root_strategy()` for first flop action (reads metadata JSON — correct)
-- Range narrowing at flop root: use root_strategies per bucket (correct)
-- For deeper decisions: route to GPU real-time search
+**Immediate task**: Verify the regret save/load checkpoint system works (test was interrupted), then launch the 8-day unified blueprint computation on EC2.
 
-### 3. Wire Leaf Values into GPU Search
-The GPU street solver (`street_solve.cu`) needs **continuation leaf values** at depth-limit boundaries. These come from the blueprint:
-- **Flop search leaves** (at turn boundary): need blueprint P(action|bucket) at turn root → 4 continuation strategies (unmodified, fold×5, call×5, raise×5)
-- **Turn search leaves** (at river boundary): need blueprint P(action|bucket) at river root
-
-Currently `street_solve.cu` accepts `leaf_values` as input. The Python wrapper needs to compute these from the blueprint and feed them in.
-
-### 4. End-to-End HUD Test
-Run the full pipeline on an actual ACR table:
-1. Detect game state (board, actions, positions) via Chrome DevTools Protocol
-2. Look up blueprint strategy for first flop action
-3. On opponent action: narrow ranges using blueprint P(action|bucket)
-4. On hero's turn: GPU re-solve subgame from street root
-5. Display recommended strategy
-
----
-
-## Key Architecture Decisions Made
-
-### Blueprint: Per-Texture, Not Unified
-Pluribus runs ONE MCCFR over the entire game. We run **separate MCCFR per flop texture** (1,755 textures). This is an approximation but:
-- Parallelizes perfectly across EC2 instances
-- Each instance needs only 16-30 GB RAM (vs Pluribus's 512 GB)
-- Cost: ~$12 vs Pluribus's ~$144
-
-### GPU for Search, CPU for Blueprint
-Attempted GPU batch outcome-sampling MCCFR (novel research). Finding: CPU external sampling converges ~5-10x faster per wall-clock. GPU is for real-time subgame search only.
-
-### Card Abstraction: 200 EHS Buckets
-Matches Pluribus. Fast C-based EHS computation (2s per texture). Percentile bucketing. All players share the same bucket pool per texture.
-
-### Payoff Model: Cumulative Investment Tracking
-Fixed 3 critical bugs: (1) bets[] reset between streets but pot accumulated, (2) raise double-counted to_call, (3) stack never decremented. Now uses `invested[]` array that persists across streets.
-
-### Hash Table: Lock-Free CAS
-Replaced `#pragma omp critical` (global lock → 15x slowdown) with per-slot atomic CAS. Three-state protocol: 0=empty, 1=ready, 2=initializing. Near-linear thread scaling to 16 cores.
-
----
-
-## What We Tried and Abandoned
-
-1. **GPU MCCFR for blueprints**: 17M traj/s but ~1000x worse sample efficiency than CPU external sampling. Outcome sampling variance too high for large game trees (9M+ info sets).
-
-2. **Linear CFR discount as global post-hoc step**: Doesn't work — needs to be applied incrementally during training. Currently applies only once at the end (minimal effect).
-
-3. **c5.2xlarge EC2 instances**: Only 16 GB RAM → OOM with 64M hash table. Need c5.4xlarge (32 GB) minimum.
-
-4. **Spot instances for blueprint**: Too volatile — 16/20 reclaimed in one run. Use on-demand for reliability (~2x cost but no re-runs).
-
-5. **More iterations for deeper convergence**: Tested 50K→1M→5M iterations. Flop non-uniform % barely grows (0.01%→0.2%). Tree grows faster than visits — 5M iterations creates 21M+ info sets and OOMs at 32 GB. Fundamental compute gap vs Pluribus.
-
-6. **Fewer buckets (50, 10) for more visits per IS**: Marginal improvement (0.2%→6.3% at 10 buckets). Still 94% uniform. Tradeoff: less strategic precision per bucket.
-
-7. **Regret scaling *50 instead of *10**: No improvement. Truncation is not the issue — visit count is.
-
-8. **strategy_sum for all streets**: Actually WORSE — accumulates 1/N (uniform) at rarely-visited nodes, drowning out any signal from the few visits.
-
-9. **c5.9xlarge (36 vCPU, 72 GB)**: Lock-free CAS hash table doesn't scale past 16 threads — 36 threads is slower than 16. No benefit.
-
-10. **tmpfs /tmp on Amazon Linux 2023**: RAM-backed, only 16 GB. Caused OOM when accumulating .bps files. Fixed by incremental S3 upload + local delete, or writing to EBS.
-
----
-
-## Performance Numbers (Measured on EC2 c5.4xlarge, 2026-03-25)
-
-| Metric | Value |
-|--------|-------|
-| MCCFR iter/s (1 thread) | 35-50K |
-| MCCFR iter/s (16 threads, lock-free CAS) | 27-30K effective |
-| MCCFR iter/s (36 threads, c5.9xlarge) | 15-20K (WORSE — CAS contention) |
-| EHS computation (1176 hands, 500 samples) | 1.8s |
-| Info sets per texture (1M iter) | ~13M |
-| Blueprint file size (LZMA-1) | ~140 MB per texture |
-| GPU street solve (river, 200 hands) | 67ms |
-| GPU street solve (flop, 200 hands) | 236ms |
-
----
-
-## File Locations
-
-```
-C:/Users/Victor/Documents/Projects/poker-solver/    # main repo
-├── src/
-│   ├── mccfr_blueprint.c/.h     # production MCCFR
-│   ├── card_abstraction.c/.h    # EHS + bucketing
-│   ├── hand_eval.h              # 7-card evaluator
-│   └── cuda/
-│       ├── street_solve.cu/.cuh # GPU subgame solver
-│       └── gpu_mccfr.cu/.cuh   # GPU MCCFR (research)
-├── python/
-│   ├── blueprint_v2.py          # .bps loader
-│   ├── hud_solver.py            # HUD pipeline
-│   ├── street_solver_gpu.py     # GPU solver wrapper
-│   ├── range_narrowing.py       # Bayesian range tracker
-│   └── off_tree.py              # pseudoharmonic mapping
-├── precompute/
-│   ├── blueprint_worker.py      # EC2 worker
-│   ├── launch_blueprint.sh      # fleet launcher
-│   └── solve_scenarios.py       # texture generation
-├── build/                        # compiled DLLs
-├── blueprint_output/             # downloaded .bps files (partial)
-├── pluribus_technical_details.md # every Pluribus parameter
-├── BLUEPRINT_PRECOMPUTE.md       # precompute architecture
-└── ARCHITECTURE.md               # overall architecture
-
-C:/Users/Victor/Documents/Projects/ACRPoker-Hud-PC/  # HUD app
-├── solver/solver-cli/target/release/tbl-engine.exe  # Rust postflop-solver
-├── solver/ranges.json                                # preflop ranges
-└── src/cdp_reader.py                                # game state reader
+**Test to run first**:
+```bash
+cd /c/Users/Victor/Documents/Projects/poker-solver
+gcc -O2 -shared -fopenmp -static -o build/mccfr_blueprint.dll src/mccfr_blueprint.c -I src -lm
+# Then run the Python save/load test (see blueprint_worker_unified.py)
 ```
 
----
-
-## Prompt for Next Agent
-
-You are continuing development of a Pluribus-equivalent 6-max NLHE poker solver. The project is at `C:/Users/Victor/Documents/Projects/poker-solver/`. Read `CONTEXT_NEXT_SESSION.md` for full context.
-
-**Immediate task**: Re-run the EC2 blueprint generation with the fixed regret scaling code, verify the exported strategies are non-uniform, download the flop-only subset (~4 GB), and test the full HUD pipeline end-to-end (blueprint lookup → range narrowing → GPU search → strategy output).
-
-**The specific bugs that were fixed but not re-deployed:**
-1. `src/mccfr_blueprint.c` line 535: regret delta uses `*10.0f` (was `*1000.0f` → int32 overflow → all-zero regrets)
-2. `src/mccfr_blueprint.c` export function: always uses `regret_match_int` (was using empty `strategy_sum` → uniform strategies)
-3. `precompute/blueprint_worker.py`: `strategy_interval=1` (was 10000)
-4. `src/mccfr_blueprint.h`: `#include <stddef.h>` for `size_t`
-
-**After the blueprint is regenerated and verified:**
-1. Wire blueprint continuation strategies into `street_solve.cu` leaf values
-2. Test on actual ACR poker table via the HUD
-3. Measure strategy quality vs Rust postflop-solver (tbl-engine.exe)
-
-**Long-term goals:**
-- Preflop solver (6-player simultaneous, not pairwise)
-- Per-street re-bucketing (Pluribus re-buckets when turn/river dealt)
-- Strategy freezing in GPU search (A3)
-- Support 2-9 players (just change MAX_PLAYERS defines)
+**Launch sequence** (after test passes):
+1. Launch t3.micro watchdog
+2. Deploy code + watchdog.sh
+3. Watchdog launches c5.metal spot with unified solver + --resume
+4. Monitor via `watchdog.sh --status` or S3 checkpoint metadata

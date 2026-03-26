@@ -328,13 +328,27 @@ class StreetSolverGPU:
             raise RuntimeError("ss_solve_gpu failed")
         self._solved = True
 
-    def get_strategy(self, player, hand_str=None, hand_idx=None):
-        """Get strategy for a specific hand at this player's first decision.
+    def get_strategy(self, player, hand_str=None, hand_idx=None,
+                     frozen_actions=None):
+        """Get strategy for a specific hand at this player's CURRENT decision.
+
+        Implements Pluribus A3 (strategy freezing): when hero has already
+        acted at a node earlier this street, the strategy at that node is
+        frozen to 100% on the previously-chosen action FOR HERO'S HAND ONLY.
+        Other hands at that info set remain free.
+
+        The solver walks the tree following the frozen action sequence to find
+        hero's actual current decision node, then returns the solver's strategy
+        at that node.
 
         Args:
             player: int (0..N-1) or "oop"(0) / "ip"(1) for 2-player
             hand_str: e.g., "AhKh"
             hand_idx: index into player's hand array
+            frozen_actions: list of action labels that hero took at previous
+                decision nodes this street, in order. The solver follows these
+                actions through the tree to find the current decision node.
+                If None or empty, returns strategy at hero's first decision.
 
         Returns:
             dict {action_label: frequency}
@@ -348,19 +362,100 @@ class StreetSolverGPU:
 
         max_h = self._max_hands
 
-        if self._output.root_player == player_idx:
-            # Player acts at root
-            root_nh = len(self.player_hands[player_idx])
-            root_na = self._output.root_num_actions
-            labels = _build_labels_at_node(self._tree, 0)
+        # If no frozen actions, return strategy at hero's first decision
+        if not frozen_actions:
+            if self._output.root_player == player_idx:
+                root_nh = len(self.player_hands[player_idx])
+                root_na = self._output.root_num_actions
+                labels = _build_labels_at_node(self._tree, 0)
+                result = {}
+                for a in range(min(root_na, len(labels))):
+                    freq = self._output.root_strategy[a * root_nh + hand_idx]
+                    if freq > 0.001:
+                        result[labels[a]] = float(freq)
+                return result
+            else:
+                return self._get_strategy_at_player_node(player_idx, hand_idx)
+
+        # Walk the tree following frozen actions to find the current node.
+        # At each node where hero acts, we follow the frozen action.
+        # At nodes where opponents act, we follow all branches and look for
+        # the next hero decision node (the solver output has avg strategies
+        # at all decision nodes, so we find the right one by matching).
+        #
+        # For the common case: hero acts at root, takes frozen action, then
+        # opponent(s) act, then hero faces a new decision. We need to find
+        # that second decision node.
+        frozen_idx = 0
+        current_node = 0  # start at root
+
+        while frozen_idx < len(frozen_actions) and current_node < self._tree.num_nodes:
+            node = self._tree.nodes[current_node]
+            if node.type != 0:  # not a decision node
+                break
+
+            if node.player == player_idx:
+                # Hero's decision — follow the frozen action
+                frozen_label = frozen_actions[frozen_idx]
+                labels = _build_labels_at_node(self._tree, current_node)
+
+                matched = False
+                for c in range(node.num_children):
+                    if c < len(labels) and self._match_action_label(
+                            labels[c], frozen_label):
+                        child_idx = self._tree.children[node.first_child + c]
+                        current_node = child_idx
+                        frozen_idx += 1
+                        matched = True
+                        break
+
+                if not matched:
+                    # Frozen action not found in tree — return best match
+                    break
+            else:
+                # Opponent's decision — we need to find the next hero node.
+                # Follow the first child (any path reaches the same set of
+                # hero decision nodes since this is a single-street tree).
+                if node.num_children > 0:
+                    # Follow check/call branch (least disruptive)
+                    current_node = self._tree.children[node.first_child]
+                else:
+                    break
+
+        # Now current_node should be at hero's next decision (or we exhausted frozen actions)
+        node = self._tree.nodes[current_node]
+        if node.type == 0 and node.player == player_idx:
+            # Found hero's current decision node — extract avg strategy
+            return self._get_strategy_at_node(current_node, player_idx, hand_idx)
+
+        # Fallback: return strategy at hero's first unfrozen decision node
+        return self._get_strategy_at_player_node(player_idx, hand_idx)
+
+    @staticmethod
+    def _match_action_label(tree_label, frozen_label):
+        """Fuzzy match action labels (e.g. "Check" matches "check")."""
+        return tree_label.lower().strip() == frozen_label.lower().strip()
+
+    def _get_strategy_at_node(self, node_idx, player_idx, hand_idx):
+        """Extract avg strategy at a specific tree node for a specific hand."""
+        max_h = self._max_hands
+        for di in range(self._output.num_avg_nodes):
+            nidx = self._output.avg_strategy_node_ids[di]
+            if nidx != node_idx:
+                continue
+            node = self._tree.nodes[nidx]
+            if node.player != player_idx or node.type != 0:
+                continue
+            na = node.num_children
+            labels = _build_labels_at_node(self._tree, nidx)
             result = {}
-            for a in range(min(root_na, len(labels))):
-                freq = self._output.root_strategy[a * root_nh + hand_idx]
+            for a in range(min(na, len(labels))):
+                freq = self._output.avg_strategies[
+                    di * SS_MAX_ACTIONS * max_h + a * max_h + hand_idx]
                 if freq > 0.001:
                     result[labels[a]] = float(freq)
             return result
-        else:
-            return self._get_strategy_at_player_node(player_idx, hand_idx)
+        return {}
 
     def _get_strategy_at_player_node(self, player_idx, hand_idx):
         """Find first decision node for this player, extract avg strategy."""

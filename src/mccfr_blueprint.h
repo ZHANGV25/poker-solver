@@ -48,24 +48,26 @@
 
 /* ── Data structures ─────────────────────────────────────────────────── */
 
-/* Info set key */
+/* Info set key — includes bucket (Pluribus-style: one info set per bucket).
+ * This means each hash table slot stores regrets[num_actions] only,
+ * reducing memory ~200x vs storing regrets[num_actions * num_buckets]. */
 typedef struct {
     int player;
-    int street;              /* 1=flop, 2=turn, 3=river */
+    int street;              /* 0=preflop, 1=flop, 2=turn, 3=river */
+    int bucket;              /* card abstraction bucket index */
     uint64_t board_hash;
     uint64_t action_hash;
 } BPInfoKey;
 
 /* Info set data — integer regrets for memory efficiency.
  * Pluribus stores regrets as int32, strategies derived from regrets.
+ * With bucket-in-key, each info set stores regrets for ONE bucket only.
  * strategy_sum is only maintained for round 1 (preflop).
  * For rounds 2-4, snapshots of current strategy are saved to disk. */
 typedef struct {
     int num_actions;
-    int num_hands;         /* actually num_buckets when using abstraction */
-    int *regrets;          /* [num_actions * num_hands], int32 */
-    float *strategy_sum;   /* [num_actions * num_hands] or NULL (lazy) */
-    float *current_strategy; /* [num_actions * num_hands], transient */
+    int *regrets;          /* [num_actions], int32 */
+    float *strategy_sum;   /* [num_actions] or NULL (lazy) */
 } BPInfoSet;
 
 /* Hash table (open addressing, linear probing) */
@@ -92,6 +94,7 @@ typedef struct {
     int num_threads;            /* OpenMP threads (0 = auto) */
     int hash_table_size;        /* 0 = auto (BP_HASH_SIZE_SMALL or _LARGE based on players) */
     const char *snapshot_dir;   /* directory for strategy snapshots (NULL = no snapshots) */
+    int include_preflop;        /* 1 = start from preflop (unified Pluribus-style), 0 = start from flop */
 } BPConfig;
 
 /* Blueprint solver state */
@@ -113,13 +116,20 @@ typedef struct {
     /* Board */
     int flop[3];
 
-    /* Bet sizing */
+    /* Bet sizing (postflop) */
     float bet_sizes[BP_MAX_ACTIONS];
     int num_bet_sizes;
 
-    /* Pot and stacks */
-    int starting_pot;
-    int effective_stack;
+    /* Preflop bet sizing (Pluribus: 1-14 sizes per decision point) */
+    float preflop_bet_sizes[BP_MAX_ACTIONS];
+    int num_preflop_bet_sizes;
+
+    /* Pot, stacks, and blinds */
+    int starting_pot;       /* pot at start of postflop (when include_preflop=0) */
+    int effective_stack;    /* stack at start of postflop (when include_preflop=0) */
+    int small_blind;        /* SB amount in chips (e.g. 50 for $50/$100) */
+    int big_blind;          /* BB amount in chips (e.g. 100) */
+    int initial_stack;      /* starting stack per player (e.g. 10000 for 100BB) */
 
     /* Info set storage */
     BPInfoTable info_table;
@@ -130,6 +140,22 @@ typedef struct {
     /* RNG state — one per thread for OpenMP */
     uint64_t *rng_states;    /* [num_threads] */
     int num_rng_states;
+
+    /* Postflop bucket config for unified solver.
+     * When include_preflop=1, postflop buckets are precomputed for all 1,755
+     * flop textures at init time. During traversal, the canonical flop hash
+     * is used to look up the precomputed 200-bucket mapping. */
+    int postflop_num_buckets;  /* target buckets per street (Pluribus: 200) */
+    int postflop_ehs_samples;  /* MC samples for EHS precompute (Pluribus: ~500) */
+
+    /* Precomputed flop texture bucket cache.
+     * Key: canonical flop hash (from 3 sorted ranks + suit pattern).
+     * Value: bucket_map[1326] for that texture.
+     * Allocated at init, freed by bp_free. */
+    #define BP_MAX_TEXTURES 1760
+    int *texture_bucket_cache;     /* [BP_MAX_TEXTURES * BP_MAX_HANDS] flat array */
+    uint64_t texture_hash_keys[BP_MAX_TEXTURES];  /* hash key per texture */
+    int num_cached_textures;
 
     /* Stats */
     int iterations_run;
@@ -200,10 +226,37 @@ BP_EXPORT int bp_solve(BPSolver *s, int max_iterations);
 BP_EXPORT int bp_get_strategy(const BPSolver *s, int player,
                                const int *board, int num_board,
                                const int *action_seq, int seq_len,
-                               float *strategy_out, int hand_idx);
+                               float *strategy_out, int bucket);
 
 BP_EXPORT int bp_num_info_sets(const BPSolver *s);
 BP_EXPORT void bp_free(BPSolver *s);
+
+/**
+ * Initialize a unified preflop-through-river solver (Pluribus-style).
+ *
+ * All 6 players get all 1326 hands. Preflop uses 169 lossless classes.
+ * Postflop uses card abstraction via bp_set_buckets().
+ *
+ * Traversal starts from preflop with SB/BB posting, then UTG→MP→CO→BTN→SB→BB
+ * acting in order. After preflop round, 3 flop cards are dealt, then
+ * flop→turn→river betting rounds proceed as in the standard postflop solver.
+ *
+ * This matches Pluribus Algorithm 1 exactly: one unified MCCFR solve.
+ *
+ * Args:
+ *   s: solver state (caller allocates)
+ *   num_players: 6 for full table (2-6 supported)
+ *   small_blind, big_blind: blind amounts in chips (e.g. 50, 100)
+ *   initial_stack: starting stack per player in chips (e.g. 10000 for 100BB)
+ *   postflop_bet_sizes, num_postflop_bet_sizes: bet fractions for flop/turn/river
+ *   preflop_bet_sizes, num_preflop_bet_sizes: bet fractions for preflop raises
+ *   config: solver configuration
+ */
+BP_EXPORT int bp_init_unified(BPSolver *s, int num_players,
+                                int small_blind, int big_blind, int initial_stack,
+                                const float *postflop_bet_sizes, int num_postflop_bet_sizes,
+                                const float *preflop_bet_sizes, int num_preflop_bet_sizes,
+                                const BPConfig *config);
 
 /**
  * Export ALL info set strategies to a binary buffer.
@@ -229,6 +282,36 @@ BP_EXPORT void bp_free(BPSolver *s);
 BP_EXPORT int bp_export_strategies(const BPSolver *s,
                                     unsigned char *buf, size_t buf_size,
                                     size_t *bytes_written);
+
+/**
+ * Save the full regret table to a binary file for checkpoint/resume.
+ *
+ * Writes all occupied hash table slots (keys + regrets + strategy_sum)
+ * to a binary file that can be reloaded via bp_load_regrets().
+ *
+ * Format:
+ *   Header: "BPRG" (4B) + table_size (4B) + num_entries (4B) + iterations_run (4B)
+ *   For each occupied slot:
+ *     BPInfoKey (player 4B, street 4B, board_hash 8B, action_hash 8B) = 24B
+ *     num_actions (4B), num_hands (4B) = 8B
+ *     regrets[num_actions * num_hands] (int32) = variable
+ *     has_strategy_sum (4B)
+ *     if has_strategy_sum: strategy_sum[num_actions * num_hands] (float32) = variable
+ *
+ * Returns 0 on success, -1 on write error.
+ */
+BP_EXPORT int bp_save_regrets(const BPSolver *s, const char *path);
+
+/**
+ * Load a previously saved regret table from a checkpoint file.
+ *
+ * Must be called AFTER bp_init_unified or bp_init_ex (hash table must exist).
+ * Loaded entries are inserted into the existing hash table. If the table is
+ * too small for the saved entries, excess entries are silently dropped.
+ *
+ * Returns number of entries loaded, or -1 on error.
+ */
+BP_EXPORT int bp_load_regrets(BPSolver *s, const char *path);
 
 /**
  * Export EHS values and bucket assignments for all hands.

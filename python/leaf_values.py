@@ -358,6 +358,121 @@ def compute_flop_leaf_values(
     return leaf_values
 
 
+# ── Flop leaf equity (v2 blueprint fallback) ─────────────────────────────
+
+def compute_flop_leaf_equity(
+    flop_board: List[int],
+    oop_hands: List[Tuple[int, int, float]],
+    ip_hands: List[Tuple[int, int, float]],
+    leaf_infos: List[LeafInfo],
+    max_hands: int,
+    starting_pot: int,
+) -> np.ndarray:
+    """Compute flop leaf values by averaging equity over all turn+river runouts.
+
+    Used when the v2 blueprint doesn't have per-action turn EVs (which are
+    needed for the full 4-continuation-strategy framework). Instead, we
+    compute each player's expected share of the pot at each leaf via equity,
+    averaged over all turn cards.
+
+    For each turn card, we call compute_turn_leaf_values to get equity over
+    river cards. This gives us proper 2-street lookahead.
+
+    Since we can't differentiate the 4 continuation strategies without
+    per-action EVs, all 16 (s0, s1) pairs get the same equity value.
+    This is conservative — the GPU search will refine via CFR iterations.
+
+    Args:
+        flop_board: [c0, c1, c2] card ints
+        oop_hands, ip_hands: per-player hands with weights
+        leaf_infos: from extract_leaf_info_from_tree()
+        max_hands: max(len(oop_hands), len(ip_hands))
+        starting_pot: pot in chips at start of flop betting
+
+    Returns:
+        np.array[num_total_leaves, 2, max_hands] float32
+    """
+    num_orig_leaves = len(leaf_infos)
+    total_leaves = num_orig_leaves * 16
+    leaf_values = np.zeros((total_leaves, 2, max_hands), dtype=np.float32)
+
+    board_set = set(flop_board)
+    turn_cards = [c for c in range(52) if c not in board_set]
+
+    # For each turn card, compute turn leaf equity (which itself averages
+    # over river cards). Then average across turn cards.
+    accumulated = np.zeros((num_orig_leaves, 2, max_hands), dtype=np.float64)
+    valid_turns = 0
+
+    # Filter turn cards that don't conflict with any player hands
+    # (all turn cards are valid — conflict is handled per-hand inside)
+    MAX_TURN_SAMPLES = 16  # sample to keep computation tractable
+    if len(turn_cards) > MAX_TURN_SAMPLES and \
+       (len(oop_hands) > 80 or len(ip_hands) > 80):
+        rng = np.random.RandomState(42)
+        sampled_turns = sorted(rng.choice(turn_cards, MAX_TURN_SAMPLES, replace=False))
+    else:
+        sampled_turns = turn_cards
+
+    for tc in sampled_turns:
+        board_4 = list(flop_board) + [tc]
+
+        # Filter hands that conflict with this turn card
+        tc_oop = [(c0, c1, w) for c0, c1, w in oop_hands if c0 != tc and c1 != tc]
+        tc_ip = [(c0, c1, w) for c0, c1, w in ip_hands if c0 != tc and c1 != tc]
+
+        if not tc_oop or not tc_ip:
+            continue
+
+        # compute_turn_leaf_values returns [total_leaves, 2, max_hands]
+        # where total_leaves = num_orig_leaves * 16
+        tc_max_h = max(len(tc_oop), len(tc_ip))
+        tc_vals = compute_turn_leaf_values(
+            board_4=board_4,
+            oop_hands=tc_oop,
+            ip_hands=tc_ip,
+            leaf_infos=leaf_infos,
+            max_hands=tc_max_h,
+            starting_pot=starting_pot,
+        )
+
+        # Map turn-card-filtered hand indices back to full hand indices
+        for p, (tc_hands, full_hands) in enumerate(
+                [(tc_oop, oop_hands), (tc_ip, ip_hands)]):
+            # Build mapping: tc_hands index -> full_hands index
+            tc_idx = 0
+            for h_full in range(len(full_hands)):
+                c0, c1 = full_hands[h_full][0], full_hands[h_full][1]
+                if c0 == tc or c1 == tc:
+                    continue  # blocked by turn card
+                if tc_idx >= len(tc_hands):
+                    break
+                # All 16 (s0,s1) pairs have same equity for this approach
+                for li_idx in range(num_orig_leaves):
+                    flat_0 = li_idx * 16  # first of 16 terminals
+                    if tc_idx < tc_max_h:
+                        accumulated[li_idx, p, h_full] += tc_vals[flat_0, p, tc_idx]
+                tc_idx += 1
+
+        valid_turns += 1
+
+    if valid_turns > 0:
+        accumulated /= valid_turns
+
+    # Replicate across all 16 (s0, s1) pairs (identical since we lack per-action EVs)
+    for li_idx in range(num_orig_leaves):
+        for s0 in range(4):
+            for s1 in range(4):
+                flat_idx = li_idx * 16 + s0 * 4 + s1
+                if flat_idx < total_leaves:
+                    leaf_values[flat_idx, 0, :max_hands] = \
+                        accumulated[li_idx, 0, :max_hands].astype(np.float32)
+                    leaf_values[flat_idx, 1, :max_hands] = \
+                        accumulated[li_idx, 1, :max_hands].astype(np.float32)
+
+    return leaf_values
+
+
 # ── Turn leaf values (river continuation) ────────────────────────────────
 
 def compute_turn_leaf_values(

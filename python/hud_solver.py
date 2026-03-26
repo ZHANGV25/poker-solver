@@ -86,7 +86,7 @@ class HUDSolver:
         self._bp_stores = {}  # scenario_id -> BlueprintStore
         self._bp_store_dir = blueprint_store_dir
 
-        # V2 blueprint (6-player MCCFR .bps files)
+        # V2 blueprint (.bps files, supports scenario-filtered v2 layout)
         self.blueprint_v2 = None
         if blueprint_v2_dir:
             try:
@@ -141,8 +141,23 @@ class HUDSolver:
 
     def new_hand(self, hero_pos, villain_pos, scenario_type="srp",
                  ranges_json_path=None, num_players=2,
-                 pot_bb=0, stack_bb=100):
-        """Initialize for a new hand."""
+                 pot_bb=0, stack_bb=100,
+                 extra_villain_positions=None,
+                 uniform_beliefs=False):
+        """Initialize for a new hand.
+
+        Args:
+            hero_pos: hero's position (e.g. "BB")
+            villain_pos: primary villain's position (e.g. "BTN")
+            scenario_type: "srp" or "3bp"
+            ranges_json_path: path to ranges.json
+            num_players: total players in the hand (2-6)
+            pot_bb: pot size in BB
+            stack_bb: effective stack in BB
+            extra_villain_positions: list of additional villain positions for
+                multiway pots (e.g. ["CO", "MP"]). If provided, ranges are
+                loaded for each and tracked separately for N-player GPU search.
+        """
         self.hero_pos = hero_pos
         self.villain_pos = villain_pos
         self.num_players = num_players
@@ -152,6 +167,7 @@ class HUDSolver:
         self._board = []
         self._pot_bb = pot_bb
         self._stack_bb = stack_bb
+        self._extra_villains = {}  # pos -> {"narrower": RangeNarrower, "player_idx": int}
 
         # Determine OOP/IP
         post_order = ["SB", "BB", "UTG", "MP", "CO", "BTN"]
@@ -169,7 +185,12 @@ class HUDSolver:
 
         self.scenario_id = "{}_vs_{}_{}".format(oop_pos, ip_pos, scenario_type)
 
+        # Set scenario on v2 blueprint so it loads the correct .bps files
+        if self.blueprint_v2:
+            self.blueprint_v2.current_scenario = self.scenario_id
+
         # Load ranges
+        ranges_data = None
         if ranges_json_path and os.path.exists(ranges_json_path):
             import json
             with open(ranges_json_path) as f:
@@ -189,8 +210,33 @@ class HUDSolver:
 
         hero_hands = parse_range_string(hero_range_str)
         villain_hands = parse_range_string(villain_range_str)
-        self.narrower.set_initial_range("hero", hero_hands)
-        self.narrower.set_initial_range("villain", villain_hands)
+
+        if uniform_beliefs:
+            # Pluribus-style: start with all 1326 hands at uniform weight.
+            # Narrow from the first action using blueprint P(action|hand).
+            self.narrower.set_uniform_range("hero")
+            self.narrower.set_uniform_range("villain")
+        else:
+            # Default: start from known preflop ranges (better for HUD use
+            # case where we know the preflop ranges from population data).
+            self.narrower.set_initial_range("hero", hero_hands)
+            self.narrower.set_initial_range("villain", villain_hands)
+
+        # Load extra villain ranges for multiway N-player GPU search
+        if extra_villain_positions and ranges_data:
+            for ev_pos in extra_villain_positions:
+                ev_range_str = self._get_range_str(
+                    ranges_data, hero_pos, ev_pos, scenario_type, is_hero=False)
+                if ev_range_str:
+                    ev_narrower = RangeNarrower()
+                    ev_hands = parse_range_string(ev_range_str)
+                    ev_narrower.set_initial_range("villain", ev_hands)
+                    # Determine position index for acting order
+                    ev_idx = post_order.index(ev_pos) if ev_pos in post_order else 99
+                    self._extra_villains[ev_pos] = {
+                        "narrower": ev_narrower,
+                        "player_idx": ev_idx,
+                    }
 
     def _get_range_str(self, ranges_data, hero_pos, villain_pos,
                         scenario_type, is_hero):
@@ -542,19 +588,63 @@ class HUDSolver:
         """Solve the current street using GPU single-street solver.
 
         Implements Pluribus real-time search (Algorithm 2 in supplementary):
-          1. Build single-street betting tree
+          1. Build single-street betting tree (2-6 players)
           2. Compute leaf values from blueprint continuation strategies
           3. Run Linear CFR on GPU (200 iterations)
           4. Return final-iteration strategy for play
           5. Store weighted-average strategy for future narrowing
-        """
-        if self.hero_player == "oop":
-            oop_hands, ip_hands = hero_hands, villain_hands
-        else:
-            oop_hands, ip_hands = villain_hands, hero_hands
 
+        When extra villains are tracked (multiway), builds an N-player
+        tree with all active players' ranges. The GPU solver handles
+        2-6 players natively (SS_MAX_PLAYERS=6).
+        """
         pot = self._pot_bb if self._pot_bb > 0 else 10.0
         stack = self._stack_bb if self._stack_bb > 0 else 90.0
+
+        # Build player ranges in position order for N-player solve
+        # post_order: SB(0), BB(1), UTG(2), MP(3), CO(4), BTN(5)
+        post_order = ["SB", "BB", "UTG", "MP", "CO", "BTN"]
+
+        if self._extra_villains:
+            # N-player mode: gather all active players' ranges in position order
+            all_players = {}  # pos -> (hands, is_hero)
+
+            all_players[self.hero_pos] = (hero_hands, True)
+            all_players[self.villain_pos] = (villain_hands, False)
+
+            board_ints = [card_to_int(c) if isinstance(c, str) else c for c in board]
+            blocked = set(board_ints)
+
+            for ev_pos, ev_info in self._extra_villains.items():
+                ev_hands = ev_info["narrower"].get_weighted_hands("villain")
+                if ev_hands:
+                    ev_hands = [(c0, c1, w) for c0, c1, w in ev_hands
+                                if c0 not in blocked and c1 not in blocked]
+                    all_players[ev_pos] = (ev_hands, False)
+
+            # Sort by position order
+            sorted_players = sorted(all_players.keys(),
+                                    key=lambda p: post_order.index(p)
+                                    if p in post_order else 99)
+
+            player_ranges = []
+            acting_order = []
+            hero_player_idx_in_solve = 0
+            for i, pos in enumerate(sorted_players):
+                hands, is_hero = all_players[pos]
+                player_ranges.append(hands)
+                acting_order.append(i)
+                if is_hero:
+                    hero_player_idx_in_solve = i
+        else:
+            # Standard 2-player mode
+            if self.hero_player == "oop":
+                player_ranges = [hero_hands, villain_hands]
+                hero_player_idx_in_solve = 0
+            else:
+                player_ranges = [villain_hands, hero_hands]
+                hero_player_idx_in_solve = 1
+            acting_order = None  # default [0, 1]
 
         t0 = time.time()
 
@@ -586,6 +676,48 @@ class HUDSolver:
                             starting_pot=pot_chips,
                         )
                     leaf_value_fn = _flop_leaf_fn
+                elif self.blueprint_v2 is not None:
+                    # Use v2 .bps blueprint for flop leaf values.
+                    # Flop leaves are at the turn boundary. Pluribus computes
+                    # continuation values by averaging equity over all 49 turn
+                    # cards, weighted by the 4 biased continuation strategies.
+                    #
+                    # Without full per-action turn EVs from the v2 blueprint,
+                    # we compute per-turn-card equity directly. This is the
+                    # same method used for turn leaves (which are at the river
+                    # boundary). The 4 continuation strategy pairs all collapse
+                    # to the same equity value since we lack per-action EVs to
+                    # differentiate them. This is conservative — the GPU search
+                    # refines leaf values via CFR iterations regardless.
+                    board_strs = list(board[:3])
+
+                    def _flop_leaf_fn_v2(tree_data, player_hands,
+                                         max_h, pot_chips):
+                        from leaf_values import (compute_flop_leaf_equity,
+                                                 extract_leaf_info_from_tree)
+                        leaf_infos = extract_leaf_info_from_tree(tree_data)
+                        if not leaf_infos:
+                            return None
+                        flop_ints = [card_to_int(c) for c in board_strs]
+                        # player_hands is list of hand lists (N-player) or
+                        # the oop_hands list (2-player callback from StreetSolverGPU)
+                        if isinstance(player_hands, list) and \
+                           len(player_hands) > 0 and \
+                           isinstance(player_hands[0], list):
+                            oop_h = player_hands[0]
+                            ip_h = player_hands[1] if len(player_hands) > 1 else []
+                        else:
+                            oop_h = player_hands
+                            ip_h = []
+                        return compute_flop_leaf_equity(
+                            flop_board=flop_ints,
+                            oop_hands=oop_h,
+                            ip_hands=ip_h,
+                            leaf_infos=leaf_infos,
+                            max_hands=max_h,
+                            starting_pot=pot_chips,
+                        )
+                    leaf_value_fn = _flop_leaf_fn_v2
 
             elif street == "turn" and len(board) >= 4:
                 board_ints = [card_to_int(c) for c in board[:4]]
@@ -608,39 +740,56 @@ class HUDSolver:
 
             # Choose solver
             if _GPU_AVAILABLE:
-                solver = StreetSolverGPU(
-                    board=board,
-                    oop_range=oop_hands,
-                    ip_range=ip_hands,
-                    pot_bb=pot,
-                    stack_bb=stack,
-                    bet_sizes=self.DEFAULT_BET_SIZES,
-                    use_cont_strats=use_cont_strats,
-                    leaf_value_fn=leaf_value_fn,
-                )
+                # Use N-player interface when we have multiway ranges,
+                # otherwise backward-compat 2-player interface
+                if self._extra_villains and len(player_ranges) > 2:
+                    solver = StreetSolverGPU(
+                        board=board,
+                        player_ranges=player_ranges,
+                        acting_order=acting_order,
+                        pot_bb=pot,
+                        stack_bb=stack,
+                        bet_sizes=self.DEFAULT_BET_SIZES,
+                        use_cont_strats=use_cont_strats,
+                        leaf_value_fn=leaf_value_fn,
+                    )
+                else:
+                    oop_h = player_ranges[0]
+                    ip_h = player_ranges[1] if len(player_ranges) > 1 else []
+                    solver = StreetSolverGPU(
+                        board=board,
+                        oop_range=oop_h,
+                        ip_range=ip_h,
+                        pot_bb=pot,
+                        stack_bb=stack,
+                        bet_sizes=self.DEFAULT_BET_SIZES,
+                        use_cont_strats=use_cont_strats,
+                        leaf_value_fn=leaf_value_fn,
+                    )
                 solver.solve(iterations=200)
 
                 hand_str = hero_cards[0] + hero_cards[1]
+                # Pluribus A3: freeze hero's strategy at previously-passed nodes.
+                # Pass the ordered list of action labels hero took this street.
+                frozen = None
+                if self._hero_actions_this_street:
+                    frozen = [action for action, _ in self._hero_actions_this_street]
                 try:
-                    strat = solver.get_strategy(self.hero_player, hand_str=hand_str)
+                    strat = solver.get_strategy(hero_player_idx_in_solve,
+                                                hand_str=hand_str,
+                                                frozen_actions=frozen)
                 except ValueError:
-                    # Hero's hand was trimmed from the range (>200 hands).
-                    # This shouldn't happen in practice — hero's actual hand
-                    # should always be in the range with weight 1.0.
-                    # Return empty result with explanation.
                     elapsed = (time.time() - t0) * 1000
                     return {
                         'actions': [], 'ev': 0, 'solving': False,
-                        'error': 'hero hand {} not in trimmed range ({}→{} hands)'.format(
-                            hand_str, len(oop_hands) + len(ip_hands),
-                            len(solver.oop_hands) + len(solver.ip_hands)),
+                        'error': 'hero hand {} not in trimmed range'.format(hand_str),
                         'time_ms': elapsed, 'street': street,
                         'source': 'street_solve_gpu',
                     }
 
                 # Store weighted average for future range narrowing
                 self._last_solve_avg_strategy = solver.get_avg_strategy(
-                    self.hero_player)
+                    hero_player_idx_in_solve)
 
                 elapsed = (time.time() - t0) * 1000
 
@@ -655,13 +804,16 @@ class HUDSolver:
                     'source': 'street_solve_gpu',
                     'time_ms': elapsed,
                     'street': street,
+                    'num_players_in_solve': len(player_ranges),
                 }
             else:
-                # CPU fallback via solver_v2
+                # CPU fallback via solver_v2 (2-player only)
+                oop_h = player_ranges[0]
+                ip_h = player_ranges[1] if len(player_ranges) > 1 else []
                 solver = StreetSolver(
                     board=board,
-                    oop_range=oop_hands,
-                    ip_range=ip_hands,
+                    oop_range=oop_h,
+                    ip_range=ip_h,
                     pot_bb=pot,
                     stack_bb=stack,
                     bet_sizes=self.DEFAULT_BET_SIZES,
@@ -669,7 +821,7 @@ class HUDSolver:
                 solver.solve(iterations=500)
 
                 hand_str = hero_cards[0] + hero_cards[1]
-                strat = solver.get_strategy(self.hero_player, hand_str)
+                strat = solver.get_strategy(hero_player_idx_in_solve, hand_str)
                 elapsed = (time.time() - t0) * 1000
 
                 actions = [{'action': name, 'frequency': freq}
@@ -684,7 +836,9 @@ class HUDSolver:
                     'street': street,
                 }
 
-            if self.num_players > 2:
+            # Only apply heuristic multiway adjustment if we couldn't do true
+            # N-player search (e.g. CPU fallback or no extra villain ranges)
+            if self.num_players > 2 and not self._extra_villains:
                 result = self._apply_multiway(result, hero_cards, board)
 
             return result

@@ -121,7 +121,15 @@ def board_to_texture_key(board_ints):
 
 
 class BlueprintV2:
-    """Loader for .bps blueprint files."""
+    """Loader for .bps blueprint files.
+
+    Supports two directory layouts:
+      v1: blueprint_dir/worker-N/{texture_key}.bps  (flat, no scenarios)
+      v2: blueprint_dir/worker-N/{scenario_id}/{texture_key}.bps  (scenario-filtered)
+
+    For v2, use load_for_scenario() or set current_scenario to select which
+    scenario's blueprints to serve. Falls back to v1 layout when no scenarios found.
+    """
 
     def __init__(self, blueprint_dir: str, streets_to_load: Optional[List[int]] = None):
         """
@@ -133,43 +141,82 @@ class BlueprintV2:
         self.blueprint_dir = blueprint_dir
         self.streets_to_load = streets_to_load or [1]  # flop by default
 
-        # Loaded data: texture_key -> {(board_hash, action_hash, player, street) -> strategy_array}
-        self._textures = {}  # texture_key -> info_set_table
-        self._metadata = {}  # texture_key -> metadata dict
+        # Loaded data: (scenario_id, texture_key) or texture_key -> info_set_table
+        self._textures = {}
+        self._metadata = {}
 
-        # File index: texture_key -> file path
+        # File index: supports both v1 and v2 layouts
+        # v1: _file_index[texture_key] = path
+        # v2: _scenario_file_index[(scenario_id, texture_key)] = path
         self._file_index = {}
+        self._scenario_file_index = {}
+        self._has_scenarios = False
+        self.current_scenario = None  # set to filter by scenario
         self._build_file_index()
 
     def _build_file_index(self):
-        """Scan blueprint_dir for .bps files."""
+        """Scan blueprint_dir for .bps files (supports v1 flat and v2 scenario layouts)."""
         if not os.path.isdir(self.blueprint_dir):
             return
         for entry in os.listdir(self.blueprint_dir):
             subdir = os.path.join(self.blueprint_dir, entry)
             if not os.path.isdir(subdir):
                 continue
-            for fname in os.listdir(subdir):
-                if fname.endswith('.bps'):
-                    key = fname[:-4]
-                    self._file_index[key] = os.path.join(subdir, fname)
+            for item in os.listdir(subdir):
+                item_path = os.path.join(subdir, item)
+                if item.endswith('.bps') and os.path.isfile(item_path):
+                    # v1 layout: worker-N/{texture}.bps
+                    key = item[:-4]
+                    self._file_index[key] = item_path
+                elif os.path.isdir(item_path):
+                    # v2 layout: worker-N/{scenario_id}/{texture}.bps
+                    scenario_id = item
+                    for fname in os.listdir(item_path):
+                        if fname.endswith('.bps'):
+                            tex_key = fname[:-4]
+                            self._scenario_file_index[(scenario_id, tex_key)] = \
+                                os.path.join(item_path, fname)
+                            # Also index by texture_key alone for backward compat
+                            # (first scenario found wins if no current_scenario set)
+                            if tex_key not in self._file_index:
+                                self._file_index[tex_key] = os.path.join(item_path, fname)
+                            self._has_scenarios = True
 
     def available_textures(self) -> List[str]:
         return list(self._file_index.keys())
 
-    def is_loaded(self, texture_key: str) -> bool:
+    def available_scenarios(self) -> List[str]:
+        """Return list of scenario_ids found in v2 layout."""
+        return sorted(set(sid for sid, _ in self._scenario_file_index.keys()))
+
+    def is_loaded(self, texture_key: str, scenario_id: str = None) -> bool:
+        if scenario_id:
+            return (scenario_id, texture_key) in self._textures
         return texture_key in self._textures
 
-    def load_texture(self, texture_key: str) -> bool:
+    def load_texture(self, texture_key: str, scenario_id: str = None) -> bool:
         """Load a texture's .bps file into memory.
+
+        Args:
+            texture_key: texture identifier (e.g. "T72_r")
+            scenario_id: optional scenario (e.g. "BB_vs_BTN_srp"). If None,
+                         uses self.current_scenario, then falls back to any match.
 
         Only loads info sets matching self.streets_to_load.
         Returns True on success.
         """
-        if texture_key in self._textures:
+        sid = scenario_id or self.current_scenario
+        cache_key = (sid, texture_key) if sid else texture_key
+
+        if cache_key in self._textures:
             return True
 
-        fpath = self._file_index.get(texture_key)
+        # Find file: prefer scenario-specific, fall back to flat index
+        fpath = None
+        if sid and (sid, texture_key) in self._scenario_file_index:
+            fpath = self._scenario_file_index[(sid, texture_key)]
+        if not fpath:
+            fpath = self._file_index.get(texture_key)
         if not fpath or not os.path.exists(fpath):
             return False
 
@@ -222,8 +269,12 @@ class BlueprintV2:
 
             p += entry_size
 
-        self._textures[texture_key] = table
-        self._metadata[texture_key] = meta
+        self._textures[cache_key] = table
+        self._metadata[cache_key] = meta
+        # Also store under plain texture_key for backward compat
+        if cache_key != texture_key:
+            self._textures[texture_key] = table
+            self._metadata[texture_key] = meta
         return True
 
     def load_for_board(self, board_ints: List[int]) -> bool:

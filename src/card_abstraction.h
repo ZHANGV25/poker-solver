@@ -2,12 +2,15 @@
  * card_abstraction.h — EHS computation + k-means bucketing for card abstraction
  *
  * Computes Expected Hand Strength (EHS) for poker hands via Monte Carlo
- * sampling, then clusters into buckets using k-means.
+ * sampling, then clusters into buckets using k-means on domain features.
  *
  * Pluribus uses 169 lossless preflop buckets and 200 lossy buckets
- * per postflop street, clustered on domain-specific features.
- * We approximate with EHS-based percentile bucketing (simpler, nearly
- * as effective for blueprint computation).
+ * per postflop street, clustered via k-means on domain-specific features
+ * (EHS + hand potential), per Johanson et al. 2013.
+ *
+ * Two bucketing methods available:
+ *   ca_assign_buckets()        — fast percentile bucketing (1D, EHS only)
+ *   ca_assign_buckets_kmeans() — k-means on [EHS, positive_potential, negative_potential]
  */
 #ifndef CARD_ABSTRACTION_H
 #define CARD_ABSTRACTION_H
@@ -97,6 +100,33 @@ CA_EXPORT int ca_generate_hands(
  *
  * Returns 169.
  */
+/**
+ * Assign hands to buckets via k-means clustering on domain features.
+ *
+ * Features per hand (Johanson et al. 2013 / Pluribus):
+ *   [0] EHS — expected hand strength vs random opponent
+ *   [1] Positive potential — P(behind now but ahead after more cards)
+ *   [2] Negative potential — P(ahead now but behind after more cards)
+ *
+ * K-means with Lloyd's algorithm, 20 iterations, percentile-seeded centroids.
+ *
+ * Args:
+ *   board, num_board: current board cards
+ *   hands: array of (c0, c1) pairs
+ *   num_hands: number of hands
+ *   num_buckets: target k
+ *   n_samples: Monte Carlo samples for EHS + potential computation
+ *   bucket_out: [num_hands] output bucket index for each hand
+ *
+ * Returns actual number of buckets used.
+ */
+CA_EXPORT int ca_assign_buckets_kmeans(
+    const int *board, int num_board,
+    const int hands[][2], int num_hands,
+    int num_buckets, int n_samples,
+    int *bucket_out
+);
+
 CA_EXPORT int ca_preflop_classes(
     int classes_out[][2],
     int *hand_to_class,

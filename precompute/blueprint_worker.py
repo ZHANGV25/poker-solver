@@ -37,7 +37,7 @@ BP_MAX_HANDS = 1326
 BP_MAX_ACTIONS = 8
 SCALE = 100
 
-BLUEPRINT_BET_SIZES = [0.5, 1.0]   # 50% pot, pot-size bet
+BLUEPRINT_BET_SIZES = [0.5, 1.0, 2.0]   # 50% pot, pot, 2x pot (Pluribus: up to 14 round 1, 3 later)
 STARTING_POT = 650                   # 6.5 BB in chips
 EFFECTIVE_STACK = 9750               # 97.5 BB in chips
 
