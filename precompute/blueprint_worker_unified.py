@@ -345,44 +345,51 @@ def _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is,
     os.replace(meta_tmp, meta_path)
 
     # ── Save strategy .bps (for runtime use) ──
-    needed = ctypes.c_size_t(0)
-    bp_lib.bp_export_strategies(solver, None, 0, ctypes.byref(needed))
-    strat_size = needed.value
+    # Only export .bps on final checkpoint — intermediate exports are too
+    # expensive (300M+ info sets × LZMA compress = minutes per checkpoint).
+    # The regret checkpoint is sufficient for resume; .bps is only needed
+    # for the runtime solver after training completes.
+    bps_path = os.path.join(args.output_dir, "unified_blueprint.bps")
+    regret_mb = os.path.getsize(regret_path) / 1024 / 1024
 
-    if strat_size > 0:
-        strat_buf = (ctypes.c_char * strat_size)()
-        written = ctypes.c_size_t(0)
-        bp_lib.bp_export_strategies(solver, strat_buf, strat_size, ctypes.byref(written))
-        strat_data = bytes(strat_buf[:written.value])
-        compressed = lzma.compress(strat_data, preset=1)
-        meta_bytes = json.dumps(meta, separators=(',', ':')).encode('utf-8')
+    if label == "final":
+        needed = ctypes.c_size_t(0)
+        bp_lib.bp_export_strategies(solver, None, 0, ctypes.byref(needed))
+        strat_size = needed.value
 
-        fname = "unified_blueprint.bps"
-        out_path = os.path.join(args.output_dir, fname)
-        out_tmp = out_path + ".tmp"
-        with open(out_tmp, 'wb') as f:
-            f.write(b'BPS2')
-            f.write(struct.pack('<II', len(compressed), len(meta_bytes)))
-            f.write(compressed)
-            f.write(meta_bytes)
-        os.replace(out_tmp, out_path)
+        if strat_size > 0:
+            strat_buf = (ctypes.c_char * strat_size)()
+            written = ctypes.c_size_t(0)
+            bp_lib.bp_export_strategies(solver, strat_buf, strat_size,
+                                        ctypes.byref(written))
+            strat_data = bytes(strat_buf[:written.value])
+            compressed = lzma.compress(strat_data, preset=1)
+            meta_bytes = json.dumps(meta, separators=(',', ':')).encode('utf-8')
 
-        comp_mb = len(compressed) / 1024 / 1024
-        regret_mb = os.path.getsize(regret_path) / 1024 / 1024
-        print(f"  Checkpoint: strategy={comp_mb:.0f}MB, regrets={regret_mb:.0f}MB")
+            out_tmp = bps_path + ".tmp"
+            with open(out_tmp, 'wb') as f:
+                f.write(b'BPS3')  # v3: uint64 size field for >4GB strategies
+                f.write(struct.pack('<QI', len(compressed), len(meta_bytes)))
+                f.write(compressed)
+                f.write(meta_bytes)
+            os.replace(out_tmp, bps_path)
+
+            comp_mb = len(compressed) / 1024 / 1024
+            print(f"  Final checkpoint: strategy={comp_mb:.0f}MB, regrets={regret_mb:.0f}MB")
+        else:
+            print("  [WARN] No strategies to export")
     else:
-        print("  [WARN] No strategies to export")
+        print(f"  Checkpoint: regrets={regret_mb:.0f}MB (strategy export deferred to final)")
 
     # ── Upload to S3 (with retries) ──
     if args.s3_bucket:
-        for local, s3key in [
+        uploads = [
             (regret_path, "checkpoints/regrets_latest.bin"),
             (meta_path, "checkpoint_meta.json"),
-            (os.path.join(args.output_dir, "unified_blueprint.bps"),
-             "unified_blueprint.bps"),
-            (os.path.join(args.output_dir, "unified_blueprint.bps"),
-             f"checkpoints/blueprint_iter{iters_done}.bps"),
-        ]:
+        ]
+        if label == "final" and os.path.exists(bps_path):
+            uploads.append((bps_path, "unified_blueprint.bps"))
+        for local, s3key in uploads:
             if os.path.exists(local):
                 try:
                     _s3_upload_with_retry(
