@@ -109,80 +109,74 @@ def bias_strategy(strategy: np.ndarray, bias_type: int,
 LeafInfo = namedtuple('LeafInfo', ['leaf_idx', 'pot', 'bets'])
 
 
-def extract_leaf_info_from_tree(tree_data) -> List[LeafInfo]:
+def extract_leaf_info_from_tree(tree_data, num_players=2) -> List[LeafInfo]:
     """Extract pot size and bet info for each leaf in the tree.
 
     Each leaf has a different pot size depending on the betting path
-    that led to it (check-check vs bet-call vs bet-raise-call etc).
-    This is critical — Pluribus computes per-leaf continuation values.
+    that led to it. Supports N-player continuation structures:
+    P0 → P1 → ... → P(N-1), each with 4 children = 4^N terminals per leaf.
 
     Args:
         tree_data: SSTreeData ctypes struct (after ss_build_tree)
+        num_players: number of active players (2-6)
 
     Returns:
         list of LeafInfo, indexed by the leaf's original index
         (before continuation strategy expansion)
     """
     leaves = []
+    cont_per_leaf = 4 ** num_players  # 16 for 2p, 64 for 3p, etc.
 
-    # Walk the tree to find the original leaves (before cont expansion).
-    # After expansion, the original leaf nodes become decision nodes.
-    # The first_child continuation decision nodes are at depth
-    # (original_leaf_depth + 1).
-    #
-    # However, we can identify original leaves by looking at decision
-    # nodes that have exactly 4 children where the children are also
-    # decision nodes with 4 children each (the P0→P1 pattern).
-    #
-    # Simpler: track leaves by their pot sizes from the tree structure.
-    # The tree stores pot in each node.
+    def _is_cont_chain(tree_data, node_idx, depth, num_players):
+        """Check if node_idx is the root of a N-deep continuation chain.
+        Each level has player=depth, num_children=4, depth levels total."""
+        node = tree_data.nodes[node_idx]
+        if node.type != 0 or node.num_children != 4:
+            return False
+        if depth == num_players - 1:
+            # Last player: children should be terminals (leaf type=4)
+            for c in range(4):
+                child_idx = tree_data.children[node.first_child + c]
+                if tree_data.nodes[child_idx].type != 4:  # not leaf
+                    return False
+            return True
+        else:
+            # Intermediate: children should be continuation decision nodes
+            for c in range(4):
+                child_idx = tree_data.children[node.first_child + c]
+                if not _is_cont_chain(tree_data, child_idx, depth + 1, num_players):
+                    return False
+            return True
 
-    # For now, we reconstruct leaf info from the node list.
-    # Leaves in the unexpanded tree are at specific positions.
-    # After expansion, they become the P0 decision nodes.
-    # The P0 decision nodes have player=0, 4 children, and those
-    # children have player=1 and 4 children each.
-
-    # We identify expanded-leaf roots as decision nodes where:
-    #   - player = 0 (P0 chooses)
-    #   - num_children = 4
-    #   - all children are decision nodes with player=1, num_children=4
-    #   - all grandchildren are SS_NODE_LEAF (type=4)
+    def _get_first_terminal(tree_data, node_idx, num_players):
+        """Walk down the first-child chain to find the first terminal leaf."""
+        cur = node_idx
+        for _ in range(num_players):
+            cur = tree_data.children[tree_data.nodes[cur].first_child]
+        return cur
 
     n_nodes = tree_data.num_nodes
     for i in range(n_nodes):
         node = tree_data.nodes[i]
-        if node.type != 0:  # not decision
+        if node.type != 0:
             continue
         if node.player != 0:
             continue
         if node.num_children != 4:
             continue
 
-        # Check children pattern
-        is_cont_root = True
-        for c in range(4):
-            child_idx = tree_data.children[node.first_child + c]
-            child = tree_data.nodes[child_idx]
-            if child.type != 0 or child.player != 1 or child.num_children != 4:
-                is_cont_root = False
-                break
+        if _is_cont_chain(tree_data, i, 0, num_players):
+            first_term_idx = _get_first_terminal(tree_data, i, num_players)
+            base_leaf_idx = tree_data.nodes[first_term_idx].leaf_idx
+            orig_idx = base_leaf_idx // cont_per_leaf
 
-        if is_cont_root:
-            # This was an original leaf, now expanded.
-            # Get the leaf_idx from its first grandchild.
-            first_child = tree_data.children[node.first_child]
-            first_grandchild_idx = tree_data.children[
-                tree_data.nodes[first_child].first_child]
-            base_leaf_idx = tree_data.nodes[first_grandchild_idx].leaf_idx
-            # base_leaf_idx is the first of 16 terminal leaves for this original leaf.
-            # The original leaf index is base_leaf_idx // 16.
-            orig_idx = base_leaf_idx // 16
+            # Collect bets for all players
+            bets = tuple(node.bets[p] for p in range(num_players))
 
             leaves.append(LeafInfo(
                 leaf_idx=orig_idx,
                 pot=node.pot,
-                bets=(node.bets[0], node.bets[1]),
+                bets=bets,
             ))
 
     leaves.sort(key=lambda x: x.leaf_idx)
@@ -193,96 +187,83 @@ def extract_leaf_info_from_tree(tree_data) -> List[LeafInfo]:
 
 def compute_flop_leaf_values(
     flop_board: List[int],
-    oop_hands: List[Tuple[int, int, float]],
-    ip_hands: List[Tuple[int, int, float]],
+    player_hands: List[List[Tuple[int, int, float]]],
     blueprint_store,
     board_cards_str: List[str],
     leaf_infos: List[LeafInfo],
     max_hands: int,
     starting_pot: int,
+    # Legacy 2-player interface — if oop_hands/ip_hands are passed, wrap them
+    oop_hands=None, ip_hands=None,
 ) -> np.ndarray:
     """Compute leaf values for a flop solve using precomputed turn blueprints.
 
-    For each original betting leaf (before continuation expansion):
-      For each pair of continuation strategies (s0, s1):
-        For each turn card:
-          Compute EV = sum_a biased_P(a|h) * action_EV(a, h)
-          using the blueprint's per-action EVs
-        Average over turn cards
-
-    The key Pluribus insight: we DON'T re-solve the turn. We compute
-    the expected value under each biased strategy using the precomputed
-    per-action EVs. This makes leaf computation O(hands * actions * turns)
-    instead of requiring a full CFR solve.
-
-    The leaf value is normalized per-opponent-hand so the GPU kernel
-    can multiply by actual opponent reach.
+    Supports N players. For each original betting leaf, for each combination
+    of continuation strategies (4^N combinations), compute the expected value
+    by averaging over turn cards using the blueprint's per-action EVs.
 
     Args:
         flop_board: [card0, card1, card2] ints
-        oop_hands: [(c0, c1, weight), ...] — solver's hand list
-        ip_hands: same
+        player_hands: list of per-player hands [(c0, c1, weight), ...]
         blueprint_store: BlueprintStore instance
         board_cards_str: ["Qs", "As", "2d"] for blueprint lookup
         leaf_infos: from extract_leaf_info_from_tree()
-        max_hands: max(len(oop_hands), len(ip_hands))
-        starting_pot: pot at the start of this street (chips, scaled)
+        max_hands: max hands across all players
+        starting_pot: pot in chips at start of this street
 
     Returns:
-        np.array[num_total_leaves, 2, max_hands] where
-        num_total_leaves = len(leaf_infos) * 16
+        np.array[num_total_leaves, num_players, max_hands] float32
+        where num_total_leaves = len(leaf_infos) * 4^num_players
     """
+    # Legacy 2-player compat
+    if player_hands is None and oop_hands is not None:
+        player_hands = [oop_hands, ip_hands]
+
     try:
         from solver import int_to_card
     except ImportError:
         from python.solver import int_to_card
 
+    num_players = len(player_hands)
     num_orig_leaves = len(leaf_infos)
-    total_leaves = num_orig_leaves * 16
-    leaf_values = np.zeros((total_leaves, 2, max_hands), dtype=np.float32)
+    cont_per_leaf = 4 ** num_players
+    total_leaves = num_orig_leaves * cont_per_leaf
+    leaf_values = np.zeros((total_leaves, num_players, max_hands), dtype=np.float32)
 
     board_set = set(flop_board)
     turn_cards = [c for c in range(52) if c not in board_set]
 
-    hands_by_player = [oop_hands, ip_hands]
-
     for li_idx, li in enumerate(leaf_infos):
-        # Each original leaf has a specific pot size
         leaf_pot = li.pot
 
-        # Accumulate per (s0, s1, player, hand) across turn cards
-        cont_values = np.zeros((4, 4, 2, max_hands), dtype=np.float64)
+        # Accumulate per (cont_combo, player, hand) across turn cards.
+        # cont_combo is a flat index into the 4^N continuation strategy space.
+        cont_values = np.zeros((cont_per_leaf, num_players, max_hands), dtype=np.float64)
         valid_turns = 0
 
         for tc in turn_cards:
             tc_str = int_to_card(tc)
             tc_set = board_set | {tc}
 
-            # Load turn strategy + per-action EVs for both players
-            player_data = []
-            for p in range(2):
+            # Load turn strategy + per-action EVs for all players
+            pdata = []
+            any_valid = False
+            for p in range(num_players):
                 strat = blueprint_store.get_turn_strategy(
                     board_cards_str, tc_str, p)
                 action_evs = blueprint_store.get_turn_action_evs(
                     board_cards_str, tc_str, p)
 
                 if strat is None or action_evs is None:
-                    player_data.append(None)
+                    pdata.append(None)
                     continue
 
+                any_valid = True
                 na = strat.shape[1]
-
-                # Determine action categories from the strategy shape.
-                # At the turn root, OOP acts first: [Check, Bet1, Bet2, ..., All-in]
-                # No fold at root because no bet to face.
                 first_is_fold = False
                 cats = classify_actions(na, first_is_fold)
-
-                # Build 4 biased strategies
                 biased = [bias_strategy(strat, bt, cats, 5.0) for bt in range(4)]
 
-                # Compute EV under each bias:
-                # EV_bias[s][h] = sum_a biased_P(a|h) * action_EV(a, h)
                 ev_per_bias = np.zeros((4, strat.shape[0]), dtype=np.float64)
                 for s in range(4):
                     for a in range(min(na, action_evs.shape[0])):
@@ -290,56 +271,44 @@ def compute_flop_leaf_values(
                         ev_per_bias[s, :nh_tc] += (
                             biased[s][:nh_tc, a] * action_evs[a, :nh_tc])
 
-                player_data.append({
-                    'strat': strat,
-                    'action_evs': action_evs,
-                    'biased': biased,
-                    'ev_per_bias': ev_per_bias,
-                    'na': na,
-                })
+                pdata.append({'ev_per_bias': ev_per_bias})
 
-            if player_data[0] is None and player_data[1] is None:
+            if not any_valid:
                 continue
 
             valid_turns += 1
 
-            # Map turn-card-specific hand indices back to solver hand indices.
-            # Blueprint stores hands with turn-card blocking already applied.
-            # Our solver hands are indexed WITHOUT turn-card blocking.
-            # We need to map: solver_hand_idx → blueprint_hand_idx (skipping blocked).
-            for p in range(2):
-                if player_data[p] is None:
+            # Map hands and accumulate into continuation combos.
+            for p in range(num_players):
+                if pdata[p] is None:
                     continue
 
-                hands = hands_by_player[p]
-                ev_bias = player_data[p]['ev_per_bias']
-                nh_bp = ev_bias.shape[1]  # blueprint hand count for this turn card
+                hands = player_hands[p]
+                ev_bias = pdata[p]['ev_per_bias']
+                nh_bp = ev_bias.shape[1]
 
-                # Build mapping: which solver hands are valid for this turn card
-                # The blueprint's hand ordering matches solver order but skips
-                # hands blocked by the turn card.
                 bp_idx = 0
                 for h in range(len(hands)):
                     hc0, hc1 = hands[h][0], hands[h][1]
                     if hc0 in tc_set or hc1 in tc_set:
-                        continue  # hand blocked by turn card
+                        continue
                     if bp_idx >= nh_bp:
                         break
 
-                    # For each continuation strategy pair:
-                    # The leaf value for player p when P0 picks s0, P1 picks s1
-                    # is determined by whichever strategy P_p chose.
-                    for s_self in range(4):
-                        ev = ev_bias[s_self, bp_idx]
-                        # Scale EV by leaf pot relative to starting pot.
-                        # The EV from blueprint is in absolute chips.
-                        # The GPU kernel multiplies by opponent reach, so
-                        # leaf_value should be the per-opponent-hand payoff.
-                        for s_other in range(4):
-                            if p == 0:
-                                cont_values[s_self, s_other, p, h] += ev
-                            else:
-                                cont_values[s_other, s_self, p, h] += ev
+                    # For each of player p's 4 strategy choices, accumulate
+                    # into all cont_combos where p picks that strategy.
+                    # cont_combo = sum_j(s_j * 4^j) for players j=0..N-1
+                    for s_p in range(4):
+                        ev = ev_bias[s_p, bp_idx]
+                        # Enumerate all combos where player p picks s_p.
+                        # stride_p = 4^p, and we iterate over all other players' choices.
+                        stride_p = 4 ** p
+                        for combo_others in range(cont_per_leaf // 4):
+                            # Insert s_p into the combo at position p
+                            lower = combo_others % stride_p
+                            upper = combo_others // stride_p
+                            combo = lower + s_p * stride_p + upper * stride_p * 4
+                            cont_values[combo, p, h] += ev
 
                     bp_idx += 1
 
@@ -347,13 +316,12 @@ def compute_flop_leaf_values(
             cont_values /= valid_turns
 
         # Write to flat leaf_values array
-        for s0 in range(4):
-            for s1 in range(4):
-                flat_idx = li.leaf_idx * 16 + s0 * 4 + s1
-                if flat_idx < total_leaves:
-                    for p in range(2):
-                        leaf_values[flat_idx, p, :max_hands] = cont_values[
-                            s0, s1, p, :max_hands].astype(np.float32)
+        for combo in range(cont_per_leaf):
+            flat_idx = li.leaf_idx * cont_per_leaf + combo
+            if flat_idx < total_leaves:
+                for p in range(num_players):
+                    leaf_values[flat_idx, p, :max_hands] = cont_values[
+                        combo, p, :max_hands].astype(np.float32)
 
     return leaf_values
 
@@ -362,39 +330,29 @@ def compute_flop_leaf_values(
 
 def compute_flop_leaf_equity(
     flop_board: List[int],
-    oop_hands: List[Tuple[int, int, float]],
-    ip_hands: List[Tuple[int, int, float]],
+    player_hands: List[List[Tuple[int, int, float]]],
     leaf_infos: List[LeafInfo],
     max_hands: int,
     starting_pot: int,
+    # Legacy 2-player compat
+    oop_hands=None, ip_hands=None,
 ) -> np.ndarray:
     """Compute flop leaf values by averaging equity over all turn+river runouts.
 
-    Used when the v2 blueprint doesn't have per-action turn EVs (which are
-    needed for the full 4-continuation-strategy framework). Instead, we
-    compute each player's expected share of the pot at each leaf via equity,
-    averaged over all turn cards.
-
-    For each turn card, we call compute_turn_leaf_values to get equity over
-    river cards. This gives us proper 2-street lookahead.
-
-    Since we can't differentiate the 4 continuation strategies without
-    per-action EVs, all 16 (s0, s1) pairs get the same equity value.
-    This is conservative — the GPU search will refine via CFR iterations.
-
-    Args:
-        flop_board: [c0, c1, c2] card ints
-        oop_hands, ip_hands: per-player hands with weights
-        leaf_infos: from extract_leaf_info_from_tree()
-        max_hands: max(len(oop_hands), len(ip_hands))
-        starting_pot: pot in chips at start of flop betting
+    N-player compatible. Since we can't differentiate the 4 continuation
+    strategies without per-action EVs, all 4^N combos get the same equity.
 
     Returns:
-        np.array[num_total_leaves, 2, max_hands] float32
+        np.array[num_total_leaves, num_players, max_hands] float32
     """
+    if player_hands is None and oop_hands is not None:
+        player_hands = [oop_hands, ip_hands]
+
+    num_players = len(player_hands)
     num_orig_leaves = len(leaf_infos)
-    total_leaves = num_orig_leaves * 16
-    leaf_values = np.zeros((total_leaves, 2, max_hands), dtype=np.float32)
+    cont_per_leaf = 4 ** num_players
+    total_leaves = num_orig_leaves * cont_per_leaf
+    leaf_values = np.zeros((total_leaves, num_players, max_hands), dtype=np.float32)
 
     board_set = set(flop_board)
     turn_cards = [c for c in range(52) if c not in board_set]

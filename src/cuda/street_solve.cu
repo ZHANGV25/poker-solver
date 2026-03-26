@@ -664,7 +664,13 @@ __global__ void ss_batch_propagate_reach(
  *   If traverser is still in but not last → handled by tree continuation
  *
  * Our tree structure creates fold terminals only when n_active==1.
- * The winner is stored in node->player. */
+ * The winner is stored in node->player.
+ *
+ * The traverser's payoff is constant for a given hand (does not depend on
+ * opponent hand strengths), so cfv = payoff * sum_over_valid_opponent_combos(reach_product).
+ * For N=2 this is just payoff * sum(opp_reach).
+ * For N>2 we enumerate opponent hand combos to correctly exclude
+ * inter-opponent card conflicts. */
 __global__ void ss_batch_fold_value(
     const SSNode *nodes, const int *batch_nodes, int batch_size,
     float *cfv,
@@ -687,29 +693,30 @@ __global__ void ss_batch_fold_value(
     int hc1 = hands[(traverser * SS_MAX_HANDS + hand) * 2 + 1];
 
     /* Payoff for traverser */
-    float half_start = starting_pot * 0.5f;
     float payoff;
     if (traverser == winner) {
-        /* Traverser wins — collect all opponents' bets */
-        float total_opp_bets = 0;
-        for (int p = 0; p < num_players; p++)
-            if (p != traverser) total_opp_bets += (float)node->bets[p];
-        payoff = half_start * (num_players - 1) / (float)num_players + total_opp_bets;
-        /* Simplified: payoff = pot/2 (traverser's share) */
-        /* Actually: traverser wins pot - their own contribution */
+        /* Traverser wins — gets pot minus their own contribution */
         payoff = (float)(node->pot - node->bets[traverser]);
     } else {
         /* Traverser lost (folded earlier or someone else won) */
         payoff = -(float)node->bets[traverser];
     }
 
-    /* Compute opponent reach product (product of all non-traverser reaches)
-     * For simplicity, sum over all valid opponent hand combos */
-    float opp_product = 1.0f;
+    /* Collect non-traverser players (all players except traverser, regardless
+     * of active status — folded players still have reach that matters for
+     * the card-removal weighting) */
+    int opp[SS_MAX_PLAYERS];
+    int n_opp = 0;
     for (int p = 0; p < num_players; p++) {
         if (p == traverser) continue;
+        opp[n_opp++] = p;
+    }
+
+    /* ── Fast path: single opponent (N=2) ── */
+    if (n_opp == 1) {
+        int p = opp[0];
         int nh_p = num_hands_arr[p];
-        float p_sum = 0;
+        float opp_sum = 0;
         for (int o = 0; o < nh_p; o++) {
             int oc0 = hands[(p * SS_MAX_HANDS + o) * 2];
             int oc1 = hands[(p * SS_MAX_HANDS + o) * 2 + 1];
@@ -718,17 +725,88 @@ __global__ void ss_batch_fold_value(
             for (int b = 0; b < node->num_board; b++)
                 if (oc0 == node->board_cards[b] || oc1 == node->board_cards[b]) { blocked = 1; break; }
             if (blocked) continue;
-            p_sum += reach_all[p * num_nodes * max_hands + node_idx * max_hands + o];
+            opp_sum += reach_all[p * num_nodes * max_hands + node_idx * max_hands + o];
         }
-        opp_product *= p_sum;
+        cfv[node_idx * max_hands + hand] = payoff * opp_sum;
+        return;
     }
 
-    cfv[node_idx * max_hands + hand] = payoff * opp_product;
+    /* ── Exact N-player: enumerate opponent hand combos ── */
+    int nh_opp[SS_MAX_PLAYERS];
+    for (int i = 0; i < n_opp; i++)
+        nh_opp[i] = num_hands_arr[opp[i]];
+
+    float total_reach = 0;
+
+    /* Odometer iteration over all opponent hand combos */
+    int idx[SS_MAX_PLAYERS - 1];
+    for (int i = 0; i < n_opp; i++) idx[i] = 0;
+
+    while (1) {
+        int opp_cards[SS_MAX_PLAYERS - 1][2];
+        float reach_prod = 1.0f;
+        int valid = 1;
+
+        for (int i = 0; i < n_opp; i++) {
+            int p = opp[i];
+            int o = idx[i];
+            int oc0 = hands[(p * SS_MAX_HANDS + o) * 2];
+            int oc1 = hands[(p * SS_MAX_HANDS + o) * 2 + 1];
+            opp_cards[i][0] = oc0;
+            opp_cards[i][1] = oc1;
+
+            /* Check conflict with traverser's cards */
+            if (hc0 == oc0 || hc0 == oc1 || hc1 == oc0 || hc1 == oc1) { valid = 0; break; }
+
+            /* Check conflict with board */
+            for (int b = 0; b < node->num_board; b++)
+                if (oc0 == node->board_cards[b] || oc1 == node->board_cards[b]) { valid = 0; break; }
+            if (!valid) break;
+
+            float w = reach_all[p * num_nodes * max_hands + node_idx * max_hands + o];
+            reach_prod *= w;
+
+            /* Check conflict with all previous opponents' cards */
+            for (int j = 0; j < i; j++) {
+                if (oc0 == opp_cards[j][0] || oc0 == opp_cards[j][1] ||
+                    oc1 == opp_cards[j][0] || oc1 == opp_cards[j][1]) {
+                    valid = 0;
+                    break;
+                }
+            }
+            if (!valid) break;
+        }
+
+        if (valid && reach_prod > 0.0f) {
+            total_reach += reach_prod;
+        }
+
+        /* Advance to next combo (odometer increment) */
+        int carry = n_opp - 1;
+        while (carry >= 0) {
+            idx[carry]++;
+            if (idx[carry] < nh_opp[carry]) break;
+            idx[carry] = 0;
+            carry--;
+        }
+        if (carry < 0) break;
+    }
+
+    cfv[node_idx * max_hands + hand] = payoff * total_reach;
 }
 
-/* N-player showdown value.
- * Compare traverser's hand against ALL remaining opponents.
- * Pot is split among winners (highest hand strength). */
+/* N-player showdown value (2-player fast path + exact N-player).
+ * Compare traverser's hand against ALL remaining opponents simultaneously.
+ * Pot is split among players with the highest hand strength.
+ *
+ * For N=2: O(M) pairwise comparison (unchanged).
+ * For N>2: Enumerate all opponent hand combinations O(M^(N-1)).
+ *   For each combo, check card conflicts, find the max strength among all
+ *   active players, and award pot to winner(s) (split on tie).
+ *   Traverser's EV = sum over combos of (payoff * product of opp reaches).
+ *
+ * In practice N>2 showdowns mostly have 3 players (rarely 4+), since
+ * most players fold before showdown, so the inner loop is ~M^2 = 40K. */
 __global__ void ss_batch_showdown_value(
     const SSNode *nodes, const int *batch_nodes, int batch_size,
     float *cfv,
@@ -755,28 +833,30 @@ __global__ void ss_batch_showdown_value(
     int hc0 = hands[(traverser * SS_MAX_HANDS + hand) * 2];
     int hc1 = hands[(traverser * SS_MAX_HANDS + hand) * 2 + 1];
 
-    /* For 2-player: simple win/lose against one opponent.
-     * For N-player: we need to consider each possible opponent hand combo.
-     * Simplification for N-player: treat each opponent independently.
-     * Traverser's EV = sum over each opponent of (win/lose against that opponent) × reach.
-     * This is an approximation for N>2 (ignores correlations between opponents). */
-
-    /* For correctness in N-player showdown:
-     * For each combination of opponent hands, compute who wins.
-     * This is O(M^(N-1)) which is prohibitive for N>2.
-     *
-     * Pluribus approximation: in N-player pots, compute EV as if
-     * playing against each opponent independently (sum of pairwise EVs).
-     * This is O(N*M) per traverser hand. */
-
-    float half_pot = node->pot * 0.5f;
-    float val = 0;
-
+    /* Collect active opponents */
+    int opp[SS_MAX_PLAYERS];
+    int n_opp = 0;
     for (int p = 0; p < num_players; p++) {
         if (p == traverser) continue;
         if (!node->active_players[p]) continue;
-        int nh_p = num_hands_arr[p];
+        opp[n_opp++] = p;
+    }
 
+    /* Traverser's payoff: pot won minus amount invested.
+     * If traverser wins outright: pot - bets[traverser]
+     * If traverser ties with k others: pot/k - bets[traverser]  (k = number of winners including traverser)
+     * If traverser loses: -bets[traverser] */
+    float pot = (float)node->pot;
+    float trav_bet = (float)node->bets[traverser];
+
+    /* ────────────────────────────────────────────────────────
+     * Fast path: N=2 (exactly one opponent)
+     * This is the original correct logic, just cleaned up.
+     * ──────────────────────────────────────────────────────── */
+    if (n_opp == 1) {
+        int p = opp[0];
+        int nh_p = num_hands_arr[p];
+        float val = 0;
         for (int o = 0; o < nh_p; o++) {
             int oc0 = hands[(p * SS_MAX_HANDS + o) * 2];
             int oc1 = hands[(p * SS_MAX_HANDS + o) * 2 + 1];
@@ -784,18 +864,121 @@ __global__ void ss_batch_showdown_value(
             uint32_t os = strengths[(sd_idx * SS_MAX_PLAYERS + p) * SS_MAX_HANDS + o];
             if (os == 0) continue;
             float w = reach_all[p * num_nodes * max_hands + node_idx * max_hands + o];
-            /* Pairwise: if we beat this opponent, we win pot share from them */
-            float share = half_pot / (float)(node->num_players - 1);
-            if (hs > os) val += w * share;
-            else if (hs < os) val -= w * share;
+            if (hs > os)      val += w * (pot - trav_bet);
+            else if (hs < os) val -= w * trav_bet;
+            /* tie: val += w * (pot / 2.0f - trav_bet) -- i.e. split pot */
+            else              val += w * (pot * 0.5f - trav_bet);
         }
+        cfv[node_idx * max_hands + hand] = val;
+        return;
+    }
+
+    /* ────────────────────────────────────────────────────────
+     * Exact N-player showdown (n_opp >= 2)
+     *
+     * We enumerate all combinations of opponent hands.
+     * For n_opp==2 this is O(M^2); for n_opp==3, O(M^3), etc.
+     * We handle up to SS_MAX_PLAYERS-1 = 5 opponents via a
+     * recursive-iteration approach using a stack of indices.
+     *
+     * For each combination:
+     *   1. Check card conflicts between all opponents
+     *   2. Compute reach product = product of each opp's reach
+     *   3. Find max strength among traverser + all opponents
+     *   4. Count how many players share that max strength
+     *   5. Traverser's payoff = (pot / n_winners) - trav_bet if winner,
+     *      else -trav_bet
+     * ──────────────────────────────────────────────────────── */
+
+    /* Pre-cache per-opponent data for the inner loops */
+    int nh_opp[SS_MAX_PLAYERS];
+    for (int i = 0; i < n_opp; i++)
+        nh_opp[i] = num_hands_arr[opp[i]];
+
+    float val = 0;
+
+    /* Iterative enumeration of opponent hand combos using index stack.
+     * idx[i] = hand index for opponent i. We iterate in odometer order. */
+    int idx[SS_MAX_PLAYERS - 1];  /* max 5 opponents */
+    for (int i = 0; i < n_opp; i++) idx[i] = 0;
+
+    /* Outer loop: iterate over all combos */
+    while (1) {
+        /* ── Gather this combo's cards, strengths, reaches ── */
+        int opp_cards[SS_MAX_PLAYERS - 1][2];
+        uint32_t opp_str[SS_MAX_PLAYERS - 1];
+        float reach_prod = 1.0f;
+        int valid = 1;
+
+        for (int i = 0; i < n_opp; i++) {
+            int p = opp[i];
+            int o = idx[i];
+            int oc0 = hands[(p * SS_MAX_HANDS + o) * 2];
+            int oc1 = hands[(p * SS_MAX_HANDS + o) * 2 + 1];
+            opp_cards[i][0] = oc0;
+            opp_cards[i][1] = oc1;
+
+            /* Check conflict with traverser's cards */
+            if (hc0 == oc0 || hc0 == oc1 || hc1 == oc0 || hc1 == oc1) { valid = 0; break; }
+
+            uint32_t os = strengths[(sd_idx * SS_MAX_PLAYERS + p) * SS_MAX_HANDS + o];
+            if (os == 0) { valid = 0; break; }
+            opp_str[i] = os;
+
+            float w = reach_all[p * num_nodes * max_hands + node_idx * max_hands + o];
+            reach_prod *= w;
+
+            /* Check conflict with all previous opponents' cards */
+            for (int j = 0; j < i; j++) {
+                if (oc0 == opp_cards[j][0] || oc0 == opp_cards[j][1] ||
+                    oc1 == opp_cards[j][0] || oc1 == opp_cards[j][1]) {
+                    valid = 0;
+                    break;
+                }
+            }
+            if (!valid) break;
+        }
+
+        if (valid && reach_prod > 0.0f) {
+            /* Find max strength among traverser + all opponents */
+            uint32_t max_str = hs;  /* traverser's strength */
+            for (int i = 0; i < n_opp; i++) {
+                if (opp_str[i] > max_str) max_str = opp_str[i];
+            }
+
+            /* Determine traverser's payoff */
+            if (hs < max_str) {
+                /* Traverser loses */
+                val += reach_prod * (-trav_bet);
+            } else {
+                /* Traverser has max strength; count total winners (including traverser) */
+                int n_winners = 1;  /* traverser */
+                for (int i = 0; i < n_opp; i++) {
+                    if (opp_str[i] == max_str) n_winners++;
+                }
+                val += reach_prod * (pot / (float)n_winners - trav_bet);
+            }
+        }
+
+        /* ── Advance to next combo (odometer increment) ── */
+        int carry = n_opp - 1;
+        while (carry >= 0) {
+            idx[carry]++;
+            if (idx[carry] < nh_opp[carry]) break;
+            idx[carry] = 0;
+            carry--;
+        }
+        if (carry < 0) break;  /* all combos exhausted */
     }
 
     cfv[node_idx * max_hands + hand] = val;
 }
 
 /* Leaf value kernel — reads external leaf values.
- * leaf_values layout: [leaf_idx * num_players * max_hands + player * max_hands + hand] */
+ * leaf_values layout: [leaf_idx * num_players * max_hands + player * max_hands + hand]
+ *
+ * For N>2, enumerate opponent hand combos to correctly handle
+ * inter-opponent card conflicts (same approach as fold kernel). */
 __global__ void ss_batch_leaf_value(
     const SSNode *nodes, const int *batch_nodes, int batch_size,
     float *cfv,
@@ -821,27 +1004,99 @@ __global__ void ss_batch_leaf_value(
     int hc0 = hands[(traverser * SS_MAX_HANDS + hand) * 2];
     int hc1 = hands[(traverser * SS_MAX_HANDS + hand) * 2 + 1];
 
-    /* Weight by opponent reach */
-    float opp_product = 1.0f;
+    /* Collect active opponents */
+    int opp[SS_MAX_PLAYERS];
+    int n_opp = 0;
     for (int p = 0; p < num_players; p++) {
         if (p == traverser) continue;
         if (!node->active_players[p]) continue;
-        int nh_p = num_hands_arr[p];
-        float p_sum = 0;
-        for (int o = 0; o < nh_p; o++) {
-            int oc0 = hands[(p * SS_MAX_HANDS + o) * 2];
-            int oc1 = hands[(p * SS_MAX_HANDS + o) * 2 + 1];
-            if (hc0 == oc0 || hc0 == oc1 || hc1 == oc0 || hc1 == oc1) continue;
-            int blocked = 0;
-            for (int b = 0; b < node->num_board; b++)
-                if (oc0 == node->board_cards[b] || oc1 == node->board_cards[b]) { blocked = 1; break; }
-            if (blocked) continue;
-            p_sum += reach_all[p * num_nodes * max_hands + node_idx * max_hands + o];
-        }
-        opp_product *= p_sum;
+        opp[n_opp++] = p;
     }
 
-    cfv[node_idx * max_hands + hand] = ev * opp_product;
+    /* ── Fast path: single opponent (N=2) ── */
+    if (n_opp <= 1) {
+        float opp_sum = 0;
+        if (n_opp == 1) {
+            int p = opp[0];
+            int nh_p = num_hands_arr[p];
+            for (int o = 0; o < nh_p; o++) {
+                int oc0 = hands[(p * SS_MAX_HANDS + o) * 2];
+                int oc1 = hands[(p * SS_MAX_HANDS + o) * 2 + 1];
+                if (hc0 == oc0 || hc0 == oc1 || hc1 == oc0 || hc1 == oc1) continue;
+                int blocked = 0;
+                for (int b = 0; b < node->num_board; b++)
+                    if (oc0 == node->board_cards[b] || oc1 == node->board_cards[b]) { blocked = 1; break; }
+                if (blocked) continue;
+                opp_sum += reach_all[p * num_nodes * max_hands + node_idx * max_hands + o];
+            }
+        } else {
+            opp_sum = 1.0f;  /* no opponents active */
+        }
+        cfv[node_idx * max_hands + hand] = ev * opp_sum;
+        return;
+    }
+
+    /* ── Exact N-player: enumerate opponent hand combos ── */
+    int nh_opp[SS_MAX_PLAYERS];
+    for (int i = 0; i < n_opp; i++)
+        nh_opp[i] = num_hands_arr[opp[i]];
+
+    float total_reach = 0;
+
+    int idx[SS_MAX_PLAYERS - 1];
+    for (int i = 0; i < n_opp; i++) idx[i] = 0;
+
+    while (1) {
+        int opp_cards[SS_MAX_PLAYERS - 1][2];
+        float reach_prod = 1.0f;
+        int valid = 1;
+
+        for (int i = 0; i < n_opp; i++) {
+            int p = opp[i];
+            int o = idx[i];
+            int oc0 = hands[(p * SS_MAX_HANDS + o) * 2];
+            int oc1 = hands[(p * SS_MAX_HANDS + o) * 2 + 1];
+            opp_cards[i][0] = oc0;
+            opp_cards[i][1] = oc1;
+
+            /* Check conflict with traverser's cards */
+            if (hc0 == oc0 || hc0 == oc1 || hc1 == oc0 || hc1 == oc1) { valid = 0; break; }
+
+            /* Check conflict with board */
+            for (int b = 0; b < node->num_board; b++)
+                if (oc0 == node->board_cards[b] || oc1 == node->board_cards[b]) { valid = 0; break; }
+            if (!valid) break;
+
+            float w = reach_all[p * num_nodes * max_hands + node_idx * max_hands + o];
+            reach_prod *= w;
+
+            /* Check conflict with all previous opponents' cards */
+            for (int j = 0; j < i; j++) {
+                if (oc0 == opp_cards[j][0] || oc0 == opp_cards[j][1] ||
+                    oc1 == opp_cards[j][0] || oc1 == opp_cards[j][1]) {
+                    valid = 0;
+                    break;
+                }
+            }
+            if (!valid) break;
+        }
+
+        if (valid && reach_prod > 0.0f) {
+            total_reach += reach_prod;
+        }
+
+        /* Advance to next combo (odometer increment) */
+        int carry = n_opp - 1;
+        while (carry >= 0) {
+            idx[carry]++;
+            if (idx[carry] < nh_opp[carry]) break;
+            idx[carry] = 0;
+            carry--;
+        }
+        if (carry < 0) break;
+    }
+
+    cfv[node_idx * max_hands + hand] = ev * total_reach;
 }
 
 /* CFV propagation + regret update (bottom-up).

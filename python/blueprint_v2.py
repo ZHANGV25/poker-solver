@@ -82,9 +82,10 @@ def board_to_texture_key(board_ints):
     Uses the same texture generation as solve_scenarios.py.
     Returns the canonical texture key (e.g., "AKQ_r", "T72_fd12").
     """
-    # Sort by rank descending
-    ranks = sorted([c // 4 for c in board_ints], reverse=True)
-    suits = [board_ints[i] % 4 for i in range(3)]
+    # Sort by rank descending, keeping (rank, suit) pairs together
+    pairs = sorted([(c // 4, c % 4) for c in board_ints], key=lambda x: -x[0])
+    ranks = [r for r, s in pairs]
+    suits = [s for r, s in pairs]
 
     # Determine suit pattern
     rank_str = "".join(RANKS[r] for r in ranks)

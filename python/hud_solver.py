@@ -365,16 +365,21 @@ class HUDSolver:
                     # Map action name to action index
                     action_idx = self._action_name_to_idx(action)
                     if action_idx is not None and action_idx < all_strats.shape[1]:
-                        probs = {}
-                        meta = self.blueprint_v2.get_metadata(
-                            self.blueprint_v2._file_index and
-                            next(iter(self.blueprint_v2._textures), None))
-                        # Return P(action) per bucket as a proxy
-                        # TODO: proper bucket→hand mapping
-                        for b in range(all_strats.shape[0]):
-                            probs[b] = float(all_strats[b, action_idx])
-                        if any(v > 0 for v in probs.values()):
-                            return probs
+                        # Map each hand in the player's range to its bucket,
+                        # then return P(action|bucket) keyed by (card0, card1).
+                        player_key = "hero" if player == "hero" else "villain"
+                        hands = self.narrower.get_weighted_hands(player_key)
+                        if hands:
+                            num_buckets = all_strats.shape[0]
+                            probs = {}
+                            for c0, c1, _w in hands:
+                                bucket = self._hand_to_bucket(
+                                    c0, c1, board_ints, num_buckets)
+                                if bucket < all_strats.shape[0]:
+                                    probs[(c0, c1)] = float(
+                                        all_strats[bucket, action_idx])
+                            if any(v > 0 for v in probs.values()):
+                                return probs
 
         # 4. Old blueprint fallback
         if self.blueprint and self.scenario_id and self._board:
@@ -391,21 +396,76 @@ class HUDSolver:
 
     @staticmethod
     def _action_name_to_idx(action):
-        """Map action name string to index in blueprint action array."""
+        """Map action name string to index in blueprint action array.
+
+        Matches the C solver action ordering:
+          ACT_FOLD=0, ACT_CHECK=1, ACT_CALL=2, ACT_BET=3+
+        """
         action_lower = action.lower().strip()
-        if "check" in action_lower or "fold" in action_lower:
+        if "fold" in action_lower:
             return 0
-        elif "50" in action_lower or "half" in action_lower:
+        elif "check" in action_lower:
             return 1
-        elif "pot" in action_lower or "100" in action_lower:
+        elif "call" in action_lower:
             return 2
         elif "all" in action_lower or "shove" in action_lower:
-            return 3
-        elif "call" in action_lower:
-            return 0  # call maps to check/call action
+            # All-in is the last bet size (highest index)
+            return 5
+        elif "50" in action_lower or "half" in action_lower:
+            return 3  # first bet size
+        elif "pot" in action_lower or "100" in action_lower:
+            return 4  # second bet size
         elif "bet" in action_lower or "raise" in action_lower:
-            return 1  # generic bet
+            return 3  # generic bet -> first bet action
         return None
+
+    @staticmethod
+    def _hand_to_bucket(c0, c1, flop_ints, num_buckets, n_samples=100):
+        """Compute the EHS-based bucket for a single hand.
+
+        Uses the same percentile-based bucketing as gpu_mccfr.compute_equity_buckets:
+        compute EHS via Monte Carlo, then map to a bucket based on the EHS value.
+
+        Since we don't have all hands sorted together for percentile ranking,
+        we approximate by directly mapping EHS (which is in [0,1]) to a bucket
+        index: bucket = floor(ehs * num_buckets), clamped to [0, num_buckets-1].
+        """
+        import numpy as np
+        rng = np.random.RandomState(c0 * 52 + c1)  # deterministic per hand
+        blocked = set(flop_ints) | {c0, c1}
+        available = [c for c in range(52) if c not in blocked]
+
+        if len(available) < 4:
+            return 0
+
+        try:
+            from gpu_mccfr import _eval7_py
+        except ImportError:
+            from python.gpu_mccfr import _eval7_py
+
+        available = np.array(available)
+        wins = 0
+        ties = 0
+        total = 0
+        for _ in range(n_samples):
+            idx = rng.choice(len(available), 4, replace=False)
+            oc0, oc1 = int(available[idx[0]]), int(available[idx[1]])
+            bc0, bc1 = int(available[idx[2]]), int(available[idx[3]])
+
+            board = list(flop_ints) + [bc0, bc1]
+            hero_str = _eval7_py(board + [c0, c1])
+            opp_str = _eval7_py(board + [oc0, oc1])
+
+            if hero_str > opp_str:
+                wins += 1
+            elif hero_str == opp_str:
+                ties += 1
+            total += 1
+
+        ehs = (wins + 0.5 * ties) / max(total, 1)
+        # Map EHS [0,1] directly to bucket index
+        bucket = int(ehs * num_buckets)
+        return min(bucket, num_buckets - 1)
 
     def _compute_off_tree_probs(self, player, actual_bet_frac):
         """Compute narrowing probs for off-tree bet via pseudoharmonic."""

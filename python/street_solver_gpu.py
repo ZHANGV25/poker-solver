@@ -378,14 +378,9 @@ class StreetSolverGPU:
                 return self._get_strategy_at_player_node(player_idx, hand_idx)
 
         # Walk the tree following frozen actions to find the current node.
-        # At each node where hero acts, we follow the frozen action.
-        # At nodes where opponents act, we follow all branches and look for
-        # the next hero decision node (the solver output has avg strategies
-        # at all decision nodes, so we find the right one by matching).
-        #
-        # For the common case: hero acts at root, takes frozen action, then
-        # opponent(s) act, then hero faces a new decision. We need to find
-        # that second decision node.
+        # frozen_actions contains ALL actions (both hero and opponent) that
+        # led to the current state, in sequence. We follow each action
+        # through the tree regardless of whose decision node it is.
         frozen_idx = 0
         current_node = 0  # start at root
 
@@ -394,33 +389,23 @@ class StreetSolverGPU:
             if node.type != 0:  # not a decision node
                 break
 
-            if node.player == player_idx:
-                # Hero's decision — follow the frozen action
-                frozen_label = frozen_actions[frozen_idx]
-                labels = _build_labels_at_node(self._tree, current_node)
+            # Follow the next frozen action at this node (any player's node)
+            frozen_label = frozen_actions[frozen_idx]
+            labels = _build_labels_at_node(self._tree, current_node)
 
-                matched = False
-                for c in range(node.num_children):
-                    if c < len(labels) and self._match_action_label(
-                            labels[c], frozen_label):
-                        child_idx = self._tree.children[node.first_child + c]
-                        current_node = child_idx
-                        frozen_idx += 1
-                        matched = True
-                        break
+            matched = False
+            for c in range(node.num_children):
+                if c < len(labels) and self._match_action_label(
+                        labels[c], frozen_label):
+                    child_idx = self._tree.children[node.first_child + c]
+                    current_node = child_idx
+                    frozen_idx += 1
+                    matched = True
+                    break
 
-                if not matched:
-                    # Frozen action not found in tree — return best match
-                    break
-            else:
-                # Opponent's decision — we need to find the next hero node.
-                # Follow the first child (any path reaches the same set of
-                # hero decision nodes since this is a single-street tree).
-                if node.num_children > 0:
-                    # Follow check/call branch (least disruptive)
-                    current_node = self._tree.children[node.first_child]
-                else:
-                    break
+            if not matched:
+                # Frozen action not found in tree — stop walking
+                break
 
         # Now current_node should be at hero's next decision (or we exhausted frozen actions)
         node = self._tree.nodes[current_node]
