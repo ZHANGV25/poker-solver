@@ -317,9 +317,54 @@ class StreetSolverGPU:
             self._leaf_arr = arr
             self._tree.leaf_values = ctypes.cast(arr, ctypes.POINTER(ctypes.c_float))
 
+        # Initialize frozen_action to NULL (no freezing by default)
+        self._tree.frozen_action = None
+        self._frozen_arr = None
+
         self._output = SSOutput()
         self._solved = False
         self._freed = False
+
+    def set_frozen_actions(self, frozen_actions, hero_player):
+        """Set A3 strategy freezing for Pluribus safe re-solving.
+
+        Walks the tree following the sequence of actions (both hero and
+        opponent) and marks hero's decision nodes with the action taken.
+        This freezes hero's strategy at those nodes during CFR iterations.
+
+        Args:
+            frozen_actions: list of action labels in order (e.g., ["Check", "Bet 50%", "Call"])
+            hero_player: hero's player index (0..N-1)
+        """
+        n = self._tree.num_nodes
+        frozen = (ctypes.c_int * n)(*[-1] * n)
+
+        current = 0  # start at root
+        for action_label in frozen_actions:
+            node = self._tree.nodes[current]
+            if node.type != 0:  # not decision
+                break
+
+            # Find matching child action
+            labels = get_action_labels(self._tree, current)
+            matched = -1
+            for i, lbl in enumerate(labels):
+                if lbl.lower() == action_label.lower():
+                    matched = i
+                    break
+
+            if matched < 0:
+                break  # action not found in tree
+
+            # If this is hero's node, freeze the strategy
+            if node.player == hero_player:
+                frozen[current] = matched
+
+            # Follow the child
+            current = self._tree.children[node.first_child + matched]
+
+        self._frozen_arr = frozen
+        self._tree.frozen_action = ctypes.cast(frozen, ctypes.POINTER(ctypes.c_int))
 
     def solve(self, iterations=200):
         err = self.lib.ss_solve_gpu(

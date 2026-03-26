@@ -613,6 +613,36 @@ __global__ void ss_batch_regret_match(
     }
 }
 
+/* ── A3 strategy freezing kernel ────────────────────── */
+/* At frozen nodes (where hero already acted), override the regret-matched
+ * strategy to 100% on the action that was actually taken. This ensures
+ * the CFR re-solve is "safe" per Pluribus A3: it cannot gain EV by
+ * deviating from hero's past actions, preventing exploitability. */
+__global__ void ss_apply_freeze(
+    const SSNode *nodes, const int *batch_nodes, int batch_size,
+    float *strategy, const int *frozen_action, int max_hands,
+    const int *num_hands_arr, int num_players
+) {
+    int bi = blockIdx.x;
+    int hand = threadIdx.x;
+    if (bi >= batch_size) return;
+    int node_idx = batch_nodes[bi];
+    int fa = frozen_action[node_idx];
+    if (fa < 0) return;  /* not frozen */
+
+    const SSNode *n = &nodes[node_idx];
+    int acting = n->player;
+    if (acting < 0 || acting >= num_players) return;
+    int nh = num_hands_arr[acting];
+    if (hand >= nh) return;
+    int na = n->num_children;
+    int base = node_idx * SS_MAX_ACTIONS * max_hands;
+
+    /* Set strategy to 100% on frozen action, 0% on others */
+    for (int a = 0; a < na; a++)
+        strategy[base + a * max_hands + hand] = (a == fa) ? 1.0f : 0.0f;
+}
+
 /* Batched reach propagation for decision nodes.
  * `reach_player` is the player whose reach we're propagating.
  * If this player is acting at the node, multiply reach by strategy.
@@ -1416,6 +1446,15 @@ extern "C" SS_EXPORT int ss_solve_gpu(
            td->num_leaf_nodes, block_size);
     fflush(stdout);
 
+    /* ── A3 strategy freezing (Pluribus safe re-solve) ──── */
+    int *d_frozen = NULL;
+    if (td->frozen_action != NULL) {
+        CUDA_CHECK(cudaMalloc(&d_frozen, N * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(d_frozen, td->frozen_action, N * sizeof(int),
+                               cudaMemcpyHostToDevice));
+        printf("[SS] A3 strategy freezing enabled\n");
+    }
+
     /* ═══════════════════════════════════════════
      * Main CFR loop — NO CUDA graph for N-player
      * (graph capture doesn't support variable traverser)
@@ -1423,6 +1462,7 @@ extern "C" SS_EXPORT int ss_solve_gpu(
      * Each iteration: cycle through all N traversers.
      * For each traverser:
      *   1. Regret matching at all decision nodes
+     *   1b. Apply A3 freezing: override strategy at frozen nodes
      *   2. Propagate reach for all NON-traverser players
      *   3. Compute terminal values (fold, showdown, leaf)
      *   4. Propagate CFV bottom-up + update traverser's regrets
@@ -1436,6 +1476,14 @@ extern "C" SS_EXPORT int ss_solve_gpu(
             ss_batch_regret_match<<<td->num_decision_nodes, block_size>>>(
                 d_nodes, d_dec_nodes, td->num_decision_nodes,
                 d_regrets, d_strategy, max_h, d_num_hands, NP, d_iter);
+
+            /* 1b. A3 freezing: at frozen nodes, override strategy to 100%
+             * on the taken action. This runs as a simple element-wise kernel. */
+            if (d_frozen != NULL) {
+                ss_apply_freeze<<<td->num_decision_nodes, block_size>>>(
+                    d_nodes, d_dec_nodes, td->num_decision_nodes,
+                    d_strategy, d_frozen, max_h, d_num_hands, NP);
+            }
 
             /* 2. Propagate reach for each non-traverser player */
             for (int rp = 0; rp < NP; rp++) {
@@ -1585,6 +1633,7 @@ extern "C" SS_EXPORT int ss_solve_gpu(
     if (d_fold_nodes) cudaFree(d_fold_nodes);
     if (d_sd_nodes_list) cudaFree(d_sd_nodes_list);
     if (d_leaf_nodes_list) cudaFree(d_leaf_nodes_list);
+    if (d_frozen) cudaFree(d_frozen);
 
     return 0;
 }

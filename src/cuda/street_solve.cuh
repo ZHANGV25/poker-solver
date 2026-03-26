@@ -111,6 +111,14 @@ typedef struct {
 
     /* Whether this is a river solve */
     int is_river;
+
+    /* A3 strategy freezing (Pluribus safe subgame re-solving).
+     * Per-node array: frozen_action[node_idx] = action index that hero took
+     * at this node (-1 if not frozen). At frozen nodes, hero's strategy is
+     * locked to 100% on the taken action during all CFR iterations.
+     * This ensures the re-solve is "safe" — it won't exploit hero's past actions.
+     * Set to NULL if no freezing needed. */
+    int *frozen_action;
 } SSTreeData;
 
 /* ── Output ──────────────────────────────────────────────────────────── */
