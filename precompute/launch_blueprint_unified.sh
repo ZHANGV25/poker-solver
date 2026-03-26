@@ -28,7 +28,7 @@ S3_BUCKET="${S3_BUCKET:-poker-blueprint-unified}"
 PROFILE_NAME="poker-solver-profile"
 
 HOURS=192           # 8 days (Pluribus)
-HASH_SIZE=536870912 # 512M slots (Pluribus: 665M action sequences)
+HASH_SIZE=1073741824 # 1B slots (~44GB metadata) — bucket-in-key creates ~300M IS in 8M iters
 DRY_RUN=0
 STATUS_ONLY=0
 DOWNLOAD_ONLY=0

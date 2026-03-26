@@ -136,7 +136,7 @@ export OMP_NUM_THREADS=$(nproc)
 python3 precompute/blueprint_worker_unified.py \
     --time-limit-hours 192 \
     --num-threads \$(nproc) \
-    --hash-size 536870912 \
+    --hash-size 1073741824 \
     --output-dir /tmp/blueprint_unified \
     --s3-bucket BUCKET_PLACEHOLDER \
     --checkpoint-interval 1000000 \
