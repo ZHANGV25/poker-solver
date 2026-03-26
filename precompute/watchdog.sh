@@ -32,7 +32,7 @@ set -euo pipefail
 
 REGION="${AWS_REGION:-us-east-1}"
 S3_BUCKET="${S3_BUCKET:-poker-blueprint-unified}"
-INSTANCE_TYPE="${SOLVER_INSTANCE_TYPE:-c5.metal}"
+INSTANCE_TYPE="${SOLVER_INSTANCE_TYPE:-c5.18xlarge}"
 CHECK_INTERVAL=300  # 5 minutes
 MAX_RELAUNCHES=50   # safety limit (8 days / ~2hr avg spot lifetime = ~96 relaunches worst case)
 LOG_FILE="/var/log/watchdog.log"
@@ -128,8 +128,7 @@ WORKDIR=/tmp/poker-solver
 mkdir -p $WORKDIR/build && cd $WORKDIR
 aws s3 sync s3://BUCKET_PLACEHOLDER/code/ $WORKDIR/ --quiet
 echo "Compiling..."
-gcc -O3 -march=native -fPIC -shared -fopenmp -o build/mccfr_blueprint.so src/mccfr_blueprint.c -I src -lm -lpthread
-gcc -O3 -march=native -fPIC -shared -o build/card_abstraction.so src/card_abstraction.c -I src -lm
+gcc -O3 -march=native -fPIC -shared -fopenmp -o build/mccfr_blueprint.so src/mccfr_blueprint.c src/card_abstraction.c -I src -lm -lpthread
 echo "Compilation complete."
 export OMP_STACKSIZE=64m
 export OMP_NUM_THREADS=$(nproc)
