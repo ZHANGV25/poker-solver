@@ -54,6 +54,89 @@ static void partial_shuffle(int *arr, int n, int k, uint64_t *rng) {
     }
 }
 
+/* ── Regret arena allocator ──────────────────────────────────────── */
+/* Eliminates per-info-set malloc overhead. Each calloc(4, sizeof(int))
+ * adds 16-32 bytes of glibc malloc header, doubling memory for tiny arrays.
+ * Arena allocates in bulk 64MB chunks, returning aligned 32-byte blocks. */
+
+#define ARENA_CHUNK_SIZE (64 * 1024 * 1024)  /* 64 MB per chunk */
+#define ARENA_BLOCK_SIZE 32                    /* 32 bytes = 8 ints max */
+
+typedef struct ArenaChunk {
+    char *data;
+    int used;       /* bytes used in this chunk */
+    int capacity;
+    struct ArenaChunk *next;
+} ArenaChunk;
+
+typedef struct {
+    ArenaChunk *head;
+    int total_chunks;
+} RegretArena;
+
+static RegretArena g_arena = {NULL, 0};
+
+static void arena_init(void) {
+    /* Nothing to do — lazy allocation on first use */
+}
+
+/* Thread-safe arena_alloc using atomic fetch-add on chunk->used.
+ * New chunk allocation uses a simple spinlock (rare path). */
+static int g_arena_lock = 0;
+
+static void *arena_alloc(int num_ints) {
+    (void)num_ints;
+    int size = ARENA_BLOCK_SIZE;
+
+retry:;
+    ArenaChunk *chunk = g_arena.head;
+    if (chunk) {
+        int old = __atomic_fetch_add(&chunk->used, size, __ATOMIC_RELAXED);
+        if (old + size <= chunk->capacity) {
+            return chunk->data + old;
+        }
+        /* Chunk full — fall through to allocate new one */
+    }
+
+    /* Rare path: allocate new chunk under spinlock */
+    int expected = 0;
+    if (!__atomic_compare_exchange_n(&g_arena_lock, &expected, 1,
+                                     0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        /* Another thread is allocating — spin then retry */
+        while (__atomic_load_n(&g_arena_lock, __ATOMIC_ACQUIRE)) { }
+        goto retry;
+    }
+
+    /* Double-check after acquiring lock */
+    chunk = g_arena.head;
+    if (chunk && chunk->used + size <= chunk->capacity) {
+        __atomic_store_n(&g_arena_lock, 0, __ATOMIC_RELEASE);
+        goto retry;
+    }
+
+    ArenaChunk *c = (ArenaChunk*)malloc(sizeof(ArenaChunk));
+    c->capacity = ARENA_CHUNK_SIZE;
+    c->data = (char*)calloc(1, ARENA_CHUNK_SIZE);
+    c->used = 0;
+    c->next = g_arena.head;
+    g_arena.head = c;
+    g_arena.total_chunks++;
+    __atomic_store_n(&g_arena_lock, 0, __ATOMIC_RELEASE);
+    goto retry;
+}
+
+static void arena_free_all(void) {
+    ArenaChunk *c = g_arena.head;
+    while (c) {
+        ArenaChunk *next = c->next;
+        free(c->data);
+        free(c);
+        c = next;
+    }
+    g_arena.head = NULL;
+    g_arena.total_chunks = 0;
+}
+
 /* ── Hash table ───────────────────────────────────────────────────── */
 
 static uint64_t hash_combine(uint64_t a, uint64_t b) {
@@ -125,7 +208,7 @@ static int info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
                                             0, __ATOMIC_ACQ_REL,
                                             __ATOMIC_ACQUIRE)) {
                 t->sets[idx].num_actions = num_actions;
-                t->sets[idx].regrets = (int*)calloc(num_actions, sizeof(int));
+                t->sets[idx].regrets = (int*)arena_alloc(num_actions);
                 t->sets[idx].strategy_sum = NULL;
                 t->keys[idx] = key;
                 __atomic_fetch_add(&t->num_entries, 1, __ATOMIC_RELAXED);
@@ -162,12 +245,13 @@ static void ensure_strategy_sum(BPInfoSet *is) {
 }
 
 static void info_table_free(BPInfoTable *t) {
+    /* strategy_sum uses individual malloc (lazy, preflop only) */
     for (int i = 0; i < t->table_size; i++) {
-        if (t->occupied[i]) {
-            free(t->sets[i].regrets);
-            if (t->sets[i].strategy_sum) free(t->sets[i].strategy_sum);
-        }
+        if (t->occupied[i] && t->sets[i].strategy_sum)
+            free(t->sets[i].strategy_sum);
     }
+    /* regrets are arena-allocated — freed in bulk */
+    arena_free_all();
     free(t->keys);
     free(t->sets);
     free(t->occupied);
