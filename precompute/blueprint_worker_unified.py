@@ -27,6 +27,7 @@ import argparse
 import ctypes
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -242,13 +243,28 @@ def main():
 
     print(f"\nStarting solve: {iters_remaining:,} iterations remaining "
           f"(of {total_iters:,}), checkpoint every {chunk_size:,}...")
-    t0 = time.time()
+    # Crash debugging: flush on every print and catch signals
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+
+    def _signal_handler(signum, frame):
+        print(f"\n[FATAL] Caught signal {signum} ({signal.Signals(signum).name})",
+              flush=True)
+        sys.exit(128 + signum)
+    for sig in (signal.SIGTERM, signal.SIGABRT, signal.SIGSEGV, signal.SIGBUS):
+        try:
+            signal.signal(sig, _signal_handler)
+        except (OSError, ValueError):
+            pass
 
     t0 = time.time()
 
     while iters_done < total_iters:
         this_chunk = min(chunk_size, total_iters - iters_done)
-        bp_lib.bp_solve(solver, this_chunk)
+        print(f"[Solve] Starting chunk: {this_chunk:,} iters from {iters_done:,}...",
+              flush=True)
+        ret = bp_lib.bp_solve(solver, this_chunk)
+        print(f"[Solve] bp_solve returned {ret}", flush=True)
         iters_done += this_chunk
 
         elapsed = time.time() - t0

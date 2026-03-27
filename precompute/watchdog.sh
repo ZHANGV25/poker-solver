@@ -247,8 +247,60 @@ while true; do
             log "Relaunch failed. Will retry in ${CHECK_INTERVAL}s."
         fi
     else
-        # Solver is running — log progress
+        # Solver is running — log progress and check for staleness
         check_progress
+
+        # Detect stale solver: if checkpoint hasn't advanced in 6 checks (30 min),
+        # the solver process likely crashed but the instance is still running.
+        META_LOCAL="/tmp/watchdog_check_meta.json"
+        aws s3 cp "s3://$S3_BUCKET/checkpoint_meta.json" "$META_LOCAL" --quiet 2>/dev/null || true
+        if [ -f "$META_LOCAL" ]; then
+            CURRENT_ITERS=$(jq -r '.iterations // 0' "$META_LOCAL" 2>/dev/null)
+            rm -f "$META_LOCAL"
+        else
+            CURRENT_ITERS=0
+        fi
+
+        if [ -f /tmp/watchdog_last_iters.txt ]; then
+            LAST_ITERS=$(cat /tmp/watchdog_last_iters.txt)
+            LAST_CHECK=$(cat /tmp/watchdog_stale_count.txt 2>/dev/null || echo 0)
+        else
+            LAST_ITERS=0
+            LAST_CHECK=0
+        fi
+
+        if [ "$CURRENT_ITERS" = "$LAST_ITERS" ] && [ "$CURRENT_ITERS" != "0" ]; then
+            LAST_CHECK=$((LAST_CHECK + 1))
+            echo "$LAST_CHECK" > /tmp/watchdog_stale_count.txt
+            if [ "$LAST_CHECK" -ge 6 ]; then
+                log "WARNING: Checkpoint stale for 30+ min (stuck at $CURRENT_ITERS iters)"
+                log "Solver process likely crashed. Attempting SSH restart..."
+                SOLVER_IP=$(aws ec2 describe-instances --instance-ids "$SOLVER_ID" \
+                    --query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null)
+                if [ -n "$SOLVER_IP" ] && [ "$SOLVER_IP" != "None" ]; then
+                    ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
+                        -i /home/ec2-user/.ssh/solver-key.pem "ec2-user@$SOLVER_IP" \
+                        "sudo bash -c '
+                        cd /tmp/poker-solver 2>/dev/null || { mkdir -p /tmp/poker-solver/build && cd /tmp/poker-solver && aws s3 sync s3://$S3_BUCKET/code/ /tmp/poker-solver/ --quiet && gcc -O3 -march=native -fPIC -shared -fopenmp -o build/mccfr_blueprint.so src/mccfr_blueprint.c src/card_abstraction.c -I src -lm -lpthread; }
+                        export OMP_STACKSIZE=128m OMP_NUM_THREADS=\$(nproc)
+                        nohup python3 precompute/blueprint_worker_unified.py \
+                            --time-limit-hours 180 --num-threads \$(nproc) \
+                            --hash-size 1073741824 --output-dir /tmp/blueprint_unified \
+                            --s3-bucket $S3_BUCKET --checkpoint-interval 1000000 \
+                            --build-dir build --resume > /var/log/blueprint-unified-wd.log 2>&1 &
+                        echo PID:\$!'" 2>&1 | while read line; do log "SSH: $line"; done
+                    echo 0 > /tmp/watchdog_stale_count.txt
+                    log "Restart attempted via SSH"
+                else
+                    log "Could not get solver IP for SSH restart"
+                fi
+            else
+                log "Checkpoint unchanged ($LAST_CHECK/6 stale checks)"
+            fi
+        else
+            echo 0 > /tmp/watchdog_stale_count.txt
+        fi
+        echo "$CURRENT_ITERS" > /tmp/watchdog_last_iters.txt
     fi
 done
 
