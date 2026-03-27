@@ -260,30 +260,80 @@ From `pluribus_technical_details.md` in this repo:
 
 ## AWS RESOURCES
 
-- **S3 bucket (v1)**: `poker-blueprint-2026` (110 GB, v1 per-texture blueprint)
-- **S3 bucket (unified)**: `poker-blueprint-unified` (will be created by launch script)
+- **S3 bucket (unified)**: `poker-blueprint-unified` — code, checkpoints, final blueprint
+- **S3 bucket (v1)**: `poker-blueprint-2026` (110 GB, old per-texture blueprint)
+- **Solver instance**: `i-07b2dee8eaa7c94d9` (c5.18xlarge on-demand, 72 vCPU, 137 GB)
+- **Watchdog instance**: `i-050adbd722d07e654` (t3.micro, 18.205.60.222)
 - **Key pair**: `poker-solver-key` (PEM at `C:/Users/Victor/poker-solver-key.pem`)
-- **Security group**: `poker-solver-sg`
-- **IAM profile**: `poker-solver-profile` (role: `poker-solver-ec2-role`)
+- **Security group**: `poker-solver-sg` (sg-07960382eb9d00a95)
+- **IAM profile**: `poker-solver-profile` (role: `poker-solver-ec2-role`, has S3 + EC2FullAccess)
 - **Region**: us-east-1
+
+---
+
+## BUGS FOUND AND FIXED DURING COMPUTE
+
+| Bug | Impact | Fix |
+|-----|--------|-----|
+| Bucket-in-key missing → 1.3TB memory | OOM | BPInfoKey includes bucket, regrets[num_actions] per slot |
+| `--num-threads 0` → 207M iter estimate | Solver stops in 3h | Use `os.cpu_count()` fallback |
+| River actions pruned | Wrong strategies | Never prune river or fold per Pluribus |
+| Percentile bucketing, not k-means | Low abstraction quality | Wire `ca_assign_buckets_kmeans` |
+| Flop buckets reused for turn/river | Stale buckets | Per-street EHS recomputation |
+| `.bps` export > 4GB | uint32 overflow crash | BPS3 format + deferred to final only |
+| `snapshot_interval` > INT32_MAX | Negative modulo → UB → silent crash | Cap all config at INT32_MAX |
+| malloc overhead on 777M tiny arrays | OOM at 87 GB RSS | Arena allocator (zero overhead) |
+| Watchdog only checks instance state | Doesn't detect process crash | Staleness detection + SSH restart |
+| `frozen_action` not in ctypes `_fields_` | A3 freezing silently broken | Added to SSTreeData struct |
 
 ---
 
 ## PROMPT FOR NEXT AGENT
 
-You are continuing development of an exact Pluribus replica poker solver. The project is at `C:/Users/Victor/Documents/Projects/poker-solver/`. Read `CONTEXT_NEXT_SESSION.md` for full context.
+You are continuing development of a Pluribus-exact 6-max NLHE poker solver. The project is at `C:/Users/Victor/Documents/Projects/poker-solver/`. Read `CONTEXT_NEXT_SESSION.md` for full context.
 
-**Immediate task**: Verify the regret save/load checkpoint system works (test was interrupted), then launch the 8-day unified blueprint computation on EC2.
+**The 8-day blueprint compute is running on EC2.** First, check its status:
 
-**Test to run first**:
 ```bash
-cd /c/Users/Victor/Documents/Projects/poker-solver
-gcc -O2 -shared -fopenmp -static -o build/mccfr_blueprint.dll src/mccfr_blueprint.c -I src -lm
-# Then run the Python save/load test (see blueprint_worker_unified.py)
+# Check instances
+aws ec2 describe-instances --region us-east-1 \
+    --filters "Name=tag:Project,Values=poker-solver-unified" "Name=instance-state-name,Values=running" \
+    --query 'Reservations[].Instances[].{Id:InstanceId,IP:PublicIpAddress,Type:InstanceType}' --output table
+
+# Check S3 checkpoint progress
+aws s3 ls s3://poker-blueprint-unified/checkpoints/ --recursive
+
+# SSH into solver (get IP from above)
+ssh -i /path/to/poker-solver-key.pem ec2-user@<IP> "tail -20 /var/log/blueprint-unified.log"
+
+# Check watchdog
+ssh -i /path/to/poker-solver-key.pem ec2-user@18.205.60.222 "tail -20 /var/log/watchdog4.log"
 ```
 
-**Launch sequence** (after test passes):
-1. Launch t3.micro watchdog
-2. Deploy code + watchdog.sh
-3. Watchdog launches c5.metal spot with unified solver + --resume
-4. Monitor via `watchdog.sh --status` or S3 checkpoint metadata
+**If compute is still running:** Monitor and wait. ETA is ~April 4, 2026.
+
+**If compute is complete** (S3 has `checkpoint_meta.json` with `"checkpoint": "final"`):
+1. Download blueprint: `aws s3 sync s3://poker-blueprint-unified/ blueprint_unified/`
+2. Terminate both EC2 instances
+3. Wire unified blueprint into runtime:
+   - Update `python/blueprint_v2.py` to load the unified `.bps` file
+   - The blueprint covers all streets (preflop through river) in one file
+   - Test: load blueprint → query preflop strategy for AA → should show mixed raise sizes
+4. Test full HUD pipeline: preflop blueprint → GPU re-solve → strategy output
+5. Integrate with ACR Poker HUD via Chrome DevTools Protocol
+
+**If compute crashed:** Check the log for the error. Common past issues:
+- OOM → check `dmesg | grep oom` → may need larger instance or reduced hash table
+- Silent death → check if `snapshot_interval` overflowed int32 (fixed in latest code)
+- Spot reclaim → watchdog should auto-relaunch; if not, manually restart
+
+**Cost tracking:**
+- On-demand c5.18xlarge: $3.06/hr × 176h remaining ≈ $539
+- Can switch to spot (~$0.96/hr) when spot limits reset to save ~$370
+- Watchdog t3.micro: $0.01/hr (negligible)
+
+**Compilation** (both .c files required):
+```bash
+gcc -O2 -shared -fopenmp -o build/mccfr_blueprint.dll \
+    src/mccfr_blueprint.c src/card_abstraction.c -I src -lm
+```
