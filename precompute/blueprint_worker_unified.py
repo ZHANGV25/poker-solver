@@ -147,13 +147,15 @@ def main():
     if args.iterations <= 0:
         args.iterations = 1000000  # default 1M
 
-    # Scale Pluribus timing parameters proportionally
-    # Pluribus: 400 min discount out of ~11520 min (8 days) = 3.5%
-    config.discount_stop_iter = max(args.iterations * 35 // 1000, 1000)
-    config.discount_interval = max(config.discount_stop_iter // 40, 100)
-    config.prune_start_iter = max(args.iterations * 17 // 1000, 500)
-    config.snapshot_start_iter = max(args.iterations * 70 // 100, 10000)
-    config.snapshot_interval = max(args.iterations * 17 // 100, 5000)
+    # Scale Pluribus timing parameters proportionally.
+    # Cap all at INT32_MAX to prevent ctypes c_int overflow — with 72 threads
+    # the iteration estimate can exceed 13B, and 13B * 0.17 > INT32_MAX.
+    INT32_MAX = 2_147_483_647
+    config.discount_stop_iter = min(max(args.iterations * 35 // 1000, 1000), INT32_MAX)
+    config.discount_interval = min(max(config.discount_stop_iter // 40, 100), INT32_MAX)
+    config.prune_start_iter = min(max(args.iterations * 17 // 1000, 500), INT32_MAX)
+    config.snapshot_start_iter = min(max(args.iterations * 70 // 100, 10000), INT32_MAX)
+    config.snapshot_interval = min(max(args.iterations * 17 // 100, 5000), INT32_MAX)
     config.strategy_interval = 10000  # Pluribus: every 10K iterations
 
     print(f"Iterations: {args.iterations:,}")
