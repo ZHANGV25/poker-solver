@@ -3,26 +3,27 @@
 ## Category A: Architectural Gaps (Pluribus features)
 
 - [x] **A1** N-player street solver — extend street_solve.cu from 2 to N players
-  - Status: DONE (2026-03-24) — tested 2-player + 3-player river
+  - Status: DONE (2026-03-24) — exact N-player showdown (2026-03-26)
 - [x] **A2** N-player blueprint — external-sampling MCCFR for 2-6 players
-  - `src/mccfr_blueprint.c` + `.h`, compiled to `build/mccfr_blueprint.dll`
-  - Rewritten 2026-03-24: OpenMP, int32 regrets, pruning, card abstraction, payoff fixes
-  - Status: DONE — production-ready for EC2
-- [~] **A3** Strategy freezing — freeze own strategy at passed nodes
-  - Python tracking infrastructure added
-  - CUDA frozen_mask kernel change needed
-  - Status: PARTIAL
+  - `src/mccfr_blueprint.c` + `card_abstraction.c` (must compile together)
+  - Bucket-in-key info set architecture (2026-03-25), k-means bucketing, per-street buckets
+  - Status: DONE — running on EC2 c5.18xlarge since 2026-03-26
+- [x] **A3** Strategy freezing — freeze own strategy at passed nodes
+  - `ss_apply_freeze` CUDA kernel + `frozen_action` field in SSTreeData
+  - Python `set_frozen_actions()` walks tree and marks hero's decision nodes
+  - Status: DONE (2026-03-26)
 - [ ] **A4** Warm-start — persist regrets between solves
-  - Status: NOT STARTED
-- [x] **A5** Run precompute — pipeline ready with blueprint_worker.py + launch_blueprint.sh
-  - Status: READY TO RUN (needs preflop integration first)
-- [x] **A6** Card abstraction — 200-bucket EHS percentile bucketing
-  - `src/card_abstraction.c` + `.h`, fast C implementation
-  - Status: DONE (2026-03-24)
-- [ ] **A7** 6-player preflop solver — extend from 2-player to all positions simultaneously
-  - Current: 2-player CFR+ over 169 classes (preflop_solver.c)
-  - Needed: Full 6-position tree with all actions
-  - Status: NOT STARTED
+  - Status: NOT STARTED (nice-to-have, not blocking)
+- [x] **A5** Run precompute — unified pipeline with blueprint_worker_unified.py
+  - EC2 compute launched 2026-03-26, watchdog on t3.micro auto-relaunches
+  - Status: RUNNING (~April 3 completion)
+- [x] **A6** Card abstraction — 200-bucket k-means on [EHS, pos_potential, neg_potential]
+  - `src/card_abstraction.c` + `.h`, k-means wired into blueprint init (2026-03-26)
+  - Per-street bucket recomputation for turn/river
+  - Status: DONE
+- [x] **A7** 6-player preflop solver — unified preflop-through-river in mccfr_blueprint.c
+  - 169 lossless preflop classes, correct blind posting and acting order
+  - Status: DONE (integrated into unified solver, preflop_solver.c removed)
 
 ## Category B: Necessary Abstractions
 
@@ -52,7 +53,7 @@
 
 | Category | Total | Done | Remaining |
 |----------|-------|------|-----------|
-| A: Architecture | 7 | 4 (A1,A2,A5,A6) | A3 partial, A4/A7 not started |
+| A: Architecture | 7 | 6 (A1-A3,A5-A7) | A4 (warm-start, nice-to-have) |
 | B: Abstractions | 6 | 5 | B5 not started |
 | C: Research | 1 | 1 | — |
 | D: Minor | 4 | 3 | D3 |

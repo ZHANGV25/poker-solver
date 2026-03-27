@@ -7,11 +7,15 @@ build/
 *.pdb
 *.lib
 *.exp
+*.bin
+*.bat
 __pycache__/
 *.pyc
 *.lzma
 *.xz
 flop_solutions/
+blueprint_unified/
+data/
 .vscode/
 .idea/
 *.log

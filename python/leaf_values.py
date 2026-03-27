@@ -359,14 +359,12 @@ def compute_flop_leaf_equity(
 
     # For each turn card, compute turn leaf equity (which itself averages
     # over river cards). Then average across turn cards.
-    accumulated = np.zeros((num_orig_leaves, 2, max_hands), dtype=np.float64)
+    accumulated = np.zeros((num_orig_leaves, num_players, max_hands), dtype=np.float64)
     valid_turns = 0
 
-    # Filter turn cards that don't conflict with any player hands
-    # (all turn cards are valid — conflict is handled per-hand inside)
-    MAX_TURN_SAMPLES = 16  # sample to keep computation tractable
-    if len(turn_cards) > MAX_TURN_SAMPLES and \
-       (len(oop_hands) > 80 or len(ip_hands) > 80):
+    MAX_TURN_SAMPLES = 16
+    any_large = any(len(h) > 80 for h in player_hands)
+    if len(turn_cards) > MAX_TURN_SAMPLES and any_large:
         rng = np.random.RandomState(42)
         sampled_turns = sorted(rng.choice(turn_cards, MAX_TURN_SAMPLES, replace=False))
     else:
@@ -376,19 +374,20 @@ def compute_flop_leaf_equity(
         board_4 = list(flop_board) + [tc]
 
         # Filter hands that conflict with this turn card
-        tc_oop = [(c0, c1, w) for c0, c1, w in oop_hands if c0 != tc and c1 != tc]
-        tc_ip = [(c0, c1, w) for c0, c1, w in ip_hands if c0 != tc and c1 != tc]
+        tc_player_hands = [
+            [(c0, c1, w) for c0, c1, w in hands if c0 != tc and c1 != tc]
+            for hands in player_hands
+        ]
 
-        if not tc_oop or not tc_ip:
+        if any(len(h) == 0 for h in tc_player_hands):
             continue
 
-        # compute_turn_leaf_values returns [total_leaves, 2, max_hands]
-        # where total_leaves = num_orig_leaves * 16
-        tc_max_h = max(len(tc_oop), len(tc_ip))
+        tc_max_h = max(len(h) for h in tc_player_hands)
+        # compute_turn_leaf_values still uses 2-player interface for now
         tc_vals = compute_turn_leaf_values(
             board_4=board_4,
-            oop_hands=tc_oop,
-            ip_hands=tc_ip,
+            oop_hands=tc_player_hands[0],
+            ip_hands=tc_player_hands[1] if num_players > 1 else tc_player_hands[0],
             leaf_infos=leaf_infos,
             max_hands=tc_max_h,
             starting_pot=starting_pot,
@@ -396,7 +395,7 @@ def compute_flop_leaf_equity(
 
         # Map turn-card-filtered hand indices back to full hand indices
         for p, (tc_hands, full_hands) in enumerate(
-                [(tc_oop, oop_hands), (tc_ip, ip_hands)]):
+                zip(tc_player_hands, player_hands)):
             # Build mapping: tc_hands index -> full_hands index
             tc_idx = 0
             for h_full in range(len(full_hands)):

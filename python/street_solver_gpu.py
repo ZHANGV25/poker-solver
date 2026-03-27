@@ -107,6 +107,7 @@ class SSTreeData(ctypes.Structure):
         ("starting_pot", ctypes.c_int),
         ("effective_stack", ctypes.c_int),
         ("is_river", ctypes.c_int),
+        ("frozen_action", ctypes.POINTER(ctypes.c_int)),
     ]
 
 class SSOutput(ctypes.Structure):
@@ -317,9 +318,7 @@ class StreetSolverGPU:
             self._leaf_arr = arr
             self._tree.leaf_values = ctypes.cast(arr, ctypes.POINTER(ctypes.c_float))
 
-        # Initialize frozen_action to NULL (no freezing by default)
-        self._tree.frozen_action = None
-        self._frozen_arr = None
+        self._frozen_arr = None  # prevent GC of frozen_action array
 
         self._output = SSOutput()
         self._solved = False
