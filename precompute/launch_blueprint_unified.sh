@@ -21,7 +21,7 @@
 set -euo pipefail
 
 REGION="${AWS_REGION:-us-east-1}"
-INSTANCE_TYPE="${INSTANCE_TYPE:-c5.18xlarge}"  # 72 vCPU, 144 GB, $3.06/hr
+INSTANCE_TYPE="${INSTANCE_TYPE:-c5.metal}"  # 96 vCPU, 192 GB, $4.08/hr
 KEY_NAME="${KEY_NAME:-poker-solver-key}"
 SECURITY_GROUP="${SECURITY_GROUP:-poker-solver-sg}"
 S3_BUCKET="${S3_BUCKET:-poker-blueprint-unified}"
@@ -131,8 +131,8 @@ echo "=== Unified Blueprint starting at \$(date) ==="
 
 yum install -y gcc gcc-c++ python3 python3-pip libgomp
 
-WORKDIR=/tmp/poker-solver
-mkdir -p \$WORKDIR/build && cd \$WORKDIR
+WORKDIR=/opt/poker-solver
+mkdir -p \$WORKDIR/build /opt/blueprint_unified && cd \$WORKDIR
 aws s3 sync s3://$S3_BUCKET/code/ \$WORKDIR/ --quiet
 
 echo "Compiling with -O3 -march=native for maximum throughput..."
@@ -147,7 +147,7 @@ python3 precompute/blueprint_worker_unified.py \
     --time-limit-hours $HOURS \
     --num-threads \$(nproc) \
     --hash-size $HASH_SIZE \
-    --output-dir /tmp/blueprint_unified \
+    --output-dir /opt/blueprint_unified \
     --s3-bucket $S3_BUCKET \
     --checkpoint-interval 1000000 \
     --build-dir build \
@@ -159,7 +159,7 @@ shutdown -h now
 USERDATA
 )
 
-USERDATA_B64=$(echo "$USERDATA" | base64 -w 0)
+USERDATA_B64=$(echo "$USERDATA" | base64 | tr -d '\n')
 
 echo "Launching instance..."
 INSTANCE_ID=$(aws ec2 run-instances \

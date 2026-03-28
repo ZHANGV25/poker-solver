@@ -223,11 +223,100 @@ class BlueprintV2:
 
         with open(fpath, 'rb') as f:
             magic = f.read(4)
-            if magic != b'BPS2':
+            if magic == b'BPS3':
+                return self._load_bps3(f, cache_key, texture_key)
+            elif magic == b'BPS2':
+                return self._load_bps2(f, cache_key, texture_key)
+            else:
                 return False
-            strat_size, meta_size = struct.unpack('<II', f.read(8))
-            compressed = f.read(strat_size)
-            meta_bytes = f.read(meta_size)
+
+    def _load_bps3(self, f, cache_key, texture_key) -> bool:
+        """Load unified blueprint in BPS3 format (bucket-in-key).
+
+        BPS3 outer format (Python wrapper):
+            'BPS3' (4B) + uint64 compressed_size + uint32 meta_size
+            + LZMA compressed data + JSON metadata
+
+        BPS3 inner format (C binary):
+            'BPS3' (4B) + uint32 num_entries + uint32 num_players
+            Per entry: player(1) + street(1) + bucket(2) + board_hash(8)
+                     + action_hash(8) + num_actions(1) + strategy[na] uint8
+        """
+        compressed_size, meta_size = struct.unpack('<QI', f.read(12))
+        compressed = f.read(compressed_size)
+        meta_bytes = f.read(meta_size)
+
+        strat_data = lzma.decompress(compressed)
+        meta = json.loads(meta_bytes.decode('utf-8'))
+
+        # Parse BPS3 inner binary
+        p = 0
+        hdr = strat_data[p:p+4]; p += 4  # 'BPS3' magic
+        n_entries = struct.unpack_from('<I', strat_data, p)[0]; p += 4
+        n_players = struct.unpack_from('<I', strat_data, p)[0]; p += 4
+
+        # BPS3 has one entry per (node, bucket). Group by node for the
+        # same interface as BPS2: table[key] = [num_buckets, num_actions].
+        # First pass: collect entries by node key.
+        node_entries = {}  # (board_hash, action_hash, player, street) -> {bucket: strategy}
+        loaded = 0
+
+        for _ in range(n_entries):
+            player = strat_data[p]; p += 1
+            street = strat_data[p]; p += 1
+            bucket = struct.unpack_from('<H', strat_data, p)[0]; p += 2
+            board_hash = struct.unpack_from('<Q', strat_data, p)[0]; p += 8
+            action_hash = struct.unpack_from('<Q', strat_data, p)[0]; p += 8
+            na = strat_data[p]; p += 1
+
+            if street in self.streets_to_load:
+                raw = np.frombuffer(strat_data, dtype=np.uint8, count=na, offset=p)
+                strat = raw.astype(np.float32) / 255.0
+                s = strat.sum()
+                if s > 0:
+                    strat = strat / s
+
+                key = (board_hash, action_hash, player, street)
+                if key not in node_entries:
+                    node_entries[key] = {}
+                node_entries[key][bucket] = (na, strat)
+                loaded += 1
+
+            p += na
+
+        # Build table: for each node, create [max_bucket+1, na] array
+        num_buckets = meta.get('postflop_buckets', 200)
+        if meta.get('preflop_buckets'):
+            preflop_buckets = meta['preflop_buckets']
+        else:
+            preflop_buckets = 169
+
+        table = {}
+        for key, bucket_map in node_entries.items():
+            street = key[3]
+            nb = preflop_buckets if street == 0 else num_buckets
+            # Determine na from any entry
+            sample_na = next(iter(bucket_map.values()))[0]
+            strategies = np.zeros((nb, sample_na), dtype=np.float32)
+            # Uniform default for unvisited buckets
+            strategies[:] = 1.0 / sample_na
+            for bucket, (na, strat) in bucket_map.items():
+                if bucket < nb:
+                    strategies[bucket] = strat
+            table[key] = strategies
+
+        self._textures[cache_key] = table
+        self._metadata[cache_key] = meta
+        if cache_key != texture_key:
+            self._textures[texture_key] = table
+            self._metadata[texture_key] = meta
+        return True
+
+    def _load_bps2(self, f, cache_key, texture_key) -> bool:
+        """Load per-scenario blueprint in BPS2 format (per-hand strategies)."""
+        strat_size, meta_size = struct.unpack('<II', f.read(8))
+        compressed = f.read(strat_size)
+        meta_bytes = f.read(meta_size)
 
         strat_data = lzma.decompress(compressed)
         meta = json.loads(meta_bytes.decode('utf-8'))
@@ -278,8 +367,36 @@ class BlueprintV2:
             self._metadata[texture_key] = meta
         return True
 
+    def load_unified(self, bps_path: str) -> bool:
+        """Load a unified BPS3 blueprint file (covers all textures/streets).
+
+        This is the primary loader for the Pluribus-style unified blueprint.
+        The file contains strategies for all info sets across all streets.
+        After loading, get_strategy() works for any board/action/player/bucket.
+
+        Args:
+            bps_path: path to unified_blueprint.bps
+
+        Returns True on success.
+        """
+        if not os.path.exists(bps_path):
+            return False
+
+        with open(bps_path, 'rb') as f:
+            magic = f.read(4)
+            if magic != b'BPS3':
+                return False
+            # Store under a special key; get_strategy will check it
+            result = self._load_bps3(f, '__unified__', '__unified__')
+
+        if result:
+            self._unified_loaded = True
+        return result
+
     def load_for_board(self, board_ints: List[int]) -> bool:
         """Load the texture for a given flop board."""
+        if getattr(self, '_unified_loaded', False):
+            return True  # unified blueprint covers all boards
         key = board_to_texture_key(board_ints)
         return self.load_texture(key)
 
@@ -301,6 +418,19 @@ class BlueprintV2:
         Returns:
             numpy array of action probabilities, or None if not found.
         """
+        board_hash = _compute_board_hash(board, len(board))
+        action_hash = _compute_action_hash(action_history)
+        key = (board_hash, action_hash, player, street)
+
+        # Check unified blueprint first
+        if getattr(self, '_unified_loaded', False):
+            table = self._textures.get('__unified__')
+            if table is not None:
+                strategies = table.get(key)
+                if strategies is not None and bucket < len(strategies):
+                    return strategies[bucket]
+
+        # Fall back to per-texture lookup
         texture_key = board_to_texture_key(board[:3])
         if not self.load_texture(texture_key):
             return None
@@ -308,10 +438,6 @@ class BlueprintV2:
         table = self._textures.get(texture_key)
         if table is None:
             return None
-
-        board_hash = _compute_board_hash(board, len(board))
-        action_hash = _compute_action_hash(action_history)
-        key = (board_hash, action_hash, player, street)
 
         strategies = table.get(key)
         if strategies is None:
@@ -347,6 +473,19 @@ class BlueprintV2:
 
         Returns [num_buckets, num_actions] array, or None.
         """
+        board_hash = _compute_board_hash(board, len(board))
+        action_hash = _compute_action_hash(action_history)
+        key = (board_hash, action_hash, player, street)
+
+        # Check unified blueprint first
+        if getattr(self, '_unified_loaded', False):
+            table = self._textures.get('__unified__')
+            if table is not None:
+                result = table.get(key)
+                if result is not None:
+                    return result
+
+        # Fall back to per-texture lookup
         texture_key = board_to_texture_key(board[:3])
         if not self.load_texture(texture_key):
             return None
@@ -354,10 +493,6 @@ class BlueprintV2:
         table = self._textures.get(texture_key)
         if table is None:
             return None
-
-        board_hash = _compute_board_hash(board, len(board))
-        action_hash = _compute_action_hash(action_history)
-        key = (board_hash, action_hash, player, street)
 
         return table.get(key)
 

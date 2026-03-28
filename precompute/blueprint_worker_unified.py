@@ -103,7 +103,7 @@ def main():
     parser.add_argument("--hash-size", type=int, default=0,
                         help="Hash table slots (0=auto, Pluribus=536870912)")
     parser.add_argument("--build-dir", default="build")
-    parser.add_argument("--output-dir", default="/tmp/blueprint_unified")
+    parser.add_argument("--output-dir", default="/opt/blueprint_unified")
     parser.add_argument("--s3-bucket", default="")
     parser.add_argument("--checkpoint-interval", type=int, default=1000000,
                         help="Export checkpoint every N iterations")
@@ -154,8 +154,8 @@ def main():
     config.discount_stop_iter = min(max(args.iterations * 35 // 1000, 1000), INT32_MAX)
     config.discount_interval = min(max(config.discount_stop_iter // 40, 100), INT32_MAX)
     config.prune_start_iter = min(max(args.iterations * 17 // 1000, 500), INT32_MAX)
-    config.snapshot_start_iter = min(max(args.iterations * 70 // 100, 10000), INT32_MAX)
-    config.snapshot_interval = min(max(args.iterations * 17 // 100, 5000), INT32_MAX)
+    config.snapshot_start_iter = min(max(args.iterations * 7 // 100, 10000), INT32_MAX)
+    config.snapshot_interval = min(max(args.iterations * 17 // 1000, 5000), INT32_MAX)
     config.strategy_interval = 10000  # Pluribus: every 10K iterations
 
     print(f"Iterations: {args.iterations:,}")
