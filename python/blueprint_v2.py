@@ -51,11 +51,74 @@ def _mask64(x):
 
 
 def _compute_board_hash(board, num_board):
-    """Must match compute_board_hash in mccfr_blueprint.c exactly."""
+    """Must match compute_board_hash in mccfr_blueprint.c exactly.
+    Board cards are canonicalized first (suit-isomorphic mapping)."""
+    if num_board >= 3:
+        canon = _canonicalize_board(board, num_board)
+    else:
+        canon = list(board[:num_board])
     h = _mask64(0x123456789ABCDEF)
     for i in range(num_board):
-        h = _hash_combine(h, _mask64(board[i] * 31 + 7))
+        h = _hash_combine(h, _mask64(canon[i] * 31 + 7))
     return h
+
+
+def _canonicalize_board(board, num_board):
+    """Canonicalize board cards for info set hashing.
+    Must match canonicalize_board() in mccfr_blueprint.c exactly."""
+    # Sort flop by rank descending
+    flop = sorted(board[:3], key=lambda c: -(c >> 2))
+    r0, r1, r2 = flop[0] >> 2, flop[1] >> 2, flop[2] >> 2
+    s0, s1, s2 = flop[0] & 3, flop[1] & 3, flop[2] & 3
+
+    if r0 == r1 and r1 == r2:
+        canon_flop = [r0*4+3, r1*4+2, r2*4+1]
+    elif r0 == r1 or r1 == r2:
+        if r0 == r1:
+            if s2 == s0 or s2 == s1:
+                canon_flop = [r0*4+3, r1*4+2, r2*4+3]
+            else:
+                canon_flop = [r0*4+3, r1*4+2, r2*4+1]
+        else:
+            if s0 == s1 or s0 == s2:
+                canon_flop = [r0*4+3, r1*4+3, r2*4+2]
+            else:
+                canon_flop = [r0*4+3, r1*4+2, r2*4+1]
+    else:
+        if s0 == s1 and s1 == s2:
+            canon_flop = [r0*4+3, r1*4+3, r2*4+3]
+        elif s0 == s1:
+            canon_flop = [r0*4+3, r1*4+3, r2*4+2]
+        elif s0 == s2:
+            canon_flop = [r0*4+3, r1*4+2, r2*4+3]
+        elif s1 == s2:
+            canon_flop = [r0*4+2, r1*4+3, r2*4+3]
+        else:
+            canon_flop = [r0*4+3, r1*4+2, r2*4+1]
+
+    # Build suit mapping
+    suit_map = [-1, -1, -1, -1]
+    for i in range(3):
+        actual_suit = flop[i] & 3
+        canon_suit = canon_flop[i] & 3
+        if suit_map[actual_suit] == -1:
+            suit_map[actual_suit] = canon_suit
+    # Fill unmapped suits
+    nc = 0
+    for i in range(4):
+        if suit_map[i] == -1:
+            while nc < 4 and any(suit_map[j] == nc for j in range(4)):
+                nc += 1
+            suit_map[i] = nc if nc < 4 else 0
+            nc += 1
+
+    # Build canonical board
+    canon = list(canon_flop)
+    for i in range(3, num_board):
+        rank = board[i] >> 2
+        suit = board[i] & 3
+        canon.append(rank * 4 + suit_map[suit])
+    return canon
 
 
 def _compute_action_hash(actions):

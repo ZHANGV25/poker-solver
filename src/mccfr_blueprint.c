@@ -151,6 +151,93 @@ static uint64_t compute_board_hash(const int *board, int num_board) {
     return h;
 }
 
+/* Canonicalize a board for info set hashing.
+ * Maps actual board cards to suit-isomorphic canonical cards so that
+ * boards with the same texture share info set entries.
+ * canon_out must have space for num_board cards. */
+static void canonicalize_board(const int *board, int num_board, int *canon_out) {
+    if (num_board == 0) return;
+
+    /* Step 1: Canonicalize the flop (first 3 cards) */
+    int sorted[3], canon_flop[3];
+    int suit_map[4] = {-1, -1, -1, -1};
+
+    /* Sort flop cards by rank descending */
+    for (int i = 0; i < 3 && i < num_board; i++) sorted[i] = board[i];
+    for (int a = 0; a < 2; a++)
+        for (int b = a+1; b < 3; b++)
+            if ((sorted[a]>>2) < (sorted[b]>>2)) {
+                int tmp = sorted[a]; sorted[a] = sorted[b]; sorted[b] = tmp;
+            }
+
+    int r0 = sorted[0]>>2, r1 = sorted[1]>>2, r2 = sorted[2]>>2;
+    int s0 = sorted[0]&3, s1 = sorted[1]&3, s2 = sorted[2]&3;
+
+    /* Determine canonical suits based on pattern (same logic as traversal) */
+    if (r0 == r1 && r1 == r2) {
+        canon_flop[0] = r0*4+3; canon_flop[1] = r1*4+2; canon_flop[2] = r2*4+1;
+    } else if (r0 == r1 || r1 == r2) {
+        if (r0 == r1) {
+            if (s2 == s0 || s2 == s1) {
+                canon_flop[0] = r0*4+3; canon_flop[1] = r1*4+2; canon_flop[2] = r2*4+3;
+            } else {
+                canon_flop[0] = r0*4+3; canon_flop[1] = r1*4+2; canon_flop[2] = r2*4+1;
+            }
+        } else {
+            if (s0 == s1 || s0 == s2) {
+                canon_flop[0] = r0*4+3; canon_flop[1] = r1*4+3; canon_flop[2] = r2*4+2;
+            } else {
+                canon_flop[0] = r0*4+3; canon_flop[1] = r1*4+2; canon_flop[2] = r2*4+1;
+            }
+        }
+    } else {
+        if (s0 == s1 && s1 == s2) {
+            canon_flop[0] = r0*4+3; canon_flop[1] = r1*4+3; canon_flop[2] = r2*4+3;
+        } else if (s0 == s1) {
+            canon_flop[0] = r0*4+3; canon_flop[1] = r1*4+3; canon_flop[2] = r2*4+2;
+        } else if (s0 == s2) {
+            canon_flop[0] = r0*4+3; canon_flop[1] = r1*4+2; canon_flop[2] = r2*4+3;
+        } else if (s1 == s2) {
+            canon_flop[0] = r0*4+2; canon_flop[1] = r1*4+3; canon_flop[2] = r2*4+3;
+        } else {
+            canon_flop[0] = r0*4+3; canon_flop[1] = r1*4+2; canon_flop[2] = r2*4+1;
+        }
+    }
+
+    /* Build suit mapping from sorted actual → canonical */
+    for (int i = 0; i < 3; i++) {
+        int as = sorted[i] & 3;
+        int cs = canon_flop[i] & 3;
+        if (suit_map[as] == -1) suit_map[as] = cs;
+    }
+    /* Assign unmapped suits to remaining canonical suits */
+    int nc = 0;
+    for (int i = 0; i < 4; i++) {
+        if (suit_map[i] == -1) {
+            while (nc < 4) {
+                int used = 0;
+                for (int j = 0; j < 4; j++)
+                    if (suit_map[j] == nc) { used = 1; break; }
+                if (!used) break;
+                nc++;
+            }
+            if (nc < 4) suit_map[i] = nc++;
+            else suit_map[i] = 0;
+        }
+    }
+
+    /* Output canonical board */
+    for (int i = 0; i < 3 && i < num_board; i++)
+        canon_out[i] = canon_flop[i];
+
+    /* Turn and river: apply suit mapping */
+    for (int i = 3; i < num_board; i++) {
+        int rank = board[i] >> 2;
+        int suit = board[i] & 3;
+        canon_out[i] = rank * 4 + suit_map[suit];
+    }
+}
+
 static uint64_t compute_action_hash(const int *actions, int num_actions) {
     uint64_t h = 0xFEDCBA9876543210ULL;
     for (int i = 0; i < num_actions; i++)
@@ -393,6 +480,17 @@ typedef struct {
     int postflop_num_buckets_actual;
     int postflop_buckets_computed;   /* 1 if buckets have been computed for this flop */
 
+    /* Canonical board for info set keys. Boards with the same texture
+     * (suit-isomorphic pattern) map to the same canonical board, so
+     * strategically equivalent boards share info sets. This matches
+     * Pluribus, which uses ~665M action sequences vs our previous ~1.3B
+     * when keying on actual dealt cards.
+     * suit_map[actual_suit] = canonical_suit (-1 = unmapped). Built when
+     * the flop is canonicalized, applied to turn/river cards. */
+    int canon_board[5];
+    int num_canon_board;
+    int suit_map[4];  /* actual suit -> canonical suit */
+
     int action_history[256];
     int history_len;
 } TraversalState;
@@ -610,6 +708,42 @@ static float traverse(TraversalState *ts, int acting_order_idx,
                     next.postflop_num_buckets_actual = s->postflop_num_buckets;
                     next.postflop_buckets_computed = 1;
                 }
+
+                /* Store canonical flop and build suit mapping for turn/river.
+                 * suit_map[actual_suit] = canonical_suit.
+                 * We map each actual suit from sorted[] to its canonical suit
+                 * from canon[]. Unmapped suits get the next available canonical
+                 * suit (for turn/river cards with new suits). */
+                next.canon_board[0] = canon[0];
+                next.canon_board[1] = canon[1];
+                next.canon_board[2] = canon[2];
+                next.num_canon_board = 3;
+
+                for (int i = 0; i < 4; i++) next.suit_map[i] = -1;
+                for (int i = 0; i < 3; i++) {
+                    int actual_suit = sorted[i] & 3;
+                    int canon_suit = canon[i] & 3;
+                    if (next.suit_map[actual_suit] == -1)
+                        next.suit_map[actual_suit] = canon_suit;
+                }
+                /* Assign unmapped suits to remaining canonical suits */
+                int next_canon = 0;
+                for (int i = 0; i < 4; i++) {
+                    if (next.suit_map[i] == -1) {
+                        /* Find next unused canonical suit */
+                        while (next_canon < 4) {
+                            int used = 0;
+                            for (int j = 0; j < 4; j++)
+                                if (next.suit_map[j] == next_canon) { used = 1; break; }
+                            if (!used) break;
+                            next_canon++;
+                        }
+                        if (next_canon < 4)
+                            next.suit_map[i] = next_canon++;
+                        else
+                            next.suit_map[i] = 0; /* fallback */
+                    }
+                }
             }
 
             /* Postflop acting order: SB(0), BB(1), UTG(2), ..., BTN(5) */
@@ -620,6 +754,13 @@ static float traverse(TraversalState *ts, int acting_order_idx,
             /* Flop->Turn or Turn->River: deal 1 card */
             int dealt = valid[rng_int(ts->rng, nv)];
             next.board[next.num_board++] = dealt;
+            /* Canonicalize the dealt card using the flop's suit mapping */
+            if (next.num_canon_board < 5) {
+                int rank = dealt >> 2;
+                int suit = dealt & 3;
+                int canon_suit = (next.suit_map[suit] >= 0) ? next.suit_map[suit] : suit;
+                next.canon_board[next.num_canon_board++] = rank * 4 + canon_suit;
+            }
             return traverse(&next, 0, acting_order, num_in_order);
         }
     }
@@ -712,7 +853,13 @@ static float traverse(TraversalState *ts, int acting_order_idx,
     key.player = ap;
     key.street = street;
     key.bucket = bucket;
-    key.board_hash = compute_board_hash(ts->board, ts->num_board);
+    /* Use canonical board hash so suit-isomorphic boards share info sets.
+     * Preflop (num_board==0) has no board cards. Postflop uses the
+     * canonicalized board built from the flop texture + mapped turn/river. */
+    if (ts->num_canon_board > 0)
+        key.board_hash = compute_board_hash(ts->canon_board, ts->num_canon_board);
+    else
+        key.board_hash = compute_board_hash(ts->board, ts->num_board);
     key.action_hash = compute_action_hash(ts->action_history, ts->history_len);
 
     int is_slot = info_table_find_or_create(&s->info_table, key, na);
@@ -1472,7 +1619,14 @@ int bp_get_strategy(const BPSolver *s, int player,
     key.player = player;
     key.street = board_to_street(num_board);
     key.bucket = bucket;
-    key.board_hash = compute_board_hash(board, num_board);
+    /* Canonicalize board for lookup (must match traversal's canonical keys) */
+    if (num_board >= 3) {
+        int canon[5];
+        canonicalize_board(board, num_board, canon);
+        key.board_hash = compute_board_hash(canon, num_board);
+    } else {
+        key.board_hash = compute_board_hash(board, num_board);
+    }
     key.action_hash = compute_action_hash(action_seq, seq_len);
 
     uint64_t h = hash_combine(key.board_hash, key.action_hash);
