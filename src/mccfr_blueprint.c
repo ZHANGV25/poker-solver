@@ -854,12 +854,14 @@ static float traverse(TraversalState *ts, int acting_order_idx,
     key.street = street;
     key.bucket = bucket;
     /* Use canonical board hash so suit-isomorphic boards share info sets.
-     * Preflop (num_board==0) has no board cards. Postflop uses the
-     * canonicalized board built from the flop texture + mapped turn/river. */
-    if (ts->num_canon_board > 0)
-        key.board_hash = compute_board_hash(ts->canon_board, ts->num_canon_board);
-    else
+     * Recompute canonicalization here (not from state) for correctness. */
+    if (ts->num_board >= 3) {
+        int cb[5];
+        canonicalize_board(ts->board, ts->num_board, cb);
+        key.board_hash = compute_board_hash(cb, ts->num_board);
+    } else {
         key.board_hash = compute_board_hash(ts->board, ts->num_board);
+    }
     key.action_hash = compute_action_hash(ts->action_history, ts->history_len);
 
     int is_slot = info_table_find_or_create(&s->info_table, key, na);
