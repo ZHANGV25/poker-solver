@@ -133,13 +133,17 @@ def main():
         config.hash_table_size = args.hash_size
 
     # If running by time limit, estimate iterations.
-    # Pluribus: 8 days on 64 cores, ~1000 iter/min → ~11.5M total iterations.
-    # We'll set a high iteration count and check time externally.
+    # The iteration estimate determines Pluribus timing thresholds (discount,
+    # pruning, snapshots) as proportions of total iterations. Getting this
+    # right is critical — overestimating causes thresholds to fire too late.
+    #
+    # Observed throughput: ~2300 iter/s on 96 threads including checkpoint
+    # overhead (~24 iter/s per thread). Burst solving speed (~290K iter/s)
+    # is much higher but checkpoint saves every 1M iters add ~10s overhead.
     if args.time_limit_hours > 0 and args.iterations == 0:
-        # Estimate: ~300 iter/s per thread.
-        # When --num-threads 0, OpenMP auto-detects; use os.cpu_count() as estimate.
         effective_threads = args.num_threads if args.num_threads > 0 else (os.cpu_count() or 1)
-        est_iter_per_sec = effective_threads * 300
+        # Use observed throughput: ~24 iter/s/thread (includes checkpoint overhead)
+        est_iter_per_sec = effective_threads * 24
         args.iterations = int(args.time_limit_hours * 3600 * est_iter_per_sec)
         print(f"Time limit: {args.time_limit_hours}h, {effective_threads} threads, "
               f"~{est_iter_per_sec} iter/s → estimated {args.iterations:,} iterations")

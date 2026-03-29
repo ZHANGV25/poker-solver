@@ -146,7 +146,7 @@ export OMP_NUM_THREADS=$(nproc)
 python3 -u precompute/blueprint_worker_unified.py \
     --time-limit-hours 192 \
     --num-threads $(nproc) \
-    --hash-size 1073741824 \
+    --hash-size 1342177280 \
     --output-dir /opt/blueprint_unified \
     --s3-bucket BUCKET_PLACEHOLDER \
     --checkpoint-interval 1000000 \
@@ -238,7 +238,7 @@ cd /opt/poker-solver 2>/dev/null || {
 export OMP_STACKSIZE=64m OMP_NUM_THREADS=\$(nproc)
 python3 -u precompute/blueprint_worker_unified.py \
     --time-limit-hours 192 --num-threads \$(nproc) \
-    --hash-size 1073741824 --output-dir /opt/blueprint_unified \
+    --hash-size 1342177280 --output-dir /opt/blueprint_unified \
     --s3-bucket $S3_BUCKET --checkpoint-interval 1000000 \
     --build-dir build --resume > /var/log/blueprint-unified.log 2>&1
 '"
