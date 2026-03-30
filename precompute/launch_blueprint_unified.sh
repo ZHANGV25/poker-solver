@@ -169,6 +169,7 @@ INSTANCE_ID=$(aws ec2 run-instances \
     --key-name "$KEY_NAME" \
     --security-groups "$SECURITY_GROUP" \
     --iam-instance-profile "Name=$PROFILE_NAME" \
+    --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":100,"VolumeType":"gp3"}}]' \
     --instance-market-options '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"persistent","InstanceInterruptionBehavior":"stop"}}' \
     --user-data "$USERDATA_B64" \
     --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=bp-unified},{Key=Project,Value=poker-solver-unified}]" \
