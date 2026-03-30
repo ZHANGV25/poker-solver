@@ -1,12 +1,12 @@
 /**
- * solver.c — Depth-limited DCFR poker solver
+ * solver.c — Depth-limited Linear CFR poker solver
  *
- * Core implementation of Discounted CFR for single-street subgame solving
+ * Core implementation of Linear CFR for single-street subgame solving
  * with Pluribus-style continuation strategies at leaf nodes.
  *
  * Key optimizations:
  *   - O(N+M) prefix-sum showdown evaluation
- *   - DCFR with Brown's parameters (alpha=1.5, beta=0.5, gamma=3.0)
+ *   - Linear CFR: regrets *= t/(t+1), matching Pluribus exactly
  *   - Regret-based pruning after warm-up
  *   - Alternating updates (one player per traversal)
  *   - Branch-free regret matching
@@ -726,26 +726,22 @@ static void best_response_traverse(Solver *s, int node_idx, int br_player,
     }
 }
 
-/** Apply DCFR discounting to regrets and cumulative strategy */
-static void apply_dcfr_discount(Solver *s, int iter) {
+/** Apply Linear CFR discounting to regrets and cumulative strategy.
+ *  Matches Pluribus: d = t/(t+1), applied uniformly to all regrets
+ *  (both positive and negative) and cumulative strategy. */
+static void apply_linear_cfr_discount(Solver *s, int iter) {
     float t = (float)iter;
-    float alpha_t = powf(t, s->alpha) / (powf(t, s->alpha) + 1.0f);
-    float beta_t = s->beta; /* Fixed at 0.5 for negative regrets */
-    float gamma_t = powf(t / (t + 1.0f), s->gamma);
+    float d = t / (t + 1.0f);
 
     for (int n = 0; n < s->num_nodes; n++) {
         InfoSet *is = &s->info_sets[n];
         if (is->regrets == NULL) continue;
 
         int size = is->num_actions * is->num_hands;
-        for (int i = 0; i < size; i++) {
-            if (is->regrets[i] > 0)
-                is->regrets[i] *= alpha_t;
-            else
-                is->regrets[i] *= beta_t;
-        }
         for (int i = 0; i < size; i++)
-            is->cum_strategy[i] *= gamma_t;
+            is->regrets[i] *= d;
+        for (int i = 0; i < size; i++)
+            is->cum_strategy[i] *= d;
     }
 }
 
@@ -790,13 +786,15 @@ int solver_init(Solver *s,
     s->starting_pot = starting_pot;
     s->effective_stack = effective_stack;
 
-    /* DCFR parameters */
-    s->alpha = 1.5f;
-    s->beta = 0.5f;
-    s->gamma = 3.0f;
+    /* Linear CFR (Pluribus-matched) — alpha/beta/gamma fields retained
+     * for API compatibility but are no longer used by the discount function. */
+    s->alpha = 1.0f;
+    s->beta = 1.0f;
+    s->gamma = 1.0f;
 
     /* Allocate tree (initial capacity) */
     s->nodes = malloc(2048 * sizeof(TreeNode));
+    if (!s->nodes) return -1;
     s->num_nodes = 0;
 
     /* Build game tree */
@@ -811,6 +809,7 @@ int solver_init(Solver *s,
 
     /* Allocate info sets (one per node, lazy init of regrets) */
     s->info_sets = calloc(s->num_nodes, sizeof(InfoSet));
+    if (!s->info_sets) return -1;
 
     /* Allocate scratch buffers to avoid malloc in hot loop */
     int max_hands = s->num_hands[0] > s->num_hands[1] ?
@@ -818,6 +817,7 @@ int solver_init(Solver *s,
     s->scratch_reach[0] = malloc(s->num_hands[0] * sizeof(float));
     s->scratch_reach[1] = malloc(s->num_hands[1] * sizeof(float));
     s->scratch_cfv = malloc(max_hands * sizeof(float));
+    if (!s->scratch_reach[0] || !s->scratch_reach[1] || !s->scratch_cfv) return -1;
 
     return 0;
 }
@@ -868,8 +868,8 @@ float solver_solve(Solver *s, int max_iterations, float target_exploitability) {
         /* Traverse for player 1 */
         cfr_traverse(s, 0, 1, reach0, reach1, cfv, iter);
 
-        /* Apply DCFR discounting */
-        apply_dcfr_discount(s, iter);
+        /* Apply Linear CFR discounting (Pluribus-matched) */
+        apply_linear_cfr_discount(s, iter);
 
         s->iterations_run = iter;
     }

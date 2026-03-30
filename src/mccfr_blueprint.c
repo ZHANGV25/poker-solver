@@ -85,8 +85,10 @@ static void arena_init(void) {
 static int g_arena_lock = 0;
 
 static void *arena_alloc(int num_ints) {
-    (void)num_ints;
-    int size = ARENA_BLOCK_SIZE;
+    int size = num_ints * (int)sizeof(int);
+    if (size < ARENA_BLOCK_SIZE) size = ARENA_BLOCK_SIZE;
+    /* Round up to 8-byte alignment */
+    size = (size + 7) & ~7;
 
 retry:;
     ArenaChunk *chunk = g_arena.head;
@@ -102,8 +104,18 @@ retry:;
     int expected = 0;
     if (!__atomic_compare_exchange_n(&g_arena_lock, &expected, 1,
                                      0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-        /* Another thread is allocating — spin then retry */
-        while (__atomic_load_n(&g_arena_lock, __ATOMIC_ACQUIRE)) { }
+        /* Another thread is allocating — spin with pause then retry */
+        for (int spins = 0; __atomic_load_n(&g_arena_lock, __ATOMIC_ACQUIRE); spins++) {
+            #ifdef __x86_64__
+            __builtin_ia32_pause();
+            #endif
+            if (spins > 10000) { /* yield after ~10us of spinning */
+                #ifdef _OPENMP
+                #pragma omp taskyield
+                #endif
+                spins = 0;
+            }
+        }
         goto retry;
     }
 
@@ -115,8 +127,10 @@ retry:;
     }
 
     ArenaChunk *c = (ArenaChunk*)malloc(sizeof(ArenaChunk));
-    c->capacity = ARENA_CHUNK_SIZE;
+    if (!c) { __atomic_store_n(&g_arena_lock, 0, __ATOMIC_RELEASE); return NULL; }
     c->data = (char*)calloc(1, ARENA_CHUNK_SIZE);
+    if (!c->data) { free(c); __atomic_store_n(&g_arena_lock, 0, __ATOMIC_RELEASE); return NULL; }
+    c->capacity = ARENA_CHUNK_SIZE;
     c->used = 0;
     c->next = g_arena.head;
     g_arena.head = c;

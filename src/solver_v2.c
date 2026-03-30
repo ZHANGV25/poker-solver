@@ -35,6 +35,7 @@ static void st_init(StreetTree *st) {
     memset(st, 0, sizeof(StreetTree));
     st->nodes_capacity = 64;
     st->nodes = malloc(st->nodes_capacity * sizeof(NodeV2));
+    /* Note: callers must check st->nodes != NULL */
 }
 
 static int st_alloc(StreetTree *st) {
@@ -374,9 +375,11 @@ static void cfr_street(SolverV2 *s, StreetTree *st, InfoSetV2 *is_arr, int is_ca
 
     float *reach0_mod = malloc(n0 * sizeof(float));
     float *reach1_mod = malloc(n1 * sizeof(float));
+    if (!reach0_mod || !reach1_mod) { free(reach0_mod); free(reach1_mod); return; }
 
     if (acting == traverser) {
         float *action_cfv = malloc(n_actions * n_trav * sizeof(float));
+        if (!action_cfv) { free(reach0_mod); free(reach1_mod); return; }
         memset(cfv_out, 0, n_trav * sizeof(float));
 
         for (int a = 0; a < n_actions; a++) {
@@ -455,13 +458,7 @@ static void cfr_chance(SolverV2 *s, const NodeV2 *node, int traverser,
 
     memset(cfv_out, 0, n_trav * sizeof(float));
     float *card_cfv = malloc(n_trav * sizeof(float));
-
-    /* Determine which info set storage to use for the next street */
-    int turn_idx_base = -1;
-    if (num_board == 3) {
-        /* Dealing the turn card — use turn_info_sets */
-        turn_idx_base = 0; /* will index by card position in next_cards */
-    }
+    if (!card_cfv) return;
 
     for (int ci = 0; ci < num_next; ci++) {
         int deal_card = next_cards[ci];
@@ -484,10 +481,42 @@ static void cfr_chance(SolverV2 *s, const NodeV2 *node, int traverser,
         build_street(&next_st, next_is_river, 0, node->pot, remaining_stack,
                      0, 0, 0, 0, s->bet_sizes, s->num_bet_sizes);
 
-        /* Ephemeral info sets for this sub-street.
-         * TODO: persist across iterations for faster convergence. */
-        int sub_is_cap = next_st.num_nodes + 16;
-        InfoSetV2 *sub_is = calloc(sub_is_cap, sizeof(InfoSetV2));
+        /* Use PERSISTENT info sets from the solver state so that regrets
+         * accumulate across iterations and CFR actually converges.
+         * Previously these were ephemeral (allocated/freed per iteration),
+         * which meant sub-street strategies never converged. */
+        InfoSetV2 *sub_is = NULL;
+        int sub_is_cap = 0;
+
+        if (num_board == 3 && s->turn_info_sets) {
+            /* Dealing turn card: use persistent turn info sets */
+            sub_is = s->turn_info_sets[ci];
+            sub_is_cap = s->max_turn_nodes;
+        } else if (num_board == 4 && s->river_info_sets) {
+            /* Dealing river card: use persistent river info sets.
+             * Index depends on whether we started from flop or turn. */
+            int river_idx;
+            if (s->num_board == 3) {
+                /* Started from flop: river_info_sets indexed by
+                 * [turn_card_idx * max_river_per_turn + river_card_idx] */
+                river_idx = street_depth * s->max_river_per_turn + ci;
+            } else {
+                /* Started from turn: river_info_sets indexed directly by ci */
+                river_idx = ci;
+            }
+            sub_is = s->river_info_sets[river_idx];
+            sub_is_cap = s->max_river_nodes;
+        }
+
+        /* Fallback: if persistent storage wasn't allocated (e.g. river-only
+         * solve), use ephemeral info sets */
+        int ephemeral = 0;
+        if (!sub_is) {
+            sub_is_cap = next_st.num_nodes + 16;
+            sub_is = calloc(sub_is_cap, sizeof(InfoSetV2));
+            if (!sub_is) { free(next_st.nodes); continue; }
+            ephemeral = 1;
+        }
 
         /* Recurse into next street */
         cfr_street(s, &next_st, sub_is, sub_is_cap,
@@ -498,14 +527,16 @@ static void cfr_chance(SolverV2 *s, const NodeV2 *node, int traverser,
         for (int h = 0; h < n_trav; h++)
             cfv_out[h] += card_cfv[h];
 
-        /* Free everything */
+        /* Only free the tree nodes -- info sets persist */
         free(next_st.nodes);
-        for (int i = 0; i < sub_is_cap; i++) {
-            if (sub_is[i].regrets) free(sub_is[i].regrets);
-            if (sub_is[i].strategy_sum) free(sub_is[i].strategy_sum);
-            if (sub_is[i].current_strategy) free(sub_is[i].current_strategy);
+        if (ephemeral) {
+            for (int i = 0; i < sub_is_cap; i++) {
+                if (sub_is[i].regrets) free(sub_is[i].regrets);
+                if (sub_is[i].strategy_sum) free(sub_is[i].strategy_sum);
+                if (sub_is[i].current_strategy) free(sub_is[i].current_strategy);
+            }
+            free(sub_is);
         }
-        free(sub_is);
     }
 
     /* Average over number of dealt cards */
@@ -658,6 +689,7 @@ static void br_chance(SolverV2 *s, const NodeV2 *node, int br_player,
 
     memset(cfv_out, 0, n_br * sizeof(float));
     float *card_cfv = malloc(n_br * sizeof(float));
+    if (!card_cfv) return;
 
     for (int ci = 0; ci < num_next; ci++) {
         int next_board[5];
@@ -670,10 +702,33 @@ static void br_chance(SolverV2 *s, const NodeV2 *node, int br_player,
                      s->effective_stack - (node->pot - s->starting_pot) / 2,
                      0, 0, 0, 0, s->bet_sizes, s->num_bet_sizes);
 
-        next_st.info_sets_capacity = next_st.num_nodes + 16;
-        next_st.info_sets = calloc(next_st.info_sets_capacity, sizeof(InfoSetV2));
+        /* Use persistent info sets for best-response computation too,
+         * so BR reads the converged sub-street strategies. */
+        InfoSetV2 *sub_is = NULL;
+        int sub_is_cap = 0;
 
-        best_response_street(s, &next_st, next_st.info_sets, next_st.info_sets_capacity,
+        if (num_board == 3 && s->turn_info_sets) {
+            sub_is = s->turn_info_sets[ci];
+            sub_is_cap = s->max_turn_nodes;
+        } else if (num_board == 4 && s->river_info_sets) {
+            int river_idx;
+            if (s->num_board == 3)
+                river_idx = street_depth * s->max_river_per_turn + ci;
+            else
+                river_idx = ci;
+            sub_is = s->river_info_sets[river_idx];
+            sub_is_cap = s->max_river_nodes;
+        }
+
+        int ephemeral = 0;
+        if (!sub_is) {
+            sub_is_cap = next_st.num_nodes + 16;
+            sub_is = calloc(sub_is_cap, sizeof(InfoSetV2));
+            if (!sub_is) { free(next_st.nodes); continue; }
+            ephemeral = 1;
+        }
+
+        best_response_street(s, &next_st, sub_is, sub_is_cap,
                              0, br_player, reach0, reach1, card_cfv,
                              next_board, next_num_board,
                              num_board == 3 ? ci : street_depth);
@@ -681,7 +736,15 @@ static void br_chance(SolverV2 *s, const NodeV2 *node, int br_player,
         for (int h = 0; h < n_br; h++)
             cfv_out[h] += card_cfv[h];
 
-        st_free(&next_st);
+        free(next_st.nodes);
+        if (ephemeral) {
+            for (int i = 0; i < sub_is_cap; i++) {
+                if (sub_is[i].regrets) free(sub_is[i].regrets);
+                if (sub_is[i].strategy_sum) free(sub_is[i].strategy_sum);
+                if (sub_is[i].current_strategy) free(sub_is[i].current_strategy);
+            }
+            free(sub_is);
+        }
     }
 
     if (num_next > 0) {
@@ -737,6 +800,7 @@ int sv2_init(SolverV2 *s,
 
     s->root_tree.info_sets_capacity = s->root_tree.num_nodes + 16;
     s->root_tree.info_sets = calloc(s->root_tree.info_sets_capacity, sizeof(InfoSetV2));
+    if (!s->root_tree.info_sets) return -1;
 
     /* Pre-allocate persistent info set storage for sub-streets */
     if (num_board < 5) {

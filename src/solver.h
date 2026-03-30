@@ -1,11 +1,11 @@
 /**
- * solver.h — Depth-limited DCFR poker solver
+ * solver.h — Depth-limited Linear CFR poker solver
  *
  * Solves a single-street subgame with:
  *   - Weighted (Bayesian-narrowed) ranges for both players
  *   - 4 continuation strategies at leaf nodes (Pluribus-style)
  *   - O(N+M) prefix-sum showdown evaluation
- *   - DCFR with Brown's parameters
+ *   - Linear CFR: d = t/(t+1), matching Pluribus exactly
  *   - Regret-based pruning
  *   - 16-bit compressed regret storage
  */
@@ -120,10 +120,10 @@ typedef struct {
     int starting_pot;
     int effective_stack;
 
-    /* DCFR parameters */
-    float alpha;            /* positive regret discount: 1.5 */
-    float beta;             /* negative regret discount: 0.5 */
-    float gamma;            /* strategy discount: 3.0 */
+    /* Linear CFR parameters (retained for API compat, not used by discount) */
+    float alpha;
+    float beta;
+    float gamma;
 
     /* Results */
     int iterations_run;

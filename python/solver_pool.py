@@ -24,11 +24,14 @@ Usage:
 """
 
 import ctypes
+import logging
 import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
 from typing import Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 try:
     from solver import card_to_int, int_to_card, SCALE, MAX_ACTIONS
@@ -38,6 +41,8 @@ except ImportError:
 
 class SolverPool:
     """Thread pool for concurrent poker solver instances."""
+
+    MAX_QUEUE_DEPTH = 64  # reject new requests if queue exceeds this
 
     def __init__(self, max_workers=4, dll_path=None):
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
@@ -85,6 +90,12 @@ class SolverPool:
             request_id (int)
         """
         with self._lock:
+            # Reject if queue is too deep to prevent unbounded memory growth
+            pending = sum(1 for f in self._futures.values() if not f.done())
+            if pending >= self.MAX_QUEUE_DEPTH:
+                raise RuntimeError(
+                    f"Solver queue full ({pending} pending). "
+                    "Wait for results before submitting more requests.")
             request_id = self._next_id
             self._next_id += 1
 
@@ -144,6 +155,17 @@ class SolverPool:
     def _solve_task(self, board, oop_hands, ip_hands,
                     pot, stack, bet_sizes, iterations, target_exploit):
         """Worker function that runs in a thread."""
+        try:
+            return self._solve_task_inner(board, oop_hands, ip_hands,
+                                          pot, stack, bet_sizes, iterations,
+                                          target_exploit)
+        except Exception as e:
+            logger.exception("Solver worker failed: %s", e)
+            return {'error': str(e), 'time_ms': 0}
+
+    def _solve_task_inner(self, board, oop_hands, ip_hands,
+                          pot, stack, bet_sizes, iterations, target_exploit):
+        """Actual solve implementation."""
         lib = self._get_lib()
         t0 = time.time()
 
@@ -205,5 +227,17 @@ class SolverPool:
         }
 
     def shutdown(self):
-        """Shutdown the thread pool."""
+        """Shutdown the thread pool and clean up pending futures."""
+        # Cancel any pending futures
+        with self._lock:
+            for rid, future in list(self._futures.items()):
+                future.cancel()
+            self._futures.clear()
         self._executor.shutdown(wait=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.shutdown()
+        return False
