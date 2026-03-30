@@ -298,17 +298,40 @@ static int info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
                 t->sets[idx].regrets = (int*)arena_alloc(num_actions);
                 t->sets[idx].strategy_sum = NULL;
                 t->keys[idx] = key;
-                __atomic_fetch_add(&t->num_entries, 1, __ATOMIC_RELAXED);
                 __atomic_store_n(&t->occupied[idx], 1, __ATOMIC_RELEASE);
+
+                /* De-dup check: scan backwards from our position to the
+                 * hash start. If the same key was published at an earlier
+                 * slot by another thread, we are the duplicate — return
+                 * the earlier slot and undo our counter increment.
+                 * This prevents split regrets and counter inflation. */
+                for (int p2 = 0; p2 < probe; p2++) {
+                    int idx2 = (slot + p2) % t->table_size;
+                    if (__atomic_load_n(&t->occupied[idx2], __ATOMIC_ACQUIRE) == 1) {
+                        if (key_eq(&t->keys[idx2], &key)) {
+                            /* Earlier copy exists — we're the duplicate.
+                             * Slot is wasted (can't reclaim with linear
+                             * probing) but regrets go to the right place. */
+                            return idx2;
+                        }
+                    }
+                }
+                __atomic_fetch_add(&t->num_entries, 1, __ATOMIC_RELAXED);
                 return idx;
             }
             state = __atomic_load_n(&t->occupied[idx], __ATOMIC_ACQUIRE);
         }
 
         if (state == 2) {
+            /* Another thread is initializing this slot. Spin-wait for it
+             * to finish (state 2 → 1). Use a generous spin count because
+             * the initializer only needs ~100ns (3 memory writes). */
             int spins = 0;
             while (__atomic_load_n(&t->occupied[idx], __ATOMIC_ACQUIRE) == 2) {
-                if (++spins > 10000) break;
+                if (++spins > 1000000) break;  /* ~1ms safety limit */
+                #ifdef __x86_64__
+                __builtin_ia32_pause();  /* reduce contention on HT cores */
+                #endif
             }
             if (__atomic_load_n(&t->occupied[idx], __ATOMIC_ACQUIRE) == 1) {
                 if (key_eq(&t->keys[idx], &key)) return idx;
