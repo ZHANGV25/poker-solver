@@ -170,7 +170,7 @@ INNEREOF
         --key-name "${KEY_NAME:-poker-solver-key}" \
         --security-groups "${SECURITY_GROUP:-poker-solver-sg}" \
         --iam-instance-profile "Name=${PROFILE_NAME:-poker-solver-profile}" \
-        --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":100,"VolumeType":"gp3"}}]' \
+        --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":200,"VolumeType":"gp3"}}]' \
         --instance-market-options '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"one-time"}}' \
         --user-data "$USERDATA_B64" \
         --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=bp-unified-solver},{Key=Project,Value=poker-solver-unified}]" \
@@ -186,7 +186,7 @@ INNEREOF
             --key-name "${KEY_NAME:-poker-solver-key}" \
             --security-groups "${SECURITY_GROUP:-poker-solver-sg}" \
             --iam-instance-profile "Name=${PROFILE_NAME:-poker-solver-profile}" \
-            --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":100,"VolumeType":"gp3"}}]' \
+            --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":200,"VolumeType":"gp3"}}]' \
             --user-data "$USERDATA_B64" \
             --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=bp-unified-solver},{Key=Project,Value=poker-solver-unified}]" \
             --query "Instances[0].InstanceId" \
