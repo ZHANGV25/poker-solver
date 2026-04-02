@@ -84,13 +84,14 @@ typedef struct {
     /* Timing-based thresholds (converted to iteration counts).
      * Pluribus used wall-clock minutes; we convert to iterations
      * based on estimated iterations/minute on the target hardware.
-     * Default: ~1000 iter/min on 64 cores -> 400 min = 400K iters. */
-    int discount_stop_iter;     /* stop Linear CFR discount after this (Pluribus: 400 min) */
-    int discount_interval;      /* apply discount every N iterations (Pluribus: ~10 min) */
-    int prune_start_iter;       /* start pruning after this (Pluribus: 200 min) */
-    int snapshot_start_iter;    /* start saving snapshots after this (Pluribus: 800 min) */
-    int snapshot_interval;      /* save snapshot every N iterations (Pluribus: ~200 min) */
-    int strategy_interval;      /* update round-1 avg strategy every N iters (Pluribus: 10K) */
+     * Uses int64 because full Pluribus-equivalent compute on fast hardware
+     * requires ~100B+ iterations, exceeding INT32_MAX. */
+    int64_t discount_stop_iter;     /* stop Linear CFR discount after this (Pluribus: 400 min) */
+    int64_t discount_interval;      /* apply discount every N iterations (Pluribus: ~10 min) */
+    int64_t prune_start_iter;       /* start pruning after this (Pluribus: 200 min) */
+    int64_t snapshot_start_iter;    /* start saving snapshots after this (Pluribus: 800 min) */
+    int64_t snapshot_interval;      /* save snapshot every N iterations (Pluribus: ~200 min) */
+    int64_t strategy_interval;      /* update round-1 avg strategy every N iters (Pluribus: 10K) */
     int num_threads;            /* OpenMP threads (0 = auto) */
     int hash_table_size;        /* 0 = auto (BP_HASH_SIZE_SMALL or _LARGE based on players) */
     const char *snapshot_dir;   /* directory for strategy snapshots (NULL = no snapshots) */
@@ -158,8 +159,8 @@ typedef struct {
     int num_cached_textures;
 
     /* Stats */
-    int iterations_run;
-    int snapshots_saved;
+    int64_t iterations_run;
+    int64_t snapshots_saved;
 } BPSolver;
 
 /* ── Public API ──────────────────────────────────────────────────────── */

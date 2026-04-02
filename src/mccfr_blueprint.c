@@ -1435,10 +1435,6 @@ int bp_solve(BPSolver *s, int max_iterations) {
     #ifdef _OPENMP
     if (nt > 1) {
         omp_set_num_threads(nt);
-        /* NOTE: traverse() is deeply recursive (~50+ levels, ~400-byte frames).
-         * Requires OMP_STACKSIZE=16m or GOMP_STACKSIZE=16384 env var.
-         * Set this BEFORE running the program, e.g.:
-         *   export OMP_STACKSIZE=16m */
     }
     #endif
 
@@ -1465,17 +1461,17 @@ int bp_solve(BPSolver *s, int max_iterations) {
     /* Resume support: offset all iteration counters by previously completed iters.
      * After bp_load_regrets, iterations_run = saved_iters, so global_iter tracks
      * the cumulative total across checkpoint/resume cycles. */
-    int iter_offset = s->iterations_run;
+    int64_t iter_offset = s->iterations_run;
 
-    int discount_count = 0;
-    int next_discount_at = s->config.discount_interval;
+    int64_t discount_count = 0;
+    int64_t next_discount_at = s->config.discount_interval;
     /* Fast-forward discount_count to match resumed state */
     if (iter_offset > 0 && s->config.discount_interval > 0) {
         discount_count = iter_offset / s->config.discount_interval;
         next_discount_at = (discount_count + 1) * s->config.discount_interval;
     }
-    int batch_size = s->config.discount_interval;
-    if (batch_size <= 0) batch_size = max_iterations;
+    int batch_size = (int)s->config.discount_interval;
+    if (batch_size <= 0 || batch_size > max_iterations) batch_size = max_iterations;
     int num_batches = (max_iterations + batch_size - 1) / batch_size;
 
     #ifdef _OPENMP
@@ -1499,8 +1495,8 @@ int bp_solve(BPSolver *s, int max_iterations) {
             #pragma omp for schedule(dynamic, 64)
             #endif
             for (int iter = batch_start; iter <= batch_end; iter++) {
-                int global_iter = iter + iter_offset;
-                int traverser = (global_iter - 1) % NP;
+                int64_t global_iter = (int64_t)iter + iter_offset;
+                int traverser = (int)((global_iter - 1) % NP);
 
                 int use_pruning = 0;
                 if (global_iter > s->config.prune_start_iter) {
@@ -1597,8 +1593,8 @@ int bp_solve(BPSolver *s, int max_iterations) {
                         #else
                         double elapsed = (double)(clock() - t_start) / CLOCKS_PER_SEC;
                         #endif
-                        printf("[BP] iter %d/%d (global %d), info sets: %d, %.1fs\n",
-                               iter, max_iterations, global_iter, s->info_table.num_entries, elapsed);
+                        printf("[BP] iter %d/%d (global %lld), info sets: %d, %.1fs\n",
+                               iter, max_iterations, (long long)global_iter, s->info_table.num_entries, elapsed);
                         fflush(stdout);
                     }
                 }
@@ -1612,7 +1608,7 @@ int bp_solve(BPSolver *s, int max_iterations) {
             #endif
             {
                 /* Linear CFR discount: d = T/(T+1) every interval */
-                int global_batch_end = batch_end + iter_offset;
+                int64_t global_batch_end = (int64_t)batch_end + iter_offset;
                 if (global_batch_end <= s->config.discount_stop_iter &&
                     global_batch_end >= next_discount_at) {
                     discount_count++;
@@ -1620,8 +1616,8 @@ int bp_solve(BPSolver *s, int max_iterations) {
                     float discount = t_val / (t_val + 1.0f);
                     apply_discount(&s->info_table, discount);
                     next_discount_at = (discount_count + 1) * s->config.discount_interval;
-                    printf("[BP] Applied Linear CFR discount #%d: d=%.4f at iter %d\n",
-                           discount_count, discount, global_batch_end);
+                    printf("[BP] Applied Linear CFR discount #%lld: d=%.4f at iter %lld\n",
+                           (long long)discount_count, discount, (long long)global_batch_end);
                 }
 
                 /* Strategy snapshots for rounds 2-4 */
@@ -1630,8 +1626,8 @@ int bp_solve(BPSolver *s, int max_iterations) {
                     (global_batch_end % s->config.snapshot_interval) < batch_size) {
                     accumulate_snapshot(&s->info_table);
                     s->snapshots_saved++;
-                    printf("[BP] Accumulated strategy snapshot #%d at iter %d\n",
-                           s->snapshots_saved, global_batch_end);
+                    printf("[BP] Accumulated strategy snapshot #%lld at iter %lld\n",
+                           (long long)s->snapshots_saved, (long long)global_batch_end);
                 }
             }
             /* implicit barrier after omp single */
@@ -1645,7 +1641,7 @@ int bp_solve(BPSolver *s, int max_iterations) {
     #endif
     printf("[BP] Done: %d iterations, %d info sets, %.1fs (%.0f iter/s)\n",
            max_iterations, s->info_table.num_entries, total_time,
-           max_iterations / total_time);
+           (double)max_iterations / total_time);
 
     return 0;
 }
@@ -1713,11 +1709,12 @@ int bp_save_regrets(const BPSolver *s, const char *path) {
 
     const BPInfoTable *t = &s->info_table;
 
-    /* Header: "BPR2" = bucket-in-key format v2 */
-    fwrite("BPR2", 1, 4, f);
+    /* Header: "BPR3" = bucket-in-key format v3 (int64 iterations) */
+    fwrite("BPR3", 1, 4, f);
     fwrite(&t->table_size, sizeof(int), 1, f);
     fwrite(&t->num_entries, sizeof(int), 1, f);
-    fwrite(&s->iterations_run, sizeof(int), 1, f);
+    int64_t iters64 = s->iterations_run;
+    fwrite(&iters64, sizeof(int64_t), 1, f);
 
     /* Entries — each info set has bucket in key, regrets[num_actions] only */
     int written = 0;
@@ -1755,19 +1752,27 @@ int bp_load_regrets(BPSolver *s, const char *path) {
     /* Header */
     char magic[4];
     fread(magic, 1, 4, f);
-    if (memcmp(magic, "BPR2", 4) != 0) {
-        printf("[BP] ERROR: expected BPR2 format, got %.4s\n", magic);
+    int is_v3 = (memcmp(magic, "BPR3", 4) == 0);
+    int is_v2 = (memcmp(magic, "BPR2", 4) == 0);
+    if (!is_v3 && !is_v2) {
+        printf("[BP] ERROR: expected BPR2/BPR3 format, got %.4s\n", magic);
         fclose(f);
         return -1;
     }
 
-    int saved_table_size, saved_entries, saved_iters;
+    int saved_table_size, saved_entries;
+    int64_t saved_iters;
     fread(&saved_table_size, sizeof(int), 1, f);
     fread(&saved_entries, sizeof(int), 1, f);
-    fread(&saved_iters, sizeof(int), 1, f);
+    if (is_v3) {
+        fread(&saved_iters, sizeof(int64_t), 1, f);
+    } else {
+        int iters32; fread(&iters32, sizeof(int), 1, f);
+        saved_iters = (int64_t)iters32;
+    }
 
-    printf("[BP] Loading checkpoint: %d info sets, %d iterations\n",
-           saved_entries, saved_iters);
+    printf("[BP] Loading checkpoint: %d info sets, %lld iterations\n",
+           saved_entries, (long long)saved_iters);
 
     BPInfoTable *t = &s->info_table;
     int loaded = 0;

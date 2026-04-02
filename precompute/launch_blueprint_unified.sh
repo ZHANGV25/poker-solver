@@ -149,7 +149,7 @@ python3 precompute/blueprint_worker_unified.py \
     --hash-size $HASH_SIZE \
     --output-dir /opt/blueprint_unified \
     --s3-bucket $S3_BUCKET \
-    --checkpoint-interval 1000000 \
+    --checkpoint-interval 500000000 \
     --build-dir build \
     --resume
 

@@ -51,12 +51,12 @@ POSTFLOP_BET_SIZES = [0.5, 1.0, 2.0]       # Pluribus: 0.5x pot, pot, all-in (�
 
 class BPConfig(ctypes.Structure):
     _fields_ = [
-        ("discount_stop_iter", ctypes.c_int),
-        ("discount_interval", ctypes.c_int),
-        ("prune_start_iter", ctypes.c_int),
-        ("snapshot_start_iter", ctypes.c_int),
-        ("snapshot_interval", ctypes.c_int),
-        ("strategy_interval", ctypes.c_int),
+        ("discount_stop_iter", ctypes.c_int64),
+        ("discount_interval", ctypes.c_int64),
+        ("prune_start_iter", ctypes.c_int64),
+        ("snapshot_start_iter", ctypes.c_int64),
+        ("snapshot_interval", ctypes.c_int64),
+        ("strategy_interval", ctypes.c_int64),
         ("num_threads", ctypes.c_int),
         ("hash_table_size", ctypes.c_int),
         ("snapshot_dir", ctypes.c_char_p),
@@ -132,34 +132,29 @@ def main():
     if args.hash_size > 0:
         config.hash_table_size = args.hash_size
 
-    # If running by time limit, estimate iterations.
-    # The iteration estimate determines Pluribus timing thresholds (discount,
-    # pruning, snapshots) as proportions of total iterations. Getting this
-    # right is critical — overestimating causes thresholds to fire too late.
-    #
-    # Observed throughput: ~2300 iter/s on 96 threads including checkpoint
-    # overhead (~24 iter/s per thread). Burst solving speed (~290K iter/s)
-    # is much higher but checkpoint saves every 1M iters add ~10s overhead.
+    # If running by time limit, estimate iterations based on Pluribus core-hours.
+    # Pluribus: 12,400 core-hours on 64 cores. We match total core-hours.
+    # Burst throughput is ~280K iter/s (pruned) / ~140K (unpruned), average ~200K.
+    # With large checkpoint intervals, overhead is negligible.
     if args.time_limit_hours > 0 and args.iterations == 0:
         effective_threads = args.num_threads if args.num_threads > 0 else (os.cpu_count() or 1)
-        # Use observed throughput: ~24 iter/s/thread (includes checkpoint overhead)
-        est_iter_per_sec = effective_threads * 24
-        args.iterations = int(args.time_limit_hours * 3600 * est_iter_per_sec)
-        print(f"Time limit: {args.time_limit_hours}h, {effective_threads} threads, "
-              f"~{est_iter_per_sec} iter/s → estimated {args.iterations:,} iterations")
+        # Target: Pluribus's 12,400 core-hours scaled to our core count
+        target_hours = 12400 / effective_threads  # wall-clock hours of solving
+        # Use conservative average throughput (mix of pruned/unpruned phases)
+        est_iter_per_sec = 200000  # ~200K iter/s on 96 threads
+        args.iterations = int(target_hours * 3600 * est_iter_per_sec)
+        print(f"Target: {12400} core-hours / {effective_threads} cores = {target_hours:.1f}h solving")
+        print(f"Estimated throughput: ~{est_iter_per_sec:,} iter/s → {args.iterations:,} iterations")
 
     if args.iterations <= 0:
         args.iterations = 1000000  # default 1M
 
-    # Scale Pluribus timing parameters proportionally.
-    # Cap all at INT32_MAX to prevent ctypes c_int overflow — with 72 threads
-    # the iteration estimate can exceed 13B, and 13B * 0.17 > INT32_MAX.
-    INT32_MAX = 2_147_483_647
-    config.discount_stop_iter = min(max(args.iterations * 35 // 1000, 1000), INT32_MAX)
-    config.discount_interval = min(max(config.discount_stop_iter // 40, 100), INT32_MAX)
-    config.prune_start_iter = min(max(args.iterations * 17 // 1000, 500), INT32_MAX)
-    config.snapshot_start_iter = min(max(args.iterations * 7 // 100, 10000), INT32_MAX)
-    config.snapshot_interval = min(max(args.iterations * 17 // 1000, 5000), INT32_MAX)
+    # Scale Pluribus timing parameters proportionally (int64, no overflow concern).
+    config.discount_stop_iter = max(args.iterations * 35 // 1000, 1000)
+    config.discount_interval = max(config.discount_stop_iter // 40, 100)
+    config.prune_start_iter = max(args.iterations * 17 // 1000, 500)
+    config.snapshot_start_iter = max(args.iterations * 7 // 100, 10000)
+    config.snapshot_interval = max(args.iterations * 17 // 1000, 5000)
     config.strategy_interval = 10000  # Pluribus: every 10K iterations
 
     print(f"Iterations: {args.iterations:,}")
