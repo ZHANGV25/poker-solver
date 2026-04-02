@@ -260,13 +260,23 @@ def main():
 
     t0 = time.time()
 
+    # bp_solve takes int32 max_iterations. If chunk_size > INT32_MAX,
+    # split into sub-chunks for the C call but only checkpoint at chunk_size boundaries.
+    INT32_MAX = 2_147_483_647
+    sub_chunk_max = min(chunk_size, INT32_MAX)
+    next_checkpoint_at = iters_done + chunk_size
+
     while iters_done < total_iters:
-        this_chunk = min(chunk_size, total_iters - iters_done)
-        print(f"[Solve] Starting chunk: {this_chunk:,} iters from {iters_done:,}...",
-              flush=True)
-        ret = bp_lib.bp_solve(solver, this_chunk)
-        print(f"[Solve] bp_solve returned {ret}", flush=True)
-        iters_done += this_chunk
+        # Solve up to the next checkpoint boundary, in int32-safe sub-chunks
+        iters_this_checkpoint = min(next_checkpoint_at, total_iters) - iters_done
+        while iters_this_checkpoint > 0:
+            call_size = min(iters_this_checkpoint, sub_chunk_max)
+            print(f"[Solve] {call_size:,} iters from {iters_done:,}...", flush=True)
+            ret = bp_lib.bp_solve(solver, call_size)
+            if ret != 0:
+                print(f"[Solve] bp_solve returned {ret}", flush=True)
+            iters_done += call_size
+            iters_this_checkpoint -= call_size
 
         elapsed = time.time() - t0
         n_is = bp_lib.bp_num_info_sets(solver)
@@ -279,6 +289,8 @@ def main():
         # Export checkpoint
         if args.output_dir:
             _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is)
+
+        next_checkpoint_at = iters_done + chunk_size
 
     elapsed = time.time() - t0
     n_is = bp_lib.bp_num_info_sets(solver)
