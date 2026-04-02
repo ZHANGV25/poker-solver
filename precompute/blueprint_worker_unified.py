@@ -74,8 +74,10 @@ def load_bp_dll(build_dir):
             bp.bp_init_unified.restype = ctypes.c_int
             bp.bp_set_buckets.restype = ctypes.c_int
             bp.bp_solve.restype = ctypes.c_int
+            bp.bp_solve.argtypes = [ctypes.c_void_p, ctypes.c_int]
             bp.bp_get_strategy.restype = ctypes.c_int
             bp.bp_num_info_sets.restype = ctypes.c_int
+            bp.bp_num_info_sets.argtypes = [ctypes.c_void_p]
             bp.bp_export_strategies.restype = ctypes.c_int
             bp.bp_export_strategies.argtypes = [
                 ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
@@ -271,8 +273,10 @@ def main():
         iters_this_checkpoint = min(next_checkpoint_at, total_iters) - iters_done
         while iters_this_checkpoint > 0:
             call_size = min(iters_this_checkpoint, sub_chunk_max)
-            print(f"[Solve] {call_size:,} iters from {iters_done:,}...", flush=True)
-            ret = bp_lib.bp_solve(solver, call_size)
+            assert call_size <= 2_147_483_647, f"call_size {call_size} exceeds INT32_MAX!"
+            call_size_int = int(call_size)  # ensure native int, not numpy or other type
+            print(f"[Solve] {call_size_int:,} iters from {iters_done:,}...", flush=True)
+            ret = bp_lib.bp_solve(solver, ctypes.c_int(call_size_int))
             if ret != 0:
                 print(f"[Solve] bp_solve returned {ret}", flush=True)
             iters_done += call_size
