@@ -1472,7 +1472,7 @@ int bp_solve(BPSolver *s, int max_iterations) {
     }
     int batch_size = (int)s->config.discount_interval;
     if (batch_size <= 0 || batch_size > max_iterations) batch_size = max_iterations;
-    int num_batches = (max_iterations + batch_size - 1) / batch_size;
+    int num_batches = (int)(((int64_t)max_iterations + batch_size - 1) / batch_size);
 
     #ifdef _OPENMP
     #pragma omp parallel if(nt > 1)
