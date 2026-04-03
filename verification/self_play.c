@@ -218,13 +218,15 @@ static int *ht_occupied;
 static int ht_count = 0;
 static int ht_actual_size;
 
+/* Forward declaration — defined below with other hash functions */
+static uint64_t hash_combine(uint64_t a, uint64_t b);
+
 static uint64_t hash_key(InfoKey k) {
-    uint64_t h = 14695981039346656037ULL;
-    h ^= (uint64_t)k.player; h *= 1099511628211ULL;
-    h ^= (uint64_t)k.street; h *= 1099511628211ULL;
-    h ^= (uint64_t)k.bucket; h *= 1099511628211ULL;
-    h ^= k.board_hash; h *= 1099511628211ULL;
-    h ^= k.action_hash; h *= 1099511628211ULL;
+    /* Match mccfr_blueprint.c info_table hash: hash_combine chain */
+    uint64_t h = hash_combine(k.board_hash, k.action_hash);
+    h = hash_combine(h, (uint64_t)k.player);
+    h = hash_combine(h, (uint64_t)k.street);
+    h = hash_combine(h, (uint64_t)k.bucket);
     return h;
 }
 
@@ -363,31 +365,109 @@ static int sample_action(const float *strat, int na) {
     return na - 1;
 }
 
-/* ── Board hash (simple canonical hash for matching checkpoint) ──── */
+/* ── Hash functions (must match mccfr_blueprint.c exactly) ────────── */
+
+static uint64_t hash_combine(uint64_t a, uint64_t b) {
+    a ^= b + 0x9e3779b97f4a7c15ULL + (a << 6) + (a >> 2);
+    return a;
+}
 
 static uint64_t compute_board_hash(const int *board, int n) {
-    /* FNV-1a style hash of sorted board cards */
-    int sorted[5];
-    for (int i = 0; i < n; i++) sorted[i] = board[i];
-    for (int i = 1; i < n; i++) {
-        int key = sorted[i]; int j = i - 1;
-        while (j >= 0 && sorted[j] > key) { sorted[j+1] = sorted[j]; j--; }
-        sorted[j+1] = key;
-    }
-    uint64_t h = 14695981039346656037ULL;
-    for (int i = 0; i < n; i++) {
-        h ^= (uint64_t)sorted[i];
-        h *= 1099511628211ULL;
-    }
+    uint64_t h = 0x123456789ABCDEFULL;
+    for (int i = 0; i < n; i++)
+        h = hash_combine(h, (uint64_t)board[i] * 31 + 7);
     return h;
 }
 
-/* ── Action hash (encode action sequence) ────────────────────────── */
+/* Canonicalize board for suit-isomorphic info set hashing.
+ * Ported from mccfr_blueprint.c:canonicalize_board(). */
+static void canonicalize_board(const int *board, int num_board, int *canon_out) {
+    if (num_board == 0) return;
 
-static uint64_t extend_action_hash(uint64_t ah, int action) {
-    ah ^= (uint64_t)(action + 1);
-    ah *= 1099511628211ULL;
-    return ah;
+    int sorted[3], canon_flop[3];
+    int suit_map[4] = {-1, -1, -1, -1};
+
+    /* Sort flop cards by rank descending */
+    for (int i = 0; i < 3 && i < num_board; i++) sorted[i] = board[i];
+    for (int a = 0; a < 2; a++)
+        for (int b = a+1; b < 3; b++)
+            if ((sorted[a]>>2) < (sorted[b]>>2)) {
+                int tmp = sorted[a]; sorted[a] = sorted[b]; sorted[b] = tmp;
+            }
+
+    int r0 = sorted[0]>>2, r1 = sorted[1]>>2, r2 = sorted[2]>>2;
+    int s0 = sorted[0]&3, s1 = sorted[1]&3, s2 = sorted[2]&3;
+
+    if (r0 == r1 && r1 == r2) {
+        canon_flop[0] = r0*4+3; canon_flop[1] = r1*4+2; canon_flop[2] = r2*4+1;
+    } else if (r0 == r1 || r1 == r2) {
+        if (r0 == r1) {
+            if (s2 == s0 || s2 == s1) {
+                canon_flop[0] = r0*4+3; canon_flop[1] = r1*4+2; canon_flop[2] = r2*4+3;
+            } else {
+                canon_flop[0] = r0*4+3; canon_flop[1] = r1*4+2; canon_flop[2] = r2*4+1;
+            }
+        } else {
+            if (s0 == s1 || s0 == s2) {
+                canon_flop[0] = r0*4+3; canon_flop[1] = r1*4+3; canon_flop[2] = r2*4+2;
+            } else {
+                canon_flop[0] = r0*4+3; canon_flop[1] = r1*4+2; canon_flop[2] = r2*4+1;
+            }
+        }
+    } else {
+        if (s0 == s1 && s1 == s2) {
+            canon_flop[0] = r0*4+3; canon_flop[1] = r1*4+3; canon_flop[2] = r2*4+3;
+        } else if (s0 == s1) {
+            canon_flop[0] = r0*4+3; canon_flop[1] = r1*4+3; canon_flop[2] = r2*4+2;
+        } else if (s0 == s2) {
+            canon_flop[0] = r0*4+3; canon_flop[1] = r1*4+2; canon_flop[2] = r2*4+3;
+        } else if (s1 == s2) {
+            canon_flop[0] = r0*4+2; canon_flop[1] = r1*4+3; canon_flop[2] = r2*4+3;
+        } else {
+            canon_flop[0] = r0*4+3; canon_flop[1] = r1*4+2; canon_flop[2] = r2*4+1;
+        }
+    }
+
+    /* Build suit mapping from sorted actual -> canonical */
+    for (int i = 0; i < 3; i++) {
+        int as = sorted[i] & 3;
+        int cs = canon_flop[i] & 3;
+        if (suit_map[as] == -1) suit_map[as] = cs;
+    }
+    int nc = 0;
+    for (int i = 0; i < 4; i++) {
+        if (suit_map[i] == -1) {
+            while (nc < 4) {
+                int used = 0;
+                for (int j = 0; j < 4; j++)
+                    if (suit_map[j] == nc) { used = 1; break; }
+                if (!used) break;
+                nc++;
+            }
+            if (nc < 4) suit_map[i] = nc++;
+            else suit_map[i] = 0;
+        }
+    }
+
+    for (int i = 0; i < 3 && i < num_board; i++)
+        canon_out[i] = canon_flop[i];
+    for (int i = 3; i < num_board; i++) {
+        int rank = board[i] >> 2;
+        int suit = board[i] & 3;
+        canon_out[i] = rank * 4 + suit_map[suit];
+    }
+}
+
+/* ── Action hash (must match mccfr_blueprint.c:compute_action_hash) ─ */
+
+static int action_history[256];
+static int action_history_len = 0;
+
+static uint64_t compute_action_hash(const int *actions, int num_actions) {
+    uint64_t h = 0xFEDCBA9876543210ULL;
+    for (int i = 0; i < num_actions; i++)
+        h = hash_combine(h, (uint64_t)actions[i] * 17 + 3);
+    return h;
 }
 
 /* ── Game simulation ─────────────────────────────────────────────── */
@@ -454,13 +534,21 @@ static void simulate_hand(SimStats *stats, int ehs_samples) {
     int streets[] = {0, 1, 2, 3}; /* preflop, flop, turn, river */
     int board_cards_per_street[] = {0, 3, 4, 5};
 
+    action_history_len = 0;
     uint64_t action_hash = ROOT_ACTION_HASH;
     int first_bet_happened = 0;
 
     for (int si = 0; si < 4; si++) {
         int street = streets[si];
         int num_board = board_cards_per_street[si];
-        uint64_t board_hash = (num_board > 0) ? compute_board_hash(board, num_board) : 0;
+        uint64_t board_hash;
+        if (num_board > 0) {
+            int canon[5];
+            canonicalize_board(board, num_board, canon);
+            board_hash = compute_board_hash(canon, num_board);
+        } else {
+            board_hash = 0;
+        }
 
         int *order = (street == 0) ? preflop_order : postflop_order;
 
@@ -583,7 +671,9 @@ static void simulate_hand(SimStats *stats, int ehs_samples) {
                 }
             }
 
-            action_hash = extend_action_hash(action_hash, action_type);
+            if (action_history_len < 256)
+                action_history[action_history_len++] = action_type;
+            action_hash = compute_action_hash(action_history, action_history_len);
             actions_taken++;
 
             if (active_players <= 1) break;
@@ -631,8 +721,9 @@ static void simulate_hand(SimStats *stats, int ehs_samples) {
         }
 
         int share = pot / n_winners;
+        int remainder = pot - share * n_winners;
         for (int w = 0; w < n_winners; w++) {
-            winner_share[winners[w]] = share;
+            winner_share[winners[w]] = share + (w == 0 ? remainder : 0);
             stats->hands_won[winners[w]]++;
         }
     }

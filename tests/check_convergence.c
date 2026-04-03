@@ -211,7 +211,7 @@ int main(int argc, char **argv) {
         }
     }
     for (int r = 0; r < n_roots; r++) {
-        if (preflop_roots[r].bucket == 168) {
+        if (preflop_roots[r].bucket == 167) {
             regret_match(preflop_roots[r].regrets, strat, preflop_roots[r].na);
             int folds = strat[0] > 0.5f;
             printf("  32o (%s): %s (fold=%.2f)\n", POS_NAMES[preflop_roots[r].player],

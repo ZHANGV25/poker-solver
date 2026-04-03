@@ -50,18 +50,21 @@ def generate_preflop_regrets(bucket, position):
     # QQ (bucket 48)
     elif bucket == 48:
         return [-500000, 200000, 800000, 1000000]
-    # 72o (bucket 167): fold a lot, especially from early position
-    elif bucket == 167:
+    # 72o (bucket 143): fold a lot, especially from early position
+    elif bucket == 143:
         if position <= 3:  # UTG, MP, CO, SB
             return [3000000, -500000, -800000, -1000000]
         else:  # BTN, BB
             return [1000000, 200000, -200000, -500000]
-    # 32o (bucket 168)
-    elif bucket == 168:
+    # 32o (bucket 167)
+    elif bucket == 167:
         if position <= 3:
             return [3500000, -600000, -900000, -1100000]
         else:
             return [1200000, 100000, -300000, -600000]
+    # 22 (bucket 168) — pocket pair, should not fold
+    elif bucket == 168:
+        return [-200000, 500000, 400000, 300000]
     # Pocket pairs on BTN: moderate, don't fold much
     elif bucket in PAIR_BUCKETS:
         if position == 5:  # BTN
@@ -85,7 +88,7 @@ def generate_checkpoint(path, num_iters=5000000000, num_extra_entries=5000):
 
     # 1. Preflop root entries for all positions and key buckets
     key_buckets = [0, 1, 2, 3, 4, 5, 10, 25, 48, 69, 84, 88, 105,
-                   120, 133, 144, 150, 153, 160, 165, 166, 167, 168]
+                   120, 133, 143, 144, 150, 153, 160, 165, 166, 167, 168]
     for pos in range(6):
         for bkt in key_buckets:
             regrets = generate_preflop_regrets(bkt, pos)

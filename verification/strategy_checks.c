@@ -113,7 +113,7 @@ int main(int argc, char **argv) {
     /* 1. AA (bucket 0) fold per position at root */
     FoldAccum aa_fold[6] = {{0}};
 
-    /* 2. 72o (bucket 167) fold per position at root */
+    /* 2. 72o (bucket 143) fold per position at root */
     FoldAccum sevtwo_fold[6] = {{0}};
 
     /* 3. Pocket pairs fold from BTN at root */
@@ -181,7 +181,7 @@ int main(int argc, char **argv) {
             }
 
             /* 72o fold */
-            if (bucket == 167) {
+            if (bucket == 143) {
                 sevtwo_fold[player].count++;
                 sevtwo_fold[player].fold_sum += fold_p;
             }
