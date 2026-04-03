@@ -569,6 +569,7 @@ static float eval_showdown_n(BPSolver *s, const int *board,
                               int traverser, const int *active,
                               const int *sampled_hands, int pot,
                               const int *invested) {
+    int NP = s->num_players;
     int th = sampled_hands[traverser];
     int tc0 = s->hands[traverser][th][0];
     int tc1 = s->hands[traverser][th][1];
@@ -576,34 +577,113 @@ static float eval_showdown_n(BPSolver *s, const int *board,
     if (card_in_set(tc0, board, 5) || card_in_set(tc1, board, 5))
         return 0;
 
-    int cards_t[7] = {board[0], board[1], board[2], board[3], board[4], tc0, tc1};
-    uint32_t trav_str = eval7(cards_t);
+    /* Evaluate all active players' hands */
+    uint32_t strength[BP_MAX_PLAYERS];
+    int valid[BP_MAX_PLAYERS];  /* 1 if hand is valid (no card conflicts) */
+    int cards[7];
+    cards[0] = board[0]; cards[1] = board[1]; cards[2] = board[2];
+    cards[3] = board[3]; cards[4] = board[4];
 
-    int n_tied = 1;
-    int trav_wins = 1;
-
-    for (int p = 0; p < s->num_players; p++) {
-        if (p == traverser || !active[p]) continue;
+    for (int p = 0; p < NP; p++) {
+        valid[p] = 0;
+        if (!active[p]) continue;
         int oh = sampled_hands[p];
         int oc0 = s->hands[p][oh][0], oc1 = s->hands[p][oh][1];
-
-        if (cards_conflict(tc0, tc1, oc0, oc1) ||
-            card_in_set(oc0, board, 5) || card_in_set(oc1, board, 5))
+        if (p != traverser && (cards_conflict(tc0, tc1, oc0, oc1) ||
+            card_in_set(oc0, board, 5) || card_in_set(oc1, board, 5)))
             continue;
+        cards[5] = oc0; cards[6] = oc1;
+        strength[p] = eval7(cards);
+        valid[p] = 1;
+    }
+    /* Traverser always valid */
+    cards[5] = tc0; cards[6] = tc1;
+    strength[traverser] = eval7(cards);
+    valid[traverser] = 1;
 
-        int cards_o[7] = {board[0], board[1], board[2], board[3], board[4], oc0, oc1};
-        uint32_t opp_str = eval7(cards_o);
-
-        if (opp_str > trav_str) { trav_wins = 0; break; }
-        else if (opp_str == trav_str) n_tied++;
+    /* Side pot calculation: sort unique investment levels, compute each
+     * pot layer, award to the best hand among eligible players.
+     * Eligible = active AND invested >= this layer's threshold. */
+    int levels[BP_MAX_PLAYERS];
+    int n_levels = 0;
+    for (int p = 0; p < NP; p++) {
+        if (!active[p] || !valid[p]) continue;
+        /* Insert invested[p] into sorted unique levels */
+        int inv = invested[p];
+        int found = 0;
+        for (int i = 0; i < n_levels; i++)
+            if (levels[i] == inv) { found = 1; break; }
+        if (!found) {
+            int pos = n_levels;
+            for (int i = 0; i < n_levels; i++)
+                if (inv < levels[i]) { pos = i; break; }
+            for (int i = n_levels; i > pos; i--) levels[i] = levels[i-1];
+            levels[pos] = inv;
+            n_levels++;
+        }
     }
 
-    /* Payoff: profit relative to TOTAL investment across all streets */
-    if (!trav_wins) {
-        return -(float)invested[traverser];
-    } else {
+    /* If all players invested equally (common case), skip side pot logic */
+    if (n_levels <= 1) {
+        int n_tied = 0;
+        int trav_wins = 1;
+        for (int p = 0; p < NP; p++) {
+            if (!active[p] || !valid[p]) continue;
+            if (strength[p] > strength[traverser]) { trav_wins = 0; }
+            if (strength[p] == strength[traverser]) n_tied++;
+        }
+        if (!trav_wins)
+            return -(float)invested[traverser];
         return (float)pot / (float)n_tied - (float)invested[traverser];
     }
+
+    /* Side pots: for each investment level, compute the pot layer and
+     * award it to the best hand among players who invested at least that much */
+    float trav_winnings = 0;
+    int prev_level = 0;
+    for (int li = 0; li < n_levels; li++) {
+        int level = levels[li];
+        int layer_per_player = level - prev_level;
+        if (layer_per_player <= 0) continue;
+
+        /* Count contributors and find winner(s) for this layer */
+        int layer_pot = 0;
+        uint32_t best = 0;
+        int n_eligible = 0;
+        for (int p = 0; p < NP; p++) {
+            /* All active players who invested >= level contribute */
+            if (invested[p] >= level) {
+                layer_pot += layer_per_player;
+            }
+            /* Only valid active players are eligible to win */
+            if (active[p] && valid[p] && invested[p] >= level) {
+                if (strength[p] > best) best = strength[p];
+                n_eligible++;
+            }
+        }
+        /* Also count folded players' contributions to this layer */
+        for (int p = 0; p < NP; p++) {
+            if (!active[p] && invested[p] > prev_level) {
+                int contrib = invested[p] - prev_level;
+                if (contrib > layer_per_player) contrib = layer_per_player;
+                layer_pot += contrib;
+            }
+        }
+
+        /* Award to winner(s) */
+        if (n_eligible > 0 && strength[traverser] == best &&
+            active[traverser] && valid[traverser] && invested[traverser] >= level) {
+            int n_winners = 0;
+            for (int p = 0; p < NP; p++)
+                if (active[p] && valid[p] && invested[p] >= level && strength[p] == best)
+                    n_winners++;
+            trav_winnings += (float)layer_pot / (float)n_winners;
+        }
+
+        prev_level = level;
+    }
+
+    return trav_winnings - (float)invested[traverser];
 }
 
 /* ── Main traversal ──────────────────────────────────────────────── */
