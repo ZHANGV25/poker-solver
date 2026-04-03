@@ -43,6 +43,7 @@
 
 /* Pluribus-matched constants */
 #define BP_REGRET_FLOOR      (-310000000)   /* minimum regret per action */
+#define BP_REGRET_CEILING     310000000     /* maximum regret per action (prevents int32 overflow) */
 #define BP_PRUNE_THRESHOLD   (-300000000)   /* skip actions below this */
 #define BP_PRUNE_PROB        0.95f          /* fraction of iters that prune */
 

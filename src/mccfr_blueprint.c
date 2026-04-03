@@ -570,6 +570,11 @@ static float eval_showdown_n(BPSolver *s, const int *board,
                               const int *sampled_hands, int pot,
                               const int *invested) {
     int NP = s->num_players;
+
+    /* If the traverser folded, they can't win anything at showdown. */
+    if (!active[traverser])
+        return -(float)invested[traverser];
+
     int th = sampled_hands[traverser];
     int tc0 = s->hands[traverser][th][0];
     int tc1 = s->hands[traverser][th][1];
@@ -596,7 +601,7 @@ static float eval_showdown_n(BPSolver *s, const int *board,
         strength[p] = eval7(cards);
         valid[p] = 1;
     }
-    /* Traverser always valid */
+    /* Traverser is active (checked above), evaluate their hand */
     cards[5] = tc0; cards[6] = tc1;
     strength[traverser] = eval7(cards);
     valid[traverser] = 1;
@@ -1043,12 +1048,19 @@ static float traverse(TraversalState *ts, int acting_order_idx,
         }
 
         /* Update integer regrets (Hogwild: no lock needed).
-         * With bucket-in-key, regrets is flat [num_actions]. */
+         * With bucket-in-key, regrets is flat [num_actions].
+         * Clamp delta to prevent int32 overflow (UB in C), then
+         * clamp result to [REGRET_FLOOR, REGRET_CEILING]. */
         for (int a = 0; a < na; a++) {
-            int delta = (int)((action_values[a] - node_value) * 10.0f);
-            is->regrets[a] += delta;
-            if (is->regrets[a] < BP_REGRET_FLOOR)
-                is->regrets[a] = BP_REGRET_FLOOR;
+            float raw_delta = (action_values[a] - node_value) * 10.0f;
+            int delta;
+            if (raw_delta > 2e9f) delta = (int)2e9;
+            else if (raw_delta < -2e9f) delta = (int)-2e9;
+            else delta = (int)raw_delta;
+            int64_t tmp = (int64_t)is->regrets[a] + (int64_t)delta;
+            if (tmp < BP_REGRET_FLOOR) is->regrets[a] = BP_REGRET_FLOOR;
+            else if (tmp > BP_REGRET_CEILING) is->regrets[a] = BP_REGRET_CEILING;
+            else is->regrets[a] = (int)tmp;
         }
 
         /* Strategy sum: only for preflop (street == 0) in unified mode,
