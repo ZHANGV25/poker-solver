@@ -356,25 +356,27 @@ static int info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
     return -1;
 }
 
-/* Allocate strategy_sum for an info set (lazy, for round 1 only) */
+/* Allocate strategy_sum for an info set (lazy, for round 1 only).
+ * Uses arena allocator (same as regrets) to avoid billions of small
+ * heap callocs that cause fragmentation and interact poorly with
+ * glibc's thread-local arenas under high concurrency. Arena memory
+ * is zeroed (calloc'd chunks), so float 0.0f is correct (IEEE 754). */
 static void ensure_strategy_sum(BPInfoSet *is) {
     if (__atomic_load_n((void**)&is->strategy_sum, __ATOMIC_ACQUIRE) == NULL) {
-        float *buf = (float*)calloc(is->num_actions, sizeof(float));
+        float *buf = (float*)arena_alloc(is->num_actions);
+        if (!buf) return;
         float *expected = NULL;
         if (!__atomic_compare_exchange_n(&is->strategy_sum, &expected, buf,
                                           0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-            free(buf);
+            /* CAS lost — buf is wasted arena space (can't free individually).
+             * This is rare (only on concurrent first access) and each waste
+             * is ≤32 bytes. Acceptable trade-off vs heap corruption risk. */
         }
     }
 }
 
 static void info_table_free(BPInfoTable *t) {
-    /* strategy_sum uses individual malloc (lazy, preflop only) */
-    for (int i = 0; i < t->table_size; i++) {
-        if (t->occupied[i] && t->sets[i].strategy_sum)
-            free(t->sets[i].strategy_sum);
-    }
-    /* regrets are arena-allocated — freed in bulk */
+    /* Both regrets and strategy_sum are arena-allocated — freed in bulk */
     arena_free_all();
     free(t->keys);
     free(t->sets);
@@ -990,6 +992,12 @@ static float traverse(TraversalState *ts, int acting_order_idx,
     if (is_slot < 0) return 0;
     BPInfoSet *is = &s->info_table.sets[is_slot];
 
+    /* Guard: if hash collision causes action count mismatch, use stored count
+     * to prevent buffer overflow on regrets (arena) and strategy_sum (heap). */
+    if (na != is->num_actions) {
+        na = is->num_actions;
+    }
+
     /* Regret matching */
     float strategy[BP_MAX_ACTIONS];
     regret_match(is->regrets, strategy, na);
@@ -1127,11 +1135,9 @@ static void accumulate_snapshot(BPInfoTable *t) {
         int na = is->num_actions;
 
         if (!is->strategy_sum) {
-            float *buf = (float*)calloc(na, sizeof(float));
-            float *expected = NULL;
-            if (!__atomic_compare_exchange_n(&is->strategy_sum, &expected, buf,
-                                              0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-                free(buf);
+            float *buf = (float*)arena_alloc(na);
+            if (buf) {
+                is->strategy_sum = buf;  /* Single-threaded (omp single), no CAS needed */
             }
         }
 
@@ -1896,9 +1902,12 @@ int bp_load_regrets(BPSolver *s, const char *path) {
         fread(&has_ss, sizeof(int), 1, f);
         if (has_ss) {
             if (!is->strategy_sum) {
-                is->strategy_sum = (float*)calloc(na, sizeof(float));
+                is->strategy_sum = (float*)arena_alloc(na);
             }
-            fread(is->strategy_sum, sizeof(float), na, f);
+            if (is->strategy_sum)
+                fread(is->strategy_sum, sizeof(float), na, f);
+            else
+                fseek(f, na * sizeof(float), SEEK_CUR);
         }
 
         loaded++;

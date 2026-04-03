@@ -135,8 +135,8 @@ WORKDIR=/opt/poker-solver
 mkdir -p \$WORKDIR/build /opt/blueprint_unified && cd \$WORKDIR
 aws s3 sync s3://$S3_BUCKET/code/ \$WORKDIR/ --quiet
 
-echo "Compiling with -O3 -march=native for maximum throughput..."
-gcc -O3 -march=native -fPIC -shared -fopenmp -o build/mccfr_blueprint.so src/mccfr_blueprint.c src/card_abstraction.c -I src -lm -lpthread
+echo "Compiling with -O2 -march=native..."
+gcc -O2 -march=native -fno-strict-aliasing -fPIC -shared -fopenmp -o build/mccfr_blueprint.so src/mccfr_blueprint.c src/card_abstraction.c -I src -lm -lpthread
 echo "Compilation complete."
 
 export OMP_STACKSIZE=64m
