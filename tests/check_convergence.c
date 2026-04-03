@@ -76,13 +76,21 @@ int main(int argc, char **argv) {
 
     /* Header */
     char magic[4];
-    int table_size, num_entries_hdr, iterations_run;
+    int table_size, num_entries_hdr;
+    int64_t iterations_run;
     fread(magic, 1, 4, f);
-    if (memcmp(magic, "BPR2", 4) != 0) { fprintf(stderr, "Bad magic\n"); return 1; }
+    int is_v3 = (memcmp(magic, "BPR3", 4) == 0);
+    int is_v2 = (memcmp(magic, "BPR2", 4) == 0);
+    if (!is_v3 && !is_v2) { fprintf(stderr, "Bad magic (expected BPR2/BPR3)\n"); return 1; }
     fread(&table_size, 4, 1, f);
     fread(&num_entries_hdr, 4, 1, f);
-    fread(&iterations_run, 4, 1, f);
-    printf("Header: table=%d entries_hdr=%d iters=%d\n\n", table_size, num_entries_hdr, iterations_run);
+    if (is_v3) {
+        fread(&iterations_run, 8, 1, f);
+    } else {
+        int iters32; fread(&iters32, 4, 1, f);
+        iterations_run = (int64_t)iters32;
+    }
+    printf("Header: table=%d entries_hdr=%d iters=%lld\n\n", table_size, num_entries_hdr, (long long)iterations_run);
 
     /* Stats */
     long long street_counts[4] = {0,0,0,0};
