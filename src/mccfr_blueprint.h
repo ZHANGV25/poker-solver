@@ -37,6 +37,7 @@
  * BP_HASH_SIZE_MEDIUM (64M slots) fits ~45M info sets at 70% load.
  * Memory: 64M * (key=20 + set=16 + occupied=4) = ~2.5GB metadata.
  * For small test runs, use BP_HASH_SIZE_SMALL. */
+#define BP_HASH_SIZE_3B     ((int64_t)3000000000) /* 3B slots (~180GB metadata) — full unified solve */
 #define BP_HASH_SIZE_LARGE  (1 << 30)   /* 1.07B slots (~44GB metadata) — bucket-in-key needs more */
 #define BP_HASH_SIZE_MEDIUM (1 << 26)   /* 64M slots (~2.5GB metadata) — per-texture */
 #define BP_HASH_SIZE_SMALL  (1 << 22)   /* 4M slots (~160MB metadata) — testing only */
@@ -76,8 +77,8 @@ typedef struct {
     BPInfoKey *keys;
     BPInfoSet *sets;
     int *occupied;
-    int num_entries;
-    int table_size;        /* actual hash table size (configurable) */
+    int64_t num_entries;
+    int64_t table_size;    /* actual hash table size (supports up to 4B+) */
 } BPInfoTable;
 
 /* Blueprint solver configuration */
@@ -94,7 +95,7 @@ typedef struct {
     int64_t snapshot_interval;      /* save snapshot every N iterations (Pluribus: ~200 min) */
     int64_t strategy_interval;      /* update round-1 avg strategy every N iters (Pluribus: 10K) */
     int num_threads;            /* OpenMP threads (0 = auto) */
-    int hash_table_size;        /* 0 = auto (BP_HASH_SIZE_SMALL or _LARGE based on players) */
+    int64_t hash_table_size;    /* 0 = auto. Supports >2B (e.g. 3B for 376GB instance) */
     const char *snapshot_dir;   /* directory for strategy snapshots (NULL = no snapshots) */
     int include_preflop;        /* 1 = start from preflop (unified Pluribus-style), 0 = start from flop */
     int postflop_num_buckets;   /* 0 = default (200). Reduce to shrink game tree. */
@@ -130,6 +131,14 @@ typedef struct {
     /* Preflop bet sizing (Pluribus: 1-14 sizes per decision point) */
     float preflop_bet_sizes[BP_MAX_ACTIONS];
     int num_preflop_bet_sizes;
+
+    /* Tiered preflop sizing: per-raise-level arrays (Pluribus-style).
+     * Level 0 = open raise, 1 = 3-bet, 2 = 4-bet, 3 = 5-bet.
+     * If num_preflop_tiers > 0, these override preflop_bet_sizes. */
+    float preflop_tiered_sizes[4][BP_MAX_ACTIONS];
+    int num_preflop_tiered_sizes[4];  /* sizes per level */
+    int num_preflop_tiers;            /* 0 = use flat preflop_bet_sizes */
+    int preflop_max_raises;           /* 0 = default (4) */
 
     /* Pot, stacks, and blinds */
     int starting_pot;       /* pot at start of postflop (when include_preflop=0) */
@@ -222,10 +231,20 @@ BP_EXPORT int bp_set_buckets(BPSolver *s, int street,
                               const int *num_buckets);
 
 /**
+ * Set tiered preflop bet sizes (Pluribus-style: fewer sizes at higher raise levels).
+ * level: 0 = open raise, 1 = 3-bet, 2 = 4-bet, 3 = 5-bet.
+ * Call once per level after bp_init_unified, before bp_solve.
+ * max_raises: total preflop raise cap (set on first call, e.g. 4).
+ */
+BP_EXPORT int bp_set_preflop_tier(BPSolver *s, int level,
+                                   const float *sizes, int num_sizes,
+                                   int max_raises);
+
+/**
  * Run external-sampling MCCFR with Pluribus optimizations.
  * Supports OpenMP parallelism, pruning, Linear CFR discount.
  */
-BP_EXPORT int bp_solve(BPSolver *s, int max_iterations);
+BP_EXPORT int bp_solve(BPSolver *s, int64_t max_iterations);
 
 /**
  * Extract weighted-average strategy at a specific info set.
@@ -235,7 +254,7 @@ BP_EXPORT int bp_get_strategy(const BPSolver *s, int player,
                                const int *action_seq, int seq_len,
                                float *strategy_out, int bucket);
 
-BP_EXPORT int bp_num_info_sets(const BPSolver *s);
+BP_EXPORT int64_t bp_num_info_sets(const BPSolver *s);
 BP_EXPORT void bp_free(BPSolver *s);
 
 /**
@@ -326,7 +345,7 @@ BP_EXPORT int bp_save_regrets(const BPSolver *s, const char *path);
  *
  * Returns number of entries loaded, or -1 on error.
  */
-BP_EXPORT int bp_load_regrets(BPSolver *s, const char *path);
+BP_EXPORT int64_t bp_load_regrets(BPSolver *s, const char *path);
 
 /**
  * Export EHS values and bucket assignments for all hands.

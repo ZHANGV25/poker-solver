@@ -28,7 +28,7 @@ S3_BUCKET="${S3_BUCKET:-poker-blueprint-unified}"
 PROFILE_NAME="poker-solver-profile"
 
 HOURS=192           # 8 days (Pluribus)
-HASH_SIZE=2147483647 # 2B slots (~125GB metadata) — 8 preflop sizes, no board_hash
+HASH_SIZE=3000000000 # 3B slots (~180GB metadata) — tiered preflop (8/3/2/1)
 DRY_RUN=0
 STATUS_ONLY=0
 DOWNLOAD_ONLY=0

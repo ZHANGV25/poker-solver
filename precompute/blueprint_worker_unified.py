@@ -44,11 +44,22 @@ BIG_BLIND = 100      # $100
 INITIAL_STACK = 10000 # $10,000 = 100BB
 
 # Pluribus bet sizes: up to 14 for preflop, 3 for later rounds
-# 14 preflop sizes: dense in open/3-bet range, geometric in 4-bet/5-bet range
+# Flat preflop sizes (used as fallback if tiered not set)
 PREFLOP_BET_SIZES = [0.4, 0.5, 0.7, 1.0, 1.5, 2.5, 4.0, 8.0]
 # Postflop first raise: Pluribus turn/river = {0.5x, 1x, all-in}
 # (all-in added automatically by generate_actions; subsequent raises use {1x, all-in})
 POSTFLOP_BET_SIZES = [0.5, 1.0]
+
+# Tiered preflop sizing (Pluribus-style: fewer sizes at deeper raise levels).
+# Open gets fine-grained sizes; 3-bet/4-bet/5-bet get progressively fewer.
+# Enumerated tree: 2.28M preflop nodes × 169 = 386M preflop info sets (vs 7.4B flat).
+PREFLOP_TIERS = {
+    0: [0.4, 0.5, 0.7, 1.0, 1.5, 2.5, 4.0, 8.0],  # open raise: 8 sizes
+    1: [0.7, 1.0, 2.5],                               # 3-bet: 3 sizes
+    2: [1.0, 4.0],                                     # 4-bet: 2 sizes
+    3: [8.0],                                          # 5-bet: shove only
+}
+PREFLOP_MAX_RAISES = 4
 
 # ── DLL loading ───────────────────────────────────────────────────
 
@@ -61,7 +72,7 @@ class BPConfig(ctypes.Structure):
         ("snapshot_interval", ctypes.c_int64),
         ("strategy_interval", ctypes.c_int64),
         ("num_threads", ctypes.c_int),
-        ("hash_table_size", ctypes.c_int),
+        ("hash_table_size", ctypes.c_int64),
         ("snapshot_dir", ctypes.c_char_p),
         ("include_preflop", ctypes.c_int),
         ("postflop_num_buckets", ctypes.c_int),
@@ -78,18 +89,24 @@ def load_bp_dll(build_dir):
             bp.bp_init_unified.restype = ctypes.c_int
             bp.bp_set_buckets.restype = ctypes.c_int
             bp.bp_solve.restype = ctypes.c_int
-            bp.bp_solve.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            bp.bp_solve.argtypes = [ctypes.c_void_p, ctypes.c_int64]
             bp.bp_get_strategy.restype = ctypes.c_int
-            bp.bp_num_info_sets.restype = ctypes.c_int
+            bp.bp_num_info_sets.restype = ctypes.c_int64
             bp.bp_num_info_sets.argtypes = [ctypes.c_void_p]
             bp.bp_export_strategies.restype = ctypes.c_int
             bp.bp_export_strategies.argtypes = [
                 ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
                 ctypes.POINTER(ctypes.c_size_t)
             ]
+            bp.bp_set_preflop_tier.restype = ctypes.c_int
+            bp.bp_set_preflop_tier.argtypes = [
+                ctypes.c_void_p, ctypes.c_int,
+                ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+                ctypes.c_int
+            ]
             bp.bp_save_regrets.restype = ctypes.c_int
             bp.bp_save_regrets.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-            bp.bp_load_regrets.restype = ctypes.c_int
+            bp.bp_load_regrets.restype = ctypes.c_int64
             bp.bp_load_regrets.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
             bp.bp_save_texture_cache.restype = ctypes.c_int
             bp.bp_save_texture_cache.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
@@ -125,7 +142,8 @@ def main():
     print(f"Players: {NUM_PLAYERS}")
     print(f"Blinds: {SMALL_BLIND}/{BIG_BLIND}")
     print(f"Stack: {INITIAL_STACK} ({INITIAL_STACK//BIG_BLIND}BB)")
-    print(f"Preflop bet sizes: {PREFLOP_BET_SIZES}")
+    print(f"Preflop tiers: {PREFLOP_TIERS}")
+    print(f"Preflop max raises: {PREFLOP_MAX_RAISES}")
     print(f"Postflop bet sizes: {POSTFLOP_BET_SIZES}")
     print(f"Threads: {args.num_threads or 'auto'}")
     print()
@@ -141,6 +159,8 @@ def main():
 
     if args.hash_size > 0:
         config.hash_table_size = args.hash_size
+    else:
+        config.hash_table_size = 3000000000  # 3B slots (~180GB meta, fits c7a.metal 376GB)
 
     # If running by time limit, estimate iterations based on Pluribus core-hours.
     # Pluribus: 12,400 core-hours on 64 cores. We match total core-hours.
@@ -218,6 +238,16 @@ def main():
         print(f"FATAL: bp_init_unified returned {ret}")
         sys.exit(1)
     print("Solver initialized.")
+
+    # Set tiered preflop sizing (overrides flat sizes)
+    for level, sizes in sorted(PREFLOP_TIERS.items()):
+        c_sizes = (ctypes.c_float * len(sizes))(*sizes)
+        ret = bp_lib.bp_set_preflop_tier(
+            solver, level, c_sizes, len(sizes), PREFLOP_MAX_RAISES)
+        if ret != 0:
+            print(f"FATAL: bp_set_preflop_tier level {level} returned {ret}")
+            sys.exit(1)
+    print(f"Tiered preflop: {len(PREFLOP_TIERS)} levels, max {PREFLOP_MAX_RAISES} raises")
 
     # Save texture cache for future runs (skips 65-min precompute next time)
     if not texture_loaded and args.s3_bucket:
@@ -325,7 +355,7 @@ def main():
             assert call_size <= 2_147_483_647, f"call_size {call_size} exceeds INT32_MAX!"
             call_size_int = int(call_size)  # ensure native int, not numpy or other type
             print(f"[Solve] {call_size_int:,} iters from {iters_done:,}...", flush=True)
-            ret = bp_lib.bp_solve(solver, ctypes.c_int(call_size_int))
+            ret = bp_lib.bp_solve(solver, ctypes.c_int64(call_size_int))
             if ret != 0:
                 print(f"[Solve] bp_solve returned {ret}", flush=True)
             iters_done += call_size
@@ -411,6 +441,8 @@ def _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is,
         "blinds": [SMALL_BLIND, BIG_BLIND],
         "initial_stack": INITIAL_STACK,
         "preflop_bet_sizes": PREFLOP_BET_SIZES,
+        "preflop_tiers": {str(k): v for k, v in PREFLOP_TIERS.items()},
+        "preflop_max_raises": PREFLOP_MAX_RAISES,
         "postflop_bet_sizes": POSTFLOP_BET_SIZES,
         "iterations": iters_done,
         "num_info_sets": n_is,

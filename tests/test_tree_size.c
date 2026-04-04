@@ -29,10 +29,11 @@ int main(int argc, char **argv) {
     int n_buckets = argc > 5 ? atoi(argv[5]) : 200;
 
     float all_post[] = {0.5f, 1.0f, 2.0f};
-    float all_pre[] = {0.5f, 1.0f, 2.0f, 3.0f};
+    float all_pre[] = {0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 1.0f, 1.2f, 1.5f,
+                        2.0f, 2.5f, 3.0f, 4.0f, 6.0f, 10.0f};
 
     if (n_post > 3) n_post = 3;
-    if (n_pre > 4) n_pre = 4;
+    if (n_pre > 14) n_pre = 14;
 
     printf("Config: %d postflop sizes, %d preflop sizes, %d buckets, %d hash, %d iters\n",
            n_post, n_pre, n_buckets, hash_size, iters);

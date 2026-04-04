@@ -117,3 +117,88 @@ Hash table at 100% capacity at crash time.
 5. **Tree size sweep**: Tested 1/2/3 postflop bet sizes — all identical tree
    growth. Tested removing board_hash — tree plateaus at ~50-80M. This proved
    board_hash was the multiplicative factor, not bet sizes.
+
+## Bug 4: Hash table fills at 75M iterations — tree 19x larger than Pluribus
+
+**Problem:** With 8 flat preflop raise sizes and max 4 raises, the game tree
+produces ~7.4 BILLION preflop info sets (43.8M decision nodes × 169 buckets).
+Pluribus has 665M action sequences total across all streets. Even a 2B hash
+table fills at ~75M iterations (0.16% of the 46.5B target), causing:
+
+1. New info set lookups return 0 — biases game values, prevents convergence
+2. Only UTG root info sets exist — SB/BB/MP/CO/BTN entries were never created
+   because the table filled before sampling reached their decision points
+3. Cache thrashing — 250 GB table at 100% occupancy, 76K iter/s instead of 360K
+
+**Root cause:** Flat sizing. Every preflop decision point (open, 3-bet, 4-bet,
+5-bet) gets 8 raise options. With 6 players and max 4 raises, the combinatorial
+explosion is massive. Pluribus uses "between 1 and 14" sizes per decision point,
+**tapered by hand** — many for the open raise, progressively fewer for 3-bet/4-bet.
+
+**Evidence — analytical enumeration (tests/count_tiered.py):**
+
+| Config                  | Preflop Nodes | × 169 = Preflop IS | Lines to Flop |
+|-------------------------|---------------|---------------------|---------------|
+| 8 flat, max 4 (broken)  | 43,806,293    | 7,403,263,517       | 43,806,262    |
+| Tiered 8/3/2/1, max 4   | 2,283,138     | 385,850,322         | 2,283,107     |
+| 4 flat, max 3            | 678,182       | 114,612,758         | 678,151       |
+
+The 4th raise level is the costliest — it reopens action for all 6 players with
+8 choices each. Dropping from max 4 to max 3 raises alone gives an 8x reduction.
+
+**The fix — tiered preflop sizing (Pluribus-style):**
+
+```
+Open raise (level 0): 8 sizes [0.4, 0.5, 0.7, 1.0, 1.5, 2.5, 4.0, 8.0]
+3-bet (level 1):      3 sizes [0.7, 1.0, 2.5]
+4-bet (level 2):      2 sizes [1.0, 4.0]
+5-bet (level 3):      1 size  [8.0] (essentially all-in)
+Max raises: 4
+```
+
+This produces 2.28M preflop decision nodes (386M preflop IS) — a 19x reduction
+from flat sizing while keeping all 8 open-raise sizes where strategic granularity
+matters most. The open raise is the highest-value decision in 6-max poker.
+
+**Implementation:**
+- `bp_set_preflop_tier(solver, level, sizes, num_sizes, max_raises)` — new API
+  to set per-raise-level bet size arrays
+- `traverse()` selects the right size array based on `num_raises`
+- `BPSolver` stores `preflop_tiered_sizes[4][BP_MAX_ACTIONS]` and
+  `num_preflop_tiers` — falls back to flat `preflop_bet_sizes` when 0
+
+**Deployed with 3B hash table** (c7a.metal-48xl, 376 GB RAM):
+- 180 GB metadata, ~30 GB arena at estimated ~600M occupied entries
+- 3B chosen for safety margin — never fills with tiered tree
+- Tradeoff: larger table is cache-hostile (~87K iter/s vs 360K with cache-fitting
+  table), but speed increases to 200-350K iter/s once pruning activates at ~790M
+  iterations (95% of subtrees skipped)
+
+## Bug 5: int32 overflow throughout solver — cannot run 46.5B iterations
+
+**Problem:** Multiple `int` (32-bit) variables overflow at >2.1B:
+
+| Variable | Location | Impact |
+|----------|----------|--------|
+| `bp_solve(int max_iterations)` | API | Can't request >2.1B iterations |
+| `iter`, `batch_start`, `batch_end` | solve loop | Overflow during iteration |
+| `TraversalState.iteration` | traversal state | Corrupts strategy accumulation timing |
+| `BPInfoTable.table_size` | hash table | Can't create 3B table |
+| `BP_HASH_SIZE_3B ((int)3B)` | constant | Wraps to -1.29B (silent!) |
+| `bp_num_info_sets` return | API | Truncates count >2.1B |
+| `written`/`loaded` in save/load | checkpoint I/O | Wrong counts |
+| `BPConfig.hash_table_size` | config struct | Truncates 3B to negative |
+
+**The fix:** Widened all iteration counters, hash table indices, and entry counts
+to `int64_t`. Updated save format to BPR4 (int64 header fields), backward
+compatible with BPR2/BPR3. Updated Python ctypes bindings to match.
+
+## Diagnostic tools added (this session)
+
+| Tool | Purpose |
+|------|---------|
+| `tests/count_preflop.py` | Enumerate exact preflop decision nodes for any flat config |
+| `tests/count_tiered.py` | Enumerate preflop nodes for tiered configs (Pluribus-style) |
+| `tests/enumerate_tree.py` | Full tree enumeration (preflop + postflop) |
+| `tests/test_tiered.py` | Smoke test: verify tiered sizing works end-to-end |
+| `tests/test_deploy_ready.py` | Pre-deploy validation: creation rate, save/load, int64, tiered vs flat |

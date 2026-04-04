@@ -273,11 +273,11 @@ static uint64_t compute_action_hash(const int *actions, int num_actions) {
     return h;
 }
 
-static void info_table_init(BPInfoTable *t, int table_size) {
+static void info_table_init(BPInfoTable *t, int64_t table_size) {
     t->table_size = table_size;
-    t->keys = (BPInfoKey*)calloc(table_size, sizeof(BPInfoKey));
-    t->sets = (BPInfoSet*)calloc(table_size, sizeof(BPInfoSet));
-    t->occupied = (int*)calloc(table_size, sizeof(int));
+    t->keys = (BPInfoKey*)calloc((size_t)table_size, sizeof(BPInfoKey));
+    t->sets = (BPInfoSet*)calloc((size_t)table_size, sizeof(BPInfoSet));
+    t->occupied = (int*)calloc((size_t)table_size, sizeof(int));
     t->num_entries = 0;
 }
 
@@ -300,16 +300,16 @@ static inline int key_eq(const BPInfoKey *a, const BPInfoKey *b) {
            a->action_hash == b->action_hash;
 }
 
-static int info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
-                                      int num_actions) {
+static int64_t info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
+                                          int num_actions) {
     uint64_t h = hash_combine(key.board_hash, key.action_hash);
     h = hash_combine(h, (uint64_t)key.player);
     h = hash_combine(h, (uint64_t)key.street);
     h = hash_combine(h, (uint64_t)key.bucket);
-    int slot = (int)(h % (uint64_t)t->table_size);
+    int64_t slot = (int64_t)(h % (uint64_t)t->table_size);
 
     for (int probe = 0; probe < 4096; probe++) {
-        int idx = (slot + probe) % t->table_size;
+        int64_t idx = (slot + probe) % t->table_size;
         int state = __atomic_load_n(&t->occupied[idx], __ATOMIC_ACQUIRE);
 
         if (state == 1) {
@@ -334,7 +334,7 @@ static int info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
                  * the earlier slot and undo our counter increment.
                  * This prevents split regrets and counter inflation. */
                 for (int p2 = 0; p2 < probe; p2++) {
-                    int idx2 = (slot + p2) % t->table_size;
+                    int64_t idx2 = (slot + p2) % t->table_size;
                     if (__atomic_load_n(&t->occupied[idx2], __ATOMIC_ACQUIRE) == 1) {
                         if (key_eq(&t->keys[idx2], &key)) {
                             /* Earlier copy exists — we're the duplicate.
@@ -511,7 +511,7 @@ typedef struct {
     BPSolver *solver;
     uint64_t *rng;           /* pointer to thread-local RNG */
     int traverser;
-    int iteration;
+    int64_t iteration;
     int use_pruning;         /* 1 if this iteration uses pruning */
     int sampled_hands[BP_MAX_PLAYERS];
 
@@ -927,9 +927,18 @@ static float traverse(TraversalState *ts, int acting_order_idx,
     int cur_num_bet_sizes;
     int max_raises = 3;
     if (ts->num_board == 0 && s->num_preflop_bet_sizes > 0) {
-        cur_bet_sizes = s->preflop_bet_sizes;
-        cur_num_bet_sizes = s->num_preflop_bet_sizes;
-        max_raises = 4;  /* preflop: open, 3bet, 4bet, 5bet(=allin usually) */
+        /* Tiered preflop: different sizes per raise level (Pluribus-style).
+         * Level 0 = open, 1 = 3-bet, 2 = 4-bet, 3 = 5-bet. */
+        if (s->num_preflop_tiers > 0) {
+            int level = ts->num_raises;
+            if (level >= s->num_preflop_tiers) level = s->num_preflop_tiers - 1;
+            cur_bet_sizes = s->preflop_tiered_sizes[level];
+            cur_num_bet_sizes = s->num_preflop_tiered_sizes[level];
+        } else {
+            cur_bet_sizes = s->preflop_bet_sizes;
+            cur_num_bet_sizes = s->num_preflop_bet_sizes;
+        }
+        max_raises = (s->preflop_max_raises > 0) ? s->preflop_max_raises : 4;
     } else if (ts->num_raises > 0 && s->num_subsequent_bet_sizes > 0) {
         /* Postflop subsequent raise: fewer sizes (Pluribus: {1x pot, all-in}) */
         cur_bet_sizes = s->subsequent_bet_sizes;
@@ -1005,7 +1014,7 @@ static float traverse(TraversalState *ts, int acting_order_idx,
     key.board_hash = 0;
     key.action_hash = compute_action_hash(ts->action_history, ts->history_len);
 
-    int is_slot = info_table_find_or_create(&s->info_table, key, na);
+    int64_t is_slot = info_table_find_or_create(&s->info_table, key, na);
     __atomic_fetch_add(&g_lookup_total, 1, __ATOMIC_RELAXED);
     if (is_slot < 0) {
         __atomic_fetch_add(&g_lookup_miss, 1, __ATOMIC_RELAXED);
@@ -1150,7 +1159,7 @@ static float traverse(TraversalState *ts, int acting_order_idx,
 
 static void accumulate_snapshot(BPInfoTable *t) {
     float strat_buf[BP_MAX_ACTIONS];
-    for (int i = 0; i < t->table_size; i++) {
+    for (int64_t i = 0; i < t->table_size; i++) {
         if (t->occupied[i] != 1) continue;
         BPInfoSet *is = &t->sets[i];
         int na = is->num_actions;
@@ -1171,7 +1180,7 @@ static void accumulate_snapshot(BPInfoTable *t) {
 /* ── Linear CFR discount ─────────────────────────────────────────── */
 
 static void apply_discount(BPInfoTable *t, float discount) {
-    for (int i = 0; i < t->table_size; i++) {
+    for (int64_t i = 0; i < t->table_size; i++) {
         if (!t->occupied[i]) continue;
         BPInfoSet *is = &t->sets[i];
         int na = is->num_actions;
@@ -1258,9 +1267,9 @@ int bp_init_ex(BPSolver *s, int num_players,
         }
 
     /* Hash table */
-    int ht_size = config->hash_table_size;
+    int64_t ht_size = config->hash_table_size;
     if (ht_size <= 0)
-        ht_size = (num_players > 2) ? BP_HASH_SIZE_MEDIUM : BP_HASH_SIZE_SMALL;
+        ht_size = (num_players > 2) ? (int64_t)BP_HASH_SIZE_MEDIUM : (int64_t)BP_HASH_SIZE_SMALL;
     info_table_init(&s->info_table, ht_size);
 
     /* RNG states — one per thread */
@@ -1338,6 +1347,10 @@ int bp_init_unified(BPSolver *s, int num_players,
     for (int i = 0; i < num_preflop_bet_sizes && i < BP_MAX_ACTIONS; i++)
         s->preflop_bet_sizes[i] = preflop_bet_sizes[i];
 
+    /* Tiered preflop: not set via bp_init_unified args, use bp_set_preflop_tiers() */
+    s->num_preflop_tiers = 0;
+    s->preflop_max_raises = 0;
+
     /* Default: 169 lossless preflop buckets (identity for postflop until set) */
     s->use_buckets = 1;
 
@@ -1382,10 +1395,10 @@ int bp_init_unified(BPSolver *s, int num_players,
                 s->bucket_map[st][p][h] = h;
         }
 
-    /* Hash table — use LARGE for unified solve (Pluribus: 665M action sequences) */
-    int ht_size = config->hash_table_size;
+    /* Hash table — 3B default for tiered preflop (Pluribus: 665M action sequences) */
+    int64_t ht_size = config->hash_table_size;
     if (ht_size <= 0)
-        ht_size = BP_HASH_SIZE_LARGE;
+        ht_size = (int64_t)BP_HASH_SIZE_LARGE;
     info_table_init(&s->info_table, ht_size);
 
     /* RNG states */
@@ -1562,7 +1575,29 @@ int bp_set_buckets(BPSolver *s, int street,
     return 0;
 }
 
-int bp_solve(BPSolver *s, int max_iterations) {
+/* Set tiered preflop bet sizes (Pluribus-style: fewer sizes at higher raise levels).
+ * level 0 = open raise, 1 = 3-bet, 2 = 4-bet, 3 = 5-bet.
+ * Call once per level after bp_init_unified, before bp_solve. */
+int bp_set_preflop_tier(BPSolver *s, int level,
+                         const float *sizes, int num_sizes,
+                         int max_raises) {
+    if (level < 0 || level >= 4) return -1;
+    if (num_sizes > BP_MAX_ACTIONS) num_sizes = BP_MAX_ACTIONS;
+    for (int i = 0; i < num_sizes; i++)
+        s->preflop_tiered_sizes[level][i] = sizes[i];
+    s->num_preflop_tiered_sizes[level] = num_sizes;
+    if (level + 1 > s->num_preflop_tiers)
+        s->num_preflop_tiers = level + 1;
+    if (max_raises > 0)
+        s->preflop_max_raises = max_raises;
+    printf("[BP] Preflop tier %d: %d sizes [", level, num_sizes);
+    for (int i = 0; i < num_sizes; i++)
+        printf("%s%.2f", i ? ", " : "", sizes[i]);
+    printf("], max_raises=%d\n", s->preflop_max_raises);
+    return 0;
+}
+
+int bp_solve(BPSolver *s, int64_t max_iterations) {
     int NP = s->num_players;
     int acting_order[BP_MAX_PLAYERS];
     for (int i = 0; i < NP; i++) acting_order[i] = i;
@@ -1574,9 +1609,9 @@ int bp_solve(BPSolver *s, int max_iterations) {
     }
     #endif
 
-    printf("[BP] Starting %d-player MCCFR: %d iterations, %d threads, "
-           "hash=%d, buckets=%s\n",
-           NP, max_iterations, nt, s->info_table.table_size,
+    printf("[BP] Starting %d-player MCCFR: %lld iterations, %d threads, "
+           "hash=%lld, buckets=%s\n",
+           NP, (long long)max_iterations, nt, (long long)s->info_table.table_size,
            s->use_buckets ? "yes" : "no");
 
     #ifdef _OPENMP
@@ -1606,9 +1641,9 @@ int bp_solve(BPSolver *s, int max_iterations) {
         discount_count = iter_offset / s->config.discount_interval;
         next_discount_at = (discount_count + 1) * s->config.discount_interval;
     }
-    int batch_size = (int)s->config.discount_interval;
+    int64_t batch_size = s->config.discount_interval;
     if (batch_size <= 0 || batch_size > max_iterations) batch_size = max_iterations;
-    int num_batches = (int)(((int64_t)max_iterations + batch_size - 1) / batch_size);
+    int64_t num_batches = (max_iterations + batch_size - 1) / batch_size;
 
     #ifdef _OPENMP
     #pragma omp parallel if(nt > 1)
@@ -1621,17 +1656,17 @@ int bp_solve(BPSolver *s, int max_iterations) {
         #endif
         uint64_t *my_rng = &s->rng_states[tid * 8];
 
-        for (int batch = 0; batch < num_batches; batch++) {
-            int batch_start = batch * batch_size + 1;
-            int batch_end = batch_start + batch_size - 1;
+        for (int64_t batch = 0; batch < num_batches; batch++) {
+            int64_t batch_start = batch * batch_size + 1;
+            int64_t batch_end = batch_start + batch_size - 1;
             if (batch_end > max_iterations) batch_end = max_iterations;
 
             /* All threads work on this batch's iterations */
             #ifdef _OPENMP
             #pragma omp for schedule(dynamic, 64)
             #endif
-            for (int iter = batch_start; iter <= batch_end; iter++) {
-                int64_t global_iter = (int64_t)iter + iter_offset;
+            for (int64_t iter = batch_start; iter <= batch_end; iter++) {
+                int64_t global_iter = iter + iter_offset;
                 int traverser = (int)((global_iter - 1) % NP);
 
                 int use_pruning = 0;
@@ -1729,8 +1764,8 @@ int bp_solve(BPSolver *s, int max_iterations) {
                         #else
                         double elapsed = (double)(clock() - t_start) / CLOCKS_PER_SEC;
                         #endif
-                        printf("[BP] iter %d/%d (global %lld), info sets: %d, %.1fs\n",
-                               iter, max_iterations, (long long)global_iter, s->info_table.num_entries, elapsed);
+                        printf("[BP] iter %lld/%lld (global %lld), info sets: %lld, %.1fs\n",
+                               (long long)iter, (long long)max_iterations, (long long)global_iter, (long long)s->info_table.num_entries, elapsed);
                         fflush(stdout);
                     }
                 }
@@ -1775,8 +1810,8 @@ int bp_solve(BPSolver *s, int max_iterations) {
     #else
     double total_time = (double)(clock() - t_start) / CLOCKS_PER_SEC;
     #endif
-    printf("[BP] Done: %d iterations, %d info sets, %.1fs (%.0f iter/s)\n",
-           max_iterations, s->info_table.num_entries, total_time,
+    printf("[BP] Done: %lld iterations, %lld info sets, %.1fs (%.0f iter/s)\n",
+           (long long)max_iterations, (long long)s->info_table.num_entries, total_time,
            (double)max_iterations / total_time);
 
     return 0;
@@ -1797,10 +1832,10 @@ int bp_get_strategy(const BPSolver *s, int player,
     h = hash_combine(h, (uint64_t)key.player);
     h = hash_combine(h, (uint64_t)key.street);
     h = hash_combine(h, (uint64_t)key.bucket);
-    int slot = (int)(h % (uint64_t)s->info_table.table_size);
+    int64_t slot = (int64_t)(h % (uint64_t)s->info_table.table_size);
 
     for (int probe = 0; probe < 1024; probe++) {
-        int idx = (slot + probe) % s->info_table.table_size;
+        int64_t idx = (slot + probe) % s->info_table.table_size;
         if (!s->info_table.occupied[idx]) return 0;
         if (key_eq(&s->info_table.keys[idx], &key)) {
             BPInfoSet *is = &s->info_table.sets[idx];
@@ -1828,7 +1863,7 @@ int bp_get_strategy(const BPSolver *s, int player,
     return 0;
 }
 
-int bp_num_info_sets(const BPSolver *s) {
+int64_t bp_num_info_sets(const BPSolver *s) {
     return s->info_table.num_entries;
 }
 
@@ -1838,16 +1873,16 @@ int bp_save_regrets(const BPSolver *s, const char *path) {
 
     const BPInfoTable *t = &s->info_table;
 
-    /* Header: "BPR3" = bucket-in-key format v3 (int64 iterations) */
-    fwrite("BPR3", 1, 4, f);
-    fwrite(&t->table_size, sizeof(int), 1, f);
-    fwrite(&t->num_entries, sizeof(int), 1, f);
+    /* Header: "BPR4" = bucket-in-key format v4 (int64 table_size, int64 iterations) */
+    fwrite("BPR4", 1, 4, f);
+    fwrite(&t->table_size, sizeof(int64_t), 1, f);
+    fwrite(&t->num_entries, sizeof(int64_t), 1, f);
     int64_t iters64 = s->iterations_run;
     fwrite(&iters64, sizeof(int64_t), 1, f);
 
     /* Entries — each info set has bucket in key, regrets[num_actions] only */
-    int written = 0;
-    for (int i = 0; i < t->table_size; i++) {
+    int64_t written = 0;
+    for (int64_t i = 0; i < t->table_size; i++) {
         if (t->occupied[i] != 1) continue;
         BPInfoKey *key = &t->keys[i];
         BPInfoSet *is = &t->sets[i];
@@ -1870,43 +1905,53 @@ int bp_save_regrets(const BPSolver *s, const char *path) {
     }
 
     fclose(f);
-    printf("[BP] Saved %d info sets to %s\n", written, path);
+    printf("[BP] Saved %lld info sets to %s\n", (long long)written, path);
     return 0;
 }
 
-int bp_load_regrets(BPSolver *s, const char *path) {
+int64_t bp_load_regrets(BPSolver *s, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
 
     /* Header */
     char magic[4];
     fread(magic, 1, 4, f);
+    int is_v4 = (memcmp(magic, "BPR4", 4) == 0);
     int is_v3 = (memcmp(magic, "BPR3", 4) == 0);
     int is_v2 = (memcmp(magic, "BPR2", 4) == 0);
-    if (!is_v3 && !is_v2) {
-        printf("[BP] ERROR: expected BPR2/BPR3 format, got %.4s\n", magic);
+    if (!is_v4 && !is_v3 && !is_v2) {
+        printf("[BP] ERROR: expected BPR2/BPR3/BPR4 format, got %.4s\n", magic);
         fclose(f);
         return -1;
     }
 
-    int saved_table_size, saved_entries;
+    int64_t saved_entries;
     int64_t saved_iters;
-    fread(&saved_table_size, sizeof(int), 1, f);
-    fread(&saved_entries, sizeof(int), 1, f);
-    if (is_v3) {
+    if (is_v4) {
+        int64_t saved_table_size64;
+        fread(&saved_table_size64, sizeof(int64_t), 1, f);
+        fread(&saved_entries, sizeof(int64_t), 1, f);
         fread(&saved_iters, sizeof(int64_t), 1, f);
     } else {
-        int iters32; fread(&iters32, sizeof(int), 1, f);
-        saved_iters = (int64_t)iters32;
+        int saved_table_size32, saved_entries32;
+        fread(&saved_table_size32, sizeof(int), 1, f);
+        fread(&saved_entries32, sizeof(int), 1, f);
+        saved_entries = (int64_t)saved_entries32;
+        if (is_v3) {
+            fread(&saved_iters, sizeof(int64_t), 1, f);
+        } else {
+            int iters32; fread(&iters32, sizeof(int), 1, f);
+            saved_iters = (int64_t)iters32;
+        }
     }
 
-    printf("[BP] Loading checkpoint: %d info sets, %lld iterations\n",
-           saved_entries, (long long)saved_iters);
+    printf("[BP] Loading checkpoint: %lld info sets, %lld iterations\n",
+           (long long)saved_entries, (long long)saved_iters);
 
     BPInfoTable *t = &s->info_table;
-    int loaded = 0;
+    int64_t loaded = 0;
 
-    for (int e = 0; e < saved_entries; e++) {
+    for (int64_t e = 0; e < saved_entries; e++) {
         BPInfoKey key;
         int na;
 
@@ -1917,7 +1962,7 @@ int bp_load_regrets(BPSolver *s, const char *path) {
         if (fread(&key.action_hash, sizeof(uint64_t), 1, f) != 1) break;
         if (fread(&na, sizeof(int), 1, f) != 1) break;
 
-        int slot = info_table_find_or_create(t, key, na);
+        int64_t slot = info_table_find_or_create(t, key, na);
         if (slot < 0) {
             fseek(f, na * sizeof(int), SEEK_CUR);
             int has_ss;
@@ -1946,8 +1991,8 @@ int bp_load_regrets(BPSolver *s, const char *path) {
 
     s->iterations_run = saved_iters;
     fclose(f);
-    printf("[BP] Loaded %d/%d info sets (table %d/%d)\n",
-           loaded, saved_entries, t->num_entries, t->table_size);
+    printf("[BP] Loaded %lld/%lld info sets (table %lld/%lld)\n",
+           (long long)loaded, (long long)saved_entries, (long long)t->num_entries, (long long)t->table_size);
     return loaded;
 }
 
@@ -2008,7 +2053,7 @@ int bp_export_strategies(const BPSolver *s,
     int count = 0;
     /* Header: 4 bytes magic + 4 bytes num_entries + 4 bytes num_players */
     total += 12;
-    for (int i = 0; i < t->table_size; i++) {
+    for (int64_t i = 0; i < t->table_size; i++) {
         if (t->occupied[i] != 1) continue;
         BPInfoSet *is = &t->sets[i];
         /* Key: player(1) + street(1) + bucket(2) + board_hash(8) + action_hash(8) = 20 bytes */
@@ -2030,7 +2075,7 @@ int bp_export_strategies(const BPSolver *s,
     memcpy(p, &np, 4); p += 4;
 
     float strategy_buf[BP_MAX_ACTIONS];
-    for (int i = 0; i < t->table_size; i++) {
+    for (int64_t i = 0; i < t->table_size; i++) {
         if (t->occupied[i] != 1) continue;
         BPInfoKey *key = &t->keys[i];
         BPInfoSet *is = &t->sets[i];
