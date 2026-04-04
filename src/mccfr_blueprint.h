@@ -29,7 +29,7 @@
 
 #define BP_MAX_PLAYERS    6
 #define BP_MAX_HANDS      1326   /* max hands per player (all possible 2-card combos) */
-#define BP_MAX_ACTIONS    8
+#define BP_MAX_ACTIONS    16
 #define BP_MAX_BOARD      5
 
 /* Hash table sizing.
@@ -97,6 +97,7 @@ typedef struct {
     int hash_table_size;        /* 0 = auto (BP_HASH_SIZE_SMALL or _LARGE based on players) */
     const char *snapshot_dir;   /* directory for strategy snapshots (NULL = no snapshots) */
     int include_preflop;        /* 1 = start from preflop (unified Pluribus-style), 0 = start from flop */
+    int postflop_num_buckets;   /* 0 = default (200). Reduce to shrink game tree. */
 } BPConfig;
 
 /* Blueprint solver state */
@@ -118,9 +119,13 @@ typedef struct {
     /* Board */
     int flop[3];
 
-    /* Bet sizing (postflop) */
+    /* Bet sizing (postflop first raise: Pluribus turn/river = 0.5x, 1x, all-in) */
     float bet_sizes[BP_MAX_ACTIONS];
     int num_bet_sizes;
+
+    /* Postflop subsequent raises (Pluribus turn/river = 1x, all-in) */
+    float subsequent_bet_sizes[BP_MAX_ACTIONS];
+    int num_subsequent_bet_sizes;
 
     /* Preflop bet sizing (Pluribus: 1-14 sizes per decision point) */
     float preflop_bet_sizes[BP_MAX_ACTIONS];

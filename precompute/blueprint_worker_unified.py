@@ -44,8 +44,11 @@ BIG_BLIND = 100      # $100
 INITIAL_STACK = 10000 # $10,000 = 100BB
 
 # Pluribus bet sizes: up to 14 for preflop, 3 for later rounds
-PREFLOP_BET_SIZES = [0.5, 1.0, 2.0, 3.0]  # 0.5x, 1x, 2x, 3x pot raises
-POSTFLOP_BET_SIZES = [0.5, 1.0, 2.0]       # Pluribus: 0.5x pot, pot, all-in (≈2x)
+# 14 preflop sizes: dense in open/3-bet range, geometric in 4-bet/5-bet range
+PREFLOP_BET_SIZES = [0.4, 0.5, 0.6, 0.7, 0.8, 1.0, 1.2, 1.5, 2.0, 2.5, 3.0, 4.0, 6.0, 10.0]
+# Postflop first raise: Pluribus turn/river = {0.5x, 1x, all-in}
+# (all-in added automatically by generate_actions; subsequent raises use {1x, all-in})
+POSTFLOP_BET_SIZES = [0.5, 1.0]
 
 # ── DLL loading ───────────────────────────────────────────────────
 
@@ -61,6 +64,7 @@ class BPConfig(ctypes.Structure):
         ("hash_table_size", ctypes.c_int),
         ("snapshot_dir", ctypes.c_char_p),
         ("include_preflop", ctypes.c_int),
+        ("postflop_num_buckets", ctypes.c_int),
     ]
 
 

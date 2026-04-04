@@ -28,7 +28,7 @@ S3_BUCKET="${S3_BUCKET:-poker-blueprint-unified}"
 PROFILE_NAME="poker-solver-profile"
 
 HOURS=192           # 8 days (Pluribus)
-HASH_SIZE=1342177280 # 1.25B slots (~80GB metadata) — hash table hit 100% at 1B with old size
+HASH_SIZE=536870912  # 512M slots (~30GB metadata) — tree is ~60-100M IS without board_hash
 DRY_RUN=0
 STATUS_ONLY=0
 DOWNLOAD_ONLY=0
@@ -139,11 +139,15 @@ echo "Compiling with -O2 -march=native..."
 gcc -O2 -march=native -fno-strict-aliasing -fPIC -shared -fopenmp -o build/mccfr_blueprint.so src/mccfr_blueprint.c src/card_abstraction.c -I src -lm -lpthread
 echo "Compilation complete."
 
+# Download precomputed texture cache (saves ~40 min precomputation)
+aws s3 cp s3://$S3_BUCKET/texture_cache.bin /tmp/texture_cache.bin --quiet 2>/dev/null || true
+echo "Texture cache: \$(ls -lh /tmp/texture_cache.bin 2>/dev/null || echo 'not found, will precompute')"
+
 export OMP_STACKSIZE=64m
 export OMP_NUM_THREADS=\$(nproc)
 
 echo "Starting unified solve: \$(nproc) threads, ${HOURS}h..."
-python3 precompute/blueprint_worker_unified.py \
+python3 -u precompute/blueprint_worker_unified.py \
     --time-limit-hours $HOURS \
     --num-threads \$(nproc) \
     --hash-size $HASH_SIZE \

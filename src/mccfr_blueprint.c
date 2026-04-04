@@ -27,6 +27,20 @@
 #include <omp.h>
 #endif
 
+/* ── Lookup miss counter (for diagnosing hash table saturation) ───── */
+static int64_t g_lookup_total = 0;
+static int64_t g_lookup_miss = 0;
+
+void bp_get_miss_stats(int64_t *total, int64_t *miss) {
+    *total = __atomic_load_n(&g_lookup_total, __ATOMIC_RELAXED);
+    *miss = __atomic_load_n(&g_lookup_miss, __ATOMIC_RELAXED);
+}
+
+void bp_reset_miss_stats(void) {
+    __atomic_store_n(&g_lookup_total, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_lookup_miss, 0, __ATOMIC_RELAXED);
+}
+
 /* ── RNG (xorshift64, thread-safe via separate states) ────────────── */
 
 static inline uint64_t rng_next(uint64_t *state) {
@@ -60,7 +74,7 @@ static void partial_shuffle(int *arr, int n, int k, uint64_t *rng) {
  * Arena allocates in bulk 64MB chunks, returning aligned 32-byte blocks. */
 
 #define ARENA_CHUNK_SIZE (64 * 1024 * 1024)  /* 64 MB per chunk */
-#define ARENA_BLOCK_SIZE 32                    /* 32 bytes = 8 ints max */
+#define ARENA_BLOCK_SIZE 64                    /* 64 bytes = 16 ints max */
 
 typedef struct ArenaChunk {
     char *data;
@@ -916,7 +930,12 @@ static float traverse(TraversalState *ts, int acting_order_idx,
         cur_bet_sizes = s->preflop_bet_sizes;
         cur_num_bet_sizes = s->num_preflop_bet_sizes;
         max_raises = 4;  /* preflop: open, 3bet, 4bet, 5bet(=allin usually) */
+    } else if (ts->num_raises > 0 && s->num_subsequent_bet_sizes > 0) {
+        /* Postflop subsequent raise: fewer sizes (Pluribus: {1x pot, all-in}) */
+        cur_bet_sizes = s->subsequent_bet_sizes;
+        cur_num_bet_sizes = s->num_subsequent_bet_sizes;
     } else {
+        /* Postflop first raise: full sizes (Pluribus: {0.5x, 1x, all-in}) */
         cur_bet_sizes = s->bet_sizes;
         cur_num_bet_sizes = s->num_bet_sizes;
     }
@@ -977,19 +996,21 @@ static float traverse(TraversalState *ts, int acting_order_idx,
     key.player = ap;
     key.street = street;
     key.bucket = bucket;
-    /* Use canonical board hash so suit-isomorphic boards share info sets.
-     * Recompute canonicalization here (not from state) for correctness. */
-    if (ts->num_board >= 3) {
-        int cb[5];
-        canonicalize_board(ts->board, ts->num_board, cb);
-        key.board_hash = compute_board_hash(cb, ts->num_board);
-    } else {
-        key.board_hash = compute_board_hash(ts->board, ts->num_board);
-    }
+    /* Board is NOT in the key — the bucket already abstracts the board's
+     * strategic impact. Including board_hash would create separate info sets
+     * for every canonical board, defeating the purpose of bucketing and
+     * inflating the tree from ~665M (Pluribus) to billions.
+     * Preflop: board_hash is constant (no board). Postflop: bucket captures
+     * the hand+board situation via EHS/k-means clustering. */
+    key.board_hash = 0;
     key.action_hash = compute_action_hash(ts->action_history, ts->history_len);
 
     int is_slot = info_table_find_or_create(&s->info_table, key, na);
-    if (is_slot < 0) return 0;
+    __atomic_fetch_add(&g_lookup_total, 1, __ATOMIC_RELAXED);
+    if (is_slot < 0) {
+        __atomic_fetch_add(&g_lookup_miss, 1, __ATOMIC_RELAXED);
+        return 0;
+    }
     BPInfoSet *is = &s->info_table.sets[is_slot];
 
     /* Guard: if hash collision causes action count mismatch, use stored count
@@ -1309,6 +1330,10 @@ int bp_init_unified(BPSolver *s, int num_players,
     for (int i = 0; i < num_postflop_bet_sizes && i < BP_MAX_ACTIONS; i++)
         s->bet_sizes[i] = postflop_bet_sizes[i];
 
+    /* Postflop subsequent raises: {1x pot, all-in} per Pluribus */
+    s->num_subsequent_bet_sizes = 1;
+    s->subsequent_bet_sizes[0] = 1.0f; /* 1x pot; all-in is added automatically */
+
     s->num_preflop_bet_sizes = num_preflop_bet_sizes;
     for (int i = 0; i < num_preflop_bet_sizes && i < BP_MAX_ACTIONS; i++)
         s->preflop_bet_sizes[i] = preflop_bet_sizes[i];
@@ -1383,7 +1408,7 @@ int bp_init_unified(BPSolver *s, int num_players,
     /* Postflop bucketing: precompute 200-bucket EHS mapping for all 1,755 textures.
      * Pluribus precomputes card abstraction (bucket assignments) for all flop textures
      * once before training starts. We do the same here. */
-    s->postflop_num_buckets = 200;
+    s->postflop_num_buckets = (config->postflop_num_buckets > 0) ? config->postflop_num_buckets : 200;
     s->postflop_ehs_samples = 500;  /* MC samples for precompute (Pluribus: ~500) */
     s->num_cached_textures = 0;
     s->texture_bucket_cache = (int*)calloc(BP_MAX_TEXTURES * (size_t)BP_MAX_HANDS, sizeof(int));
@@ -1394,8 +1419,16 @@ int bp_init_unified(BPSolver *s, int num_players,
            num_players, small_blind, big_blind, initial_stack,
            num_preflop_bet_sizes, num_postflop_bet_sizes, nh,
            n_classes, s->postflop_num_buckets);
+    /* Try loading precomputed texture cache from well-known paths */
+    if (s->num_cached_textures == 0) {
+        const char *cache_paths[] = {"/tmp/texture_cache.bin", "texture_cache.bin",
+                                      "/opt/blueprint_unified/texture_cache.bin", NULL};
+        for (int ci = 0; cache_paths[ci]; ci++) {
+            if (bp_load_texture_cache(s, cache_paths[ci]) > 0) break;
+        }
+    }
     if (s->num_cached_textures > 0) {
-        printf("[BP] Texture cache already loaded (%d textures), skipping precompute\n",
+        printf("[BP] Texture cache loaded (%d textures), skipping precompute\n",
                s->num_cached_textures);
     } else {
     printf("[BP] Precomputing postflop buckets for all flop textures...\n");
@@ -1757,14 +1790,7 @@ int bp_get_strategy(const BPSolver *s, int player,
     key.player = player;
     key.street = board_to_street(num_board);
     key.bucket = bucket;
-    /* Canonicalize board for lookup (must match traversal's canonical keys) */
-    if (num_board >= 3) {
-        int canon[5];
-        canonicalize_board(board, num_board, canon);
-        key.board_hash = compute_board_hash(canon, num_board);
-    } else {
-        key.board_hash = compute_board_hash(board, num_board);
-    }
+    key.board_hash = 0;  /* Board abstracted by bucket, not in key */
     key.action_hash = compute_action_hash(action_seq, seq_len);
 
     uint64_t h = hash_combine(key.board_hash, key.action_hash);
