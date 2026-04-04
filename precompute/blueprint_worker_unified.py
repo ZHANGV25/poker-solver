@@ -87,6 +87,10 @@ def load_bp_dll(build_dir):
             bp.bp_save_regrets.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
             bp.bp_load_regrets.restype = ctypes.c_int
             bp.bp_load_regrets.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            bp.bp_save_texture_cache.restype = ctypes.c_int
+            bp.bp_save_texture_cache.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            bp.bp_load_texture_cache.restype = ctypes.c_int
+            bp.bp_load_texture_cache.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
             bp.bp_free.restype = None
             return bp
     raise FileNotFoundError(f"mccfr_blueprint not found in {build_dir}")
@@ -165,12 +169,39 @@ def main():
     print(f"Snapshots: after iter {config.snapshot_start_iter:,}, every {config.snapshot_interval:,}")
     print()
 
+    # Try to load cached texture buckets from S3 (saves ~65 min precompute)
+    texture_cache_local = os.path.join(args.output_dir, "texture_cache.bin")
+    texture_loaded = False
+    if args.s3_bucket:
+        os.makedirs(args.output_dir, exist_ok=True)
+        texture_s3 = f"s3://{args.s3_bucket}/texture_cache.bin"
+        ret = subprocess.run(
+            ["aws", "s3", "cp", texture_s3, texture_cache_local, "--quiet"],
+            capture_output=True
+        )
+        if ret.returncode == 0 and os.path.exists(texture_cache_local):
+            print(f"Found texture cache on S3, will load after init")
+            texture_loaded = True
+        else:
+            print("No texture cache found, will precompute")
+
     # Initialize
     buf = (ctypes.c_char * 524288)()
     solver = ctypes.cast(buf, ctypes.c_void_p)
 
     c_postflop = (ctypes.c_float * len(POSTFLOP_BET_SIZES))(*POSTFLOP_BET_SIZES)
     c_preflop = (ctypes.c_float * len(PREFLOP_BET_SIZES))(*PREFLOP_BET_SIZES)
+
+    # Load texture cache BEFORE init so bp_init_unified skips the 65-min precompute.
+    # bp_load_texture_cache allocates the cache array and sets num_cached_textures > 0.
+    # bp_init_unified checks this and skips if already loaded.
+    if texture_loaded:
+        n = bp_lib.bp_load_texture_cache(solver, texture_cache_local.encode('utf-8'))
+        if n > 0:
+            print(f"Loaded texture cache: {n} textures")
+        else:
+            print("Failed to load texture cache, will precompute")
+            texture_loaded = False
 
     ret = bp_lib.bp_init_unified(
         solver, NUM_PLAYERS,
@@ -183,6 +214,20 @@ def main():
         print(f"FATAL: bp_init_unified returned {ret}")
         sys.exit(1)
     print("Solver initialized.")
+
+    # Save texture cache for future runs (skips 65-min precompute next time)
+    if not texture_loaded and args.s3_bucket:
+        os.makedirs(args.output_dir, exist_ok=True)
+        bp_lib.bp_save_texture_cache(solver, texture_cache_local.encode('utf-8'))
+        try:
+            subprocess.run(
+                ["aws", "s3", "cp", texture_cache_local,
+                 f"s3://{args.s3_bucket}/texture_cache.bin", "--quiet"],
+                check=True, capture_output=True
+            )
+            print("Texture cache saved to S3")
+        except subprocess.CalledProcessError:
+            print("Warning: failed to upload texture cache to S3")
     # Postflop buckets (200 EHS percentile) are precomputed inside bp_init_unified
     # for all 1,755 flop textures. During traversal, the dealt flop is canonicalized
     # and the precomputed bucket mapping is looked up in O(1755) per deal.

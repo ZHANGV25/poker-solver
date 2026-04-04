@@ -1394,6 +1394,10 @@ int bp_init_unified(BPSolver *s, int num_players,
            num_players, small_blind, big_blind, initial_stack,
            num_preflop_bet_sizes, num_postflop_bet_sizes, nh,
            n_classes, s->postflop_num_buckets);
+    if (s->num_cached_textures > 0) {
+        printf("[BP] Texture cache already loaded (%d textures), skipping precompute\n",
+               s->num_cached_textures);
+    } else {
     printf("[BP] Precomputing postflop buckets for all flop textures...\n");
     fflush(stdout);
 
@@ -1507,6 +1511,7 @@ int bp_init_unified(BPSolver *s, int num_players,
         double pc_elapsed = (double)(clock() - pc_start) / CLOCKS_PER_SEC;
         printf("[BP] Precomputed %d textures in %.1fs\n", tex_count, pc_elapsed);
     }
+    } /* end else (skip if cache loaded) */
 
     return 0;
 }
@@ -1918,6 +1923,44 @@ int bp_load_regrets(BPSolver *s, const char *path) {
     printf("[BP] Loaded %d/%d info sets (table %d/%d)\n",
            loaded, saved_entries, t->num_entries, t->table_size);
     return loaded;
+}
+
+int bp_save_texture_cache(const BPSolver *s, const char *path) {
+    if (!s->texture_bucket_cache || s->num_cached_textures == 0) return -1;
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    fwrite("TXC1", 1, 4, f);
+    fwrite(&s->num_cached_textures, sizeof(int), 1, f);
+    fwrite(&s->postflop_num_buckets, sizeof(int), 1, f);
+    fwrite(s->texture_hash_keys, sizeof(uint64_t), s->num_cached_textures, f);
+    fwrite(s->texture_bucket_cache, sizeof(int),
+           (size_t)s->num_cached_textures * BP_MAX_HANDS, f);
+    fclose(f);
+    printf("[BP] Saved texture cache: %d textures to %s\n",
+           s->num_cached_textures, path);
+    return 0;
+}
+
+int bp_load_texture_cache(BPSolver *s, const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    char magic[4];
+    fread(magic, 1, 4, f);
+    if (memcmp(magic, "TXC1", 4) != 0) { fclose(f); return -1; }
+    int num_tex, num_buckets;
+    fread(&num_tex, sizeof(int), 1, f);
+    fread(&num_buckets, sizeof(int), 1, f);
+    if (num_tex > BP_MAX_TEXTURES || num_buckets != s->postflop_num_buckets) {
+        fclose(f); return -1;
+    }
+    if (!s->texture_bucket_cache)
+        s->texture_bucket_cache = (int*)calloc(BP_MAX_TEXTURES * (size_t)BP_MAX_HANDS, sizeof(int));
+    fread(s->texture_hash_keys, sizeof(uint64_t), num_tex, f);
+    fread(s->texture_bucket_cache, sizeof(int), (size_t)num_tex * BP_MAX_HANDS, f);
+    s->num_cached_textures = num_tex;
+    fclose(f);
+    printf("[BP] Loaded texture cache: %d textures from %s\n", num_tex, path);
+    return num_tex;
 }
 
 void bp_free(BPSolver *s) {

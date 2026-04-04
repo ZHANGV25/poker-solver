@@ -234,6 +234,14 @@ BP_EXPORT int bp_num_info_sets(const BPSolver *s);
 BP_EXPORT void bp_free(BPSolver *s);
 
 /**
+ * Save/load precomputed texture bucket cache to skip the 65-90 min
+ * precompute on subsequent launches. Format: TXC1 header + hash keys
+ * + bucket mappings. ~9.3 MB file for 1755 textures × 1326 hands.
+ */
+BP_EXPORT int bp_save_texture_cache(const BPSolver *s, const char *path);
+BP_EXPORT int bp_load_texture_cache(BPSolver *s, const char *path);
+
+/**
  * Initialize a unified preflop-through-river solver (Pluribus-style).
  *
  * All 6 players get all 1326 hands. Preflop uses 169 lossless classes.
