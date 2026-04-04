@@ -28,7 +28,7 @@ S3_BUCKET="${S3_BUCKET:-poker-blueprint-unified}"
 PROFILE_NAME="poker-solver-profile"
 
 HOURS=192           # 8 days (Pluribus)
-HASH_SIZE=1073741824 # 1B slots (~60GB metadata) — 8 preflop sizes, no board_hash
+HASH_SIZE=2147483647 # 2B slots (~125GB metadata) — 8 preflop sizes, no board_hash
 DRY_RUN=0
 STATUS_ONLY=0
 DOWNLOAD_ONLY=0
@@ -176,7 +176,6 @@ INSTANCE_ID=$(aws ec2 run-instances \
     --security-groups "$SECURITY_GROUP" \
     --iam-instance-profile "Name=$PROFILE_NAME" \
     --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":200,"VolumeType":"gp3"}}]' \
-    --instance-market-options '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"persistent","InstanceInterruptionBehavior":"stop"}}' \
     --user-data "$USERDATA_B64" \
     --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=bp-unified},{Key=Project,Value=poker-solver-unified}]" \
     --query "Instances[0].InstanceId" \
