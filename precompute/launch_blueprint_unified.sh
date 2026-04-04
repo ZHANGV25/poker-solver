@@ -21,7 +21,7 @@
 set -euo pipefail
 
 REGION="${AWS_REGION:-us-east-1}"
-INSTANCE_TYPE="${INSTANCE_TYPE:-c5.metal}"  # 96 vCPU, 192 GB, $4.08/hr
+INSTANCE_TYPE="${INSTANCE_TYPE:-c7a.metal}"  # 192 vCPU, 384 GB, ~$5.20/hr
 KEY_NAME="${KEY_NAME:-poker-solver-key}"
 SECURITY_GROUP="${SECURITY_GROUP:-poker-solver-sg}"
 S3_BUCKET="${S3_BUCKET:-poker-blueprint-unified}"
@@ -91,8 +91,10 @@ echo ""
 case "$INSTANCE_TYPE" in
     c5.18xlarge) OD_PRICE="3.06";;
     c5.metal)    OD_PRICE="4.08";;
+    c6a.metal)   OD_PRICE="4.90";;
+    c7a.metal)   OD_PRICE="5.20";;
     r5.24xlarge) OD_PRICE="6.05";;
-    *)           OD_PRICE="3.00";;
+    *)           OD_PRICE="5.00";;
 esac
 COST=$(echo "$OD_PRICE * $HOURS" | bc 2>/dev/null || echo "???")
 echo "Estimated cost: ~\$$COST (on-demand)"
