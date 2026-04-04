@@ -45,7 +45,7 @@ INITIAL_STACK = 10000 # $10,000 = 100BB
 
 # Pluribus bet sizes: up to 14 for preflop, 3 for later rounds
 # 14 preflop sizes: dense in open/3-bet range, geometric in 4-bet/5-bet range
-PREFLOP_BET_SIZES = [0.4, 0.5, 0.6, 0.7, 0.8, 1.0, 1.2, 1.5, 2.0, 2.5, 3.0, 4.0, 6.0, 10.0]
+PREFLOP_BET_SIZES = [0.4, 0.5, 0.7, 1.0, 1.5, 2.5, 4.0, 8.0]
 # Postflop first raise: Pluribus turn/river = {0.5x, 1x, all-in}
 # (all-in added automatically by generate_actions; subsequent raises use {1x, all-in})
 POSTFLOP_BET_SIZES = [0.5, 1.0]
