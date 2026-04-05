@@ -133,9 +133,19 @@ Keep pruning but use a less aggressive threshold for preflop (e.g., -50M instead
 ### Option E: Fix strategy_sum accumulation
 The strategy_sum (average strategy) is NULL for UTG root info sets, which means the output strategy is the noisy current regret-matched one. Even if regrets oscillate, the average strategy should be smooth. Investigate why strategy_sum isn't being populated for UTG, and fix it. This might not fix the lock-in but would make the output strategies much better.
 
-## Recommendation
+## Important: Evaluate before fixing
 
-Start with **Option A** (exempt preflop from pruning) — it's the smallest code change, directly addresses the root cause, and has minimal performance impact (preflop is a tiny fraction of the tree). Then also investigate **Option E** (strategy_sum) because the average strategy matters for the final output.
+The analysis above is our best understanding but may be wrong or incomplete. Before implementing any fix:
+
+1. **Verify the diagnosis.** Is the lock-in actually caused by the pruning + pure strategy interaction described above? Or is there a different root cause (e.g., Linear CFR discount erasing signal, hash collisions corrupting regrets, incorrect postflop values)?
+
+2. **Check if Pluribus has this problem.** Read the Pluribus supplementary materials on pruning. Does Pluribus exempt certain streets from pruning? Does it use a different exploration mechanism? Our pruning parameters match Pluribus (threshold -300M, 95% of iters after warmup) — if Pluribus has the same parameters and doesn't have this problem, the root cause is something else.
+
+3. **Consider whether this is even a bug.** Maybe 99 SHOULD fold from UTG in the solver's equilibrium at this point in convergence, and it will eventually start raising as postflop values improve. The fact that 22 escaped the trap suggests the mechanism does self-correct for some hands. Maybe 99 just needs more iterations.
+
+4. **Test the hypothesis directly.** Before changing production code, run a controlled experiment: disable pruning entirely for a short run (e.g., 20M iterations from scratch) and check if 99/TT converge to raise. If they still fold, pruning isn't the cause.
+
+Only implement a fix after you're confident in the diagnosis.
 
 ## Testing
 
