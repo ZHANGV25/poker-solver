@@ -173,6 +173,13 @@ typedef struct {
     uint64_t texture_hash_keys[BP_MAX_TEXTURES];  /* hash key per texture */
     int num_cached_textures;
 
+    /* Precomputed turn k-means centroids for bucketing.
+     * 200 centroids in [EHS, PPot, NPot] feature space.
+     * During traversal, each hand's features are computed inline and
+     * mapped to nearest centroid. Matches Pluribus bucketing approach. */
+    float turn_centroids[200][3];
+    int turn_centroids_k;
+
     /* Stats */
     int64_t iterations_run;
     int64_t snapshots_saved;

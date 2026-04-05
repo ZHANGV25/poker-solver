@@ -202,3 +202,134 @@ compatible with BPR2/BPR3. Updated Python ctypes bindings to match.
 | `tests/enumerate_tree.py` | Full tree enumeration (preflop + postflop) |
 | `tests/test_tiered.py` | Smoke test: verify tiered sizing works end-to-end |
 | `tests/test_deploy_ready.py` | Pre-deploy validation: creation rate, save/load, int64, tiered vs flat |
+
+## Bug 6: strategy_sum not accumulated for SB, UTG, CO (modular arithmetic aliasing)
+
+**Problem:** The strategy_sum accumulation for preflop (round 1) only triggered when
+`iteration % strategy_interval == 0` (strategy_interval = 10,000). Since the
+traverser is `(iteration - 1) % 6`, and `gcd(6, 10000) = 2`, only players
+1 (BB), 3 (MP), and 5 (BTN) were ever the traverser at multiples of 10,000.
+Players 0 (SB), 2 (UTG), and 4 (CO) were permanently excluded — their
+strategy_sum remained NULL forever.
+
+**Evidence:** `dump_raw_regrets` showed `Strategy sum: NULL` for all UTG root
+info sets across 4 checkpoints (2.0B–2.6B iterations). MP and BTN entries had
+populated strategy_sum values.
+
+**The fix:** Remove the interval check entirely. Accumulate strategy_sum on
+every traverser visit for preflop:
+
+```c
+// Before (buggy):
+if (street == 0 && (ts->iteration % s->config.strategy_interval) == 0) {
+// After (fixed):
+if (street == 0) {
+```
+
+This is cheap (preflop info sets are tiny) and ensures all 6 players accumulate.
+
+## Bug 7: Dominant-action feedback loop (call trap / fold trap)
+
+**Problem:** In external-sampling MCCFR, non-traversers sample actions according
+to the current regret-matched strategy. When one action dominates (e.g., 80% call),
+two self-reinforcing effects trap the solver:
+
+1. **Frozen dominant regret:** When strategy ≈ [0%, 80%, 1%, 1%, ...] (call dominant),
+   `node_value ≈ call_value`, so `regret[call] += call_value - call_value ≈ 0`.
+   Call regret freezes at its current positive value — identical to the fold lock-in
+   mechanism, but for call instead of fold.
+
+2. **Stale opponent strategies:** During non-traverser iterations, the dominant player
+   samples call 80% of the time. With 8 raise sizes each getting ~1%, opponent nodes
+   at "player raised size X" get ~80x less training data than "player called" nodes.
+   When the traverser explores raising, opponents respond with undertrained strategies,
+   producing unreliable raise values that prevent raise regrets from growing.
+
+This affects early positions (UTG, MP) severely because they face 5 opponents —
+more opponent nodes to train, each getting less data. Late positions (BTN, SB) with
+1-3 opponents converge correctly.
+
+**Evidence (2.5B iterations, strategy_sum averages):**
+
+| Position | Opponents | TT avg raise | 99 avg raise | Status |
+|----------|-----------|-------------|-------------|--------|
+| SB       | 1         | 94.7%       | 98.7%       | ✓ Works |
+| BTN      | 2-3       | 84.5%       | 91.4%       | ✓ Works |
+| CO       | 3-4       | 38.9%       | 58.4%       | Borderline |
+| UTG      | 5         | 39.6%       | 38.5%       | ✗ Broken |
+| MP       | 4-5       | 26.4%       | 23.6%       | ✗ Broken |
+
+Additional failure modes at UTG:
+- **Call trap:** TT raise declined monotonically: 63% → 41% → 34% → 12% → 38% avg
+- **Fold locked:** 44/33/22 at 100% fold across all checkpoints (same as original bug)
+- **Uniform stuck:** AKo, 88 show 9.1/9.1/81.8 (all regrets ≤ 0) after 2B+ iterations
+
+**Root cause:** The combination of (a) many competing raise sizes fragmenting the
+positive raise signal, and (b) external sampling's non-traverser using the current
+strategy, which starves minority actions of opponent training data.
+
+**The fix — Average Strategy Sampling (Lanctot et al., NIPS 2012):**
+
+For preflop non-traverser sampling, use the accumulated average strategy
+(strategy_sum) instead of the current regret-matched strategy. This preserves
+historical action frequencies even when the current strategy concentrates on
+one action, ensuring opponent nodes at all action subtrees receive adequate
+training data.
+
+```c
+// Non-traverser sampling in traverse():
+float *sample_strat = strategy;  // default: current regret-matched
+float avg_strat[BP_MAX_ACTIONS];
+if (street == 0 && is->strategy_sum) {
+    float sum = 0;
+    for (int a = 0; a < na; a++) sum += is->strategy_sum[a];
+    if (sum > 0) {
+        for (int a = 0; a < na; a++) avg_strat[a] = is->strategy_sum[a] / sum;
+        sample_strat = avg_strat;
+    }
+}
+int sampled = sample_action(sample_strat, na, ts->rng);
+```
+
+**Why not exempt preflop from pruning?** This was tried first. It broke the fold
+lock-in (99/TT started raising) but revealed the call trap underneath — same
+frozen-dominant-action mechanism, one level deeper. Pruning exemption is a
+symptom fix; AS addresses the root cause. Pruning was reverted to match Pluribus.
+
+**Why not reduce raise sizes?** Helps (concentrates signal), but doesn't fix the
+feedback loop. Even with 2 raise sizes, call can starve raise nodes of opponent
+training data. AS is orthogonal and can combine with fewer sizes if needed.
+
+## Bug 8: Spurious 10x regret scaling factor
+
+**Problem:** The regret delta was multiplied by 10.0f before casting to int:
+```c
+float raw_delta = (action_values[a] - node_value) * 10.0f;
+```
+
+This was added in commit `de36555` to "prevent float-to-int truncation" when chip
+values were small. But with $50/$100 blinds and $10,000 stacks, typical deltas are
+in the hundreds to thousands — truncation loses at most 1 chip, which is negligible.
+
+The 10x multiplier causes:
+1. Regrets hit ±310M ceiling/floor **10x faster**, saturating and losing information
+2. Actions reach the -300M pruning threshold 10x sooner, getting pruned before
+   proving their value
+3. External-sampling noise amplified 10x, making all value estimates less reliable
+
+Pluribus stores "regrets as 4-byte integers" with no scaling mentioned.
+
+**The fix:** Remove the scaling factor:
+```c
+// Before:
+float raw_delta = (action_values[a] - node_value) * 10.0f;
+// After:
+float raw_delta = action_values[a] - node_value;
+```
+
+## Diagnostic tools added (this session)
+
+| Tool | Purpose |
+|------|---------|
+| `tests/dump_raw_regrets.c` | Dump raw regret + strategy_sum for specific hands (fixed bucket indices) |
+| `tests/extract_roots.c` | Extract root strategies for all 6 positions, now shows strategy_sum average alongside regret-matched |

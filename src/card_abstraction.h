@@ -127,6 +127,36 @@ CA_EXPORT int ca_assign_buckets_kmeans(
     int *bucket_out
 );
 
+/**
+ * Compute [EHS, PPot, NPot] feature vectors for a set of hands.
+ * Used for k-means bucketing and centroid precomputation.
+ */
+CA_EXPORT void ca_compute_features(
+    const int *board, int num_board,
+    const int hands[][2], int num_hands,
+    int n_samples,
+    float features[][3]
+);
+
+/**
+ * Find the nearest centroid for a single 3D feature vector.
+ * Returns the centroid index (0 to k-1).
+ */
+static inline int ca_nearest_centroid(
+    const float feat[3], const float centroids[][3], int k
+) {
+    float best_dist = 1e30f;
+    int best = 0;
+    for (int c = 0; c < k; c++) {
+        float d0 = feat[0] - centroids[c][0];
+        float d1 = feat[1] - centroids[c][1];
+        float d2 = feat[2] - centroids[c][2];
+        float dist = d0*d0 + d1*d1 + d2*d2;
+        if (dist < best_dist) { best_dist = dist; best = c; }
+    }
+    return best;
+}
+
 CA_EXPORT int ca_preflop_classes(
     int classes_out[][2],
     int *hand_to_class,

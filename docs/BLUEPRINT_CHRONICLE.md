@@ -172,33 +172,225 @@ When a hand converges to 100% fold:
 
 **Unaffected:** 22 (escaped because raise regret crossed zero fast enough), AA/KK (never converged to pure fold), 32o (correctly folds, frozen but correct).
 
-### Status: ❌ UNSOLVED — needs fix in next session
-
-See `DEBUG_SESSION_2.md` for the full investigation prompt. Options include exempting preflop from pruning, raising the pruning threshold, or epsilon-greedy exploration. The diagnosis should be verified before implementing any fix (it could be a different root cause).
+### Status: ✅ ROOT CAUSE IDENTIFIED — fixed in Phase 6
 
 ---
 
-## Current State (end of April 4-5 session)
+## Phase 6: Fixing the Lock-In — Attempt 1: Pruning Exemption (April 5, 2026)
 
-### What works
-- Tiered preflop sizing (8/3/2/1) — 19x tree reduction
-- int64 support throughout — handles 3B table and 46.5B iterations
-- All 6 positions populated with correct position gradient
-- Premiums (AA, KK, AKo) converge correctly
-- Pure trash (32o, 72o) converge correctly
-- Checkpoint/resume system works with BPR4 format
-- Extract tools with correct hash function
+### Hypothesis: Pruning prevents locked hands from recovering
+The debug session diagnosed fold lock-in as: pure fold → fold regret frozen → raise
+regrets sink below -300M → pruning kills them permanently. Fix: exempt preflop from
+pruning.
 
-### What's broken
-- Preflop regret lock-in for marginal hands (99, TT, suited connectors)
-- strategy_sum NULL for UTG root info sets (average strategy not computed)
-- Instance self-terminated after first checkpoint (S3 upload may have failed with set -e)
+### Also found: strategy_sum aliasing bug (Bug 6)
+`iteration % 10000 == 0` combined with `traverser = (iter-1) % 6` created a phase
+lock — only players 1,3,5 accumulated strategy_sum. Players 0 (SB), 2 (UTG), 4 (CO)
+were permanently excluded. Fix: remove interval check, accumulate every visit.
 
-### Resources on S3 (`s3://poker-blueprint-unified/`)
-- `checkpoints/regrets_2B.bin` — 2.0B iterations, 66 GB, tiered config
-- `checkpoints/regrets_latest.bin` — 2.6B iterations, 66 GB, tiered config
-- `texture_cache.bin` — precomputed flop buckets (saves 40 min)
-- `checkpoints_old_flat8/` — old flat-8-sizes checkpoints (archived, don't use)
+### Local verification (2M iterations, 10M hash table, 1 thread)
+- UTG 99: **100% RAISE** (was 100% FOLD). Lock-in broken.
+- UTG TT: **100% RAISE**. All pocket pairs raising.
+- strategy_sum populated for all players.
+- 127/169 hands raising from UTG — too loose (tiny hash table, garbage postflop).
+- **Result:** Pruning fix works locally. Deployed to EC2 for proper verification.
 
-### No running instances
-All EC2 instances terminated. Next session should fix the lock-in bug before deploying.
+### EC2 run: Fresh start, 5B target, 500M checkpoints (c7a.metal-48xl)
+Instance `i-02b8082868fdbe0c6`, ~90K iter/s, checkpoints at 500M/1B/1.5B/2B/2.5B.
+
+**Convergence trajectory (UTG pocket pairs, regret-matched strategy):**
+
+| Hand | 500M | 1B | 1.5B | 2B | Diagnosis |
+|------|------|-----|------|-----|-----------|
+| AA | 11%R | 59%R | 87%R | 83%R | ✓ Converging |
+| KK | 1%R | 66%R | 75%R | 81%R | ✓ Converging |
+| TT | 63%R | 41%R | 34%R | 12%R | ✗ Declining → call trap |
+| 99 | 73%R | 40%R | 20%R | 0%R | ✗ 100% call at 2B |
+| 88 | uniform | uniform | uniform | uniform | ✗ No convergence |
+| 44-22 | fold | fold | fold | fold | ✗ Still locked |
+
+**The pruning fix solved the fold lock-in but revealed a deeper problem:**
+TT/99 moved from fold → call, not fold → raise. The call trap is the SAME
+frozen-dominant-action mechanism, one level deeper: call regret freezes when
+call dominates, raise regrets can't grow because opponent strategies at "player
+raised" nodes are undertrained.
+
+### Cross-position analysis confirms structural issue
+
+Position comparison at 2.5B (strategy_sum averages, not noisy snapshot):
+
+| Position | Opponents | TT avg raise | 99 avg raise |
+|----------|-----------|-------------|-------------|
+| SB | 1 | 94.7% | 98.7% |
+| BTN | 2-3 | 84.5% | 91.4% |
+| CO | 3-4 | 38.9% | 58.4% |
+| UTG | 5 | 39.6% | 38.5% |
+| MP | 4-5 | 26.4% | 23.6% |
+
+BTN: 15/15 pocket pairs raise. UTG: 5/15 raise, 4 call-trapped, 4 fold-locked,
+2 uniform-stuck. Perfectly correlated with opponent count.
+
+### Root cause: External Sampling feedback loop
+
+In ES-MCCFR, non-traversers sample from the CURRENT regret-matched strategy.
+When call dominates (80%), raise subtrees get ~1% sampling each → opponents at
+those nodes get 80x less training data → raise values are unreliable → raise
+regrets stay negative → call stays dominant. Self-reinforcing loop.
+
+With 8 open-raise sizes, each individual raise competes against a single
+concentrated call action. Even if total raise EV > call EV, no single raise
+size accumulates enough regret to overtake call.
+
+### Pruning fix reverted
+Exempting preflop from pruning deviates from Pluribus without fixing the root
+cause. Reverted to standard Pluribus pruning (river + fold exemptions only).
+
+---
+
+## Phase 7: Fixing the Lock-In — Attempt 2: Average Strategy Sampling (April 5, 2026)
+
+### Research: Lanctot et al., NIPS 2012
+"Efficient Monte Carlo CFR in Games with Many Player Actions" — a variant of
+MCCFR where non-traversers sample from the accumulated **average strategy**
+instead of the current regret-matched strategy. Proven to converge faster in
+games with many actions. 54% improvement over ES in no-limit hold'em.
+
+### Why AS fixes the feedback loop
+- Current strategy: 80% call → raise nodes get 1% each → stale opponents
+- Average strategy: historical mix (e.g., 40% call, 60% raise spread) → raise
+  nodes get meaningful sampling → opponents train properly → raise values improve
+  → raise regrets can grow → convergence
+
+We already maintain strategy_sum for preflop (Bug 6 fix). We just need to
+USE it for non-traverser sampling.
+
+### Implementation
+One change in the non-traverser branch of `traverse()`:
+```c
+if (street == 0 && is->strategy_sum) {
+    // normalize strategy_sum → avg_strat
+    sample_strat = avg_strat;
+}
+```
+
+Strategy_sum fix (Bug 6) retained — all players now accumulate correctly.
+Pruning reverted to Pluribus-standard.
+
+### Pluribus alignment check
+- Pluribus paper does NOT mention AS explicitly
+- But Pluribus hand-selected 1-14 raise sizes per decision point ("based on what
+  earlier versions used with significant positive probability") — they avoided the
+  fragmentation problem by design
+- Pluribus opens to ~2.0-2.25 BB; our 8 sizes include irrelevant options like
+  0.4x pot (min-raise) and 8.0x pot (overbet shove)
+- AS is the algorithmic fix; reducing open sizes to 2-3 is the abstraction fix.
+  Both address the same problem from different angles.
+
+### Also found: 10x regret scaling factor (Bug 8)
+Git blame traced `raw_delta * 10.0f` to commit `de36555` ("prevent float-to-int
+truncation"). With $50/$100 blinds and $10K stacks, deltas are naturally in the
+hundreds — truncation is negligible. The 10x causes regrets to hit the ±310M
+ceiling/floor and -300M pruning threshold 10x faster, amplifies noise, and
+accelerates premature pruning. Removed: `raw_delta = action_values[a] - node_value`.
+
+### Status: DEPLOYED — made things worse (see Phase 8)
+
+---
+
+## Phase 8: AS + No-10x Run — Failed (April 5, 2026)
+
+### EC2 run: AS + no-10x + standard pruning + fixed strategy_sum
+Instance `i-016f5878b0e6aaf2e`, fresh start, 500M checkpoint.
+
+**Result at 500M — WORSE than all previous runs:**
+
+| Hand | Phase 6 (pruning fix, 10x) | Phase 7+8 (AS, no-10x) |
+|------|---------------------------|------------------------|
+| AA | 11% raise (improving) | **uniform (no signal)** |
+| KK | 1.4% raise (improving) | **0% raise (100% call)** |
+| TT | 63% raise | **0% raise (100% call)** |
+| 99 | 73% raise | 79% raise |
+
+BTN converged perfectly (all pairs raise 85-97%). UTG was broken.
+
+### Root cause: AS bootstrap problem
+AS makes non-traversers sample from strategy_sum. In early iterations,
+strategy_sum is dominated by accumulated uniform strategy (all regrets start
+at 0 → 1/11 each action). Opponents sample uniformly → all UTG action values
+look similar → no regret differentiation → strategy stays uniform → more
+uniform data in strategy_sum → self-reinforcing loop.
+
+Every-visit strategy_sum accumulation worsened this: 83M uniform entries
+drowned out later signal.
+
+### Killed instance, reverted AS
+
+---
+
+## Phase 9: Return to Pluribus-Exact (April 5, 2026)
+
+### Full audit: what deviated from Pluribus?
+
+After 4 failed attempts, audited every algorithmic parameter against the paper:
+
+| Parameter | Pluribus | Our code | Status |
+|-----------|----------|----------|--------|
+| Non-traverser sampling | Current σ | **AS (strategy_sum)** | ✗ Reverted |
+| Regret scaling | None | **10x** | ✗ Removed |
+| Strategy_sum interval | Every 10K | **Every visit** | ✗ Fixed: 10007 (coprime) |
+| Pruning | River + fold | River + fold | ✓ |
+| Discount | d=T/(T+1) | d=T/(T+1) | ✓ |
+| PPot/NPot bucketing | K-means [EHS,PPot,NPot] | **All zeros (broken)** | ✗ Fixed |
+| Turn bucketing | K-means | **30-sample EHS percentile** | ✗ Fixed: k-means centroids |
+| River bucketing | K-means (but PPot/NPot=0) | 200-sample EHS percentile | ~ equivalent |
+
+### Changes made
+1. **Reverted AS** — non-traverser samples from current σ (standard ES)
+2. **10x already removed** in Phase 7
+3. **Strategy_sum interval** — changed from every-visit to every 10007 iterations
+   (coprime with 6, avoids aliasing, matches Pluribus intent)
+4. **Fixed PPot/NPot** in ca_compute_features — padding cards were identical to
+   board completion cards, making current=final evaluation, PPot/NPot always 0
+5. **Turn k-means centroids** — precomputed during init from 2000 sampled boards,
+   nearest-centroid lookup during traversal
+6. **River 200 samples** — up from 30
+7. **Flop texture cache regenerated** with fixed PPot/NPot
+
+### Monitoring improvement
+Worker runs in 50M mini-chunks with lightweight probes between each.
+`bp_get_strategy` reads directly from memory — no disk I/O. Probe uploaded
+to `s3://probes/probe_latest.txt` (~100 bytes). Full checkpoint every 500M.
+
+### Status: ✅ DEPLOYED — running on `i-0de1597e03994a548`
+
+---
+
+## Current State (end of April 5, 2026)
+
+### What the code matches
+Every algorithmic parameter now matches Pluribus exactly. Remaining known
+gaps are action abstraction (our 8 open sizes vs Pluribus hand-selected)
+and total compute (targeting 12,400 core-hours on 192-core metal instance).
+
+### What's running
+Instance `i-0de1597e03994a548` (c7a.metal-48xl), fresh start, 5B iteration
+target, 50M probe interval, 500M full checkpoint interval.
+Texture cache on S3 with fixed PPot/NPot k-means.
+
+### Monitoring
+```bash
+# Quick probe (100 bytes, instant):
+aws s3 cp s3://poker-blueprint-unified/probes/probe_latest.txt -
+
+# Full summary (after 500M checkpoint):
+aws s3 cp s3://poker-blueprint-unified/summaries/strategy_500M.txt -
+
+# SSH log:
+grep "Probe" /var/log/blueprint-unified.log | tail -5
+```
+
+### Key question this run answers
+Does standard Pluribus-matching ES-MCCFR (no 10x, no AS, fixed bucketing)
+converge correctly for UTG pocket pairs? If TT/99 show raise signal in
+the first few 50M probes, the algorithm works and we just need compute time.
+If not, the issue is in the action abstraction (8 open sizes).

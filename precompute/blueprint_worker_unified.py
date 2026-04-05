@@ -347,33 +347,56 @@ def main():
     sub_chunk_max = min(chunk_size, INT32_MAX)
     next_checkpoint_at = iters_done + chunk_size
 
+    # Solve in mini-chunks (50M) with lightweight strategy probes between each.
+    # Full checkpoint (regret save + S3 upload) only at chunk_size (500M) boundaries.
+    mini_chunk = 50_000_000  # strategy probe every 50M iterations
+
     while iters_done < total_iters:
-        # Solve up to the next checkpoint boundary, in int32-safe sub-chunks
-        iters_this_checkpoint = min(next_checkpoint_at, total_iters) - iters_done
-        while iters_this_checkpoint > 0:
-            call_size = min(iters_this_checkpoint, sub_chunk_max)
-            assert call_size <= 2_147_483_647, f"call_size {call_size} exceeds INT32_MAX!"
-            call_size_int = int(call_size)  # ensure native int, not numpy or other type
-            print(f"[Solve] {call_size_int:,} iters from {iters_done:,}...", flush=True)
-            ret = bp_lib.bp_solve(solver, ctypes.c_int64(call_size_int))
-            if ret != 0:
-                print(f"[Solve] bp_solve returned {ret}", flush=True)
-            iters_done += call_size
-            iters_this_checkpoint -= call_size
+        # Solve one mini-chunk
+        call_size = min(mini_chunk, total_iters - iters_done, sub_chunk_max)
+        call_size_int = int(call_size)
+        print(f"[Solve] {call_size_int:,} iters from {iters_done:,}...", flush=True)
+        ret = bp_lib.bp_solve(solver, ctypes.c_int64(call_size_int))
+        if ret != 0:
+            print(f"[Solve] bp_solve returned {ret}", flush=True)
+        iters_done += call_size
 
         elapsed = time.time() - t0
         n_is = bp_lib.bp_num_info_sets(solver)
         ips = iters_done / elapsed if elapsed > 0 else 0
-        remaining_h = (total_iters - iters_done) / ips / 3600 if ips > 0 else 0
-        print(f"[Checkpoint] {iters_done:,}/{total_iters:,} iters, "
-              f"{n_is:,} IS, {elapsed/3600:.1f}h elapsed, "
-              f"~{remaining_h:.1f}h remaining, {ips:.0f} iter/s")
 
-        # Export checkpoint
-        if args.output_dir:
-            _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is)
+        # Lightweight strategy probe: extract UTG pocket pair strategies
+        # directly from memory via bp_get_strategy (no disk I/O).
+        probe = _probe_preflop(bp_lib, solver)
+        if probe:
+            print(f"[Probe {iters_done:,}] {probe}", flush=True)
+            # Upload tiny probe file to S3
+            if args.s3_bucket and args.output_dir:
+                iter_tag = f"{iters_done // 1_000_000}M"
+                probe_path = os.path.join(args.output_dir, "probe_latest.txt")
+                with open(probe_path, 'w') as pf:
+                    pf.write(f"{iters_done} {probe}\n")
+                try:
+                    subprocess.run(
+                        ["aws", "s3", "cp", probe_path,
+                         f"s3://{args.s3_bucket}/probes/probe_{iter_tag}.txt",
+                         "--quiet"], capture_output=True, timeout=30)
+                    subprocess.run(
+                        ["aws", "s3", "cp", probe_path,
+                         f"s3://{args.s3_bucket}/probes/probe_latest.txt",
+                         "--quiet"], capture_output=True, timeout=30)
+                except Exception:
+                    pass
 
-        next_checkpoint_at = iters_done + chunk_size
+        # Full checkpoint at chunk_size boundaries
+        if iters_done >= next_checkpoint_at or iters_done >= total_iters:
+            remaining_h = (total_iters - iters_done) / ips / 3600 if ips > 0 else 0
+            print(f"[Checkpoint] {iters_done:,}/{total_iters:,} iters, "
+                  f"{n_is:,} IS, {elapsed/3600:.1f}h elapsed, "
+                  f"~{remaining_h:.1f}h remaining, {ips:.0f} iter/s")
+            if args.output_dir:
+                _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is)
+            next_checkpoint_at = iters_done + chunk_size
 
     elapsed = time.time() - t0
     n_is = bp_lib.bp_num_info_sets(solver)
@@ -389,6 +412,43 @@ def main():
 
     bp_lib.bp_free(solver)
     print("\nDone.")
+
+
+def _probe_preflop(bp_lib, solver):
+    """Extract UTG pocket pair strategies directly from memory.
+    Returns a compact string like 'AA:R83 KK:R75 TT:C62 99:F100'.
+    Uses bp_get_strategy which reads the in-memory hash table — instant."""
+    try:
+        # Pocket pair bucket indices: AA=0, KK=25, QQ=48, JJ=69, TT=88,
+        # 99=105, 88=120, 77=133, 66=144, 55=153, 44=160, 33=165, 22=168
+        pairs = [
+            ("AA", 0), ("KK", 25), ("QQ", 48), ("JJ", 69), ("TT", 88),
+            ("99", 105), ("88", 120), ("77", 133), ("66", 144), ("55", 153),
+            ("44", 160), ("33", 165), ("22", 168),
+        ]
+        strat_buf = (ctypes.c_float * 16)()
+        parts = []
+        for name, bucket in pairs:
+            # UTG = player 2, preflop = no board cards, root = no action sequence
+            empty_board = (ctypes.c_int * 1)(0)
+            empty_seq = (ctypes.c_int * 1)(0)
+            na = bp_lib.bp_get_strategy(solver, 2, empty_board, 0,
+                                         empty_seq, 0, strat_buf, bucket)
+            if na >= 3:
+                fold_p = strat_buf[0] * 100
+                call_p = strat_buf[1] * 100
+                raise_p = sum(strat_buf[a] for a in range(2, na)) * 100
+                if fold_p >= call_p and fold_p >= raise_p:
+                    parts.append(f"{name}:F{fold_p:.0f}")
+                elif call_p >= raise_p:
+                    parts.append(f"{name}:C{call_p:.0f}")
+                else:
+                    parts.append(f"{name}:R{raise_p:.0f}")
+            else:
+                parts.append(f"{name}:?")
+        return " ".join(parts)
+    except Exception as e:
+        return f"probe_error:{e}"
 
 
 def _s3_upload_with_retry(local_path, s3_uri, max_attempts=3, delay=5):
@@ -502,22 +562,71 @@ def _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is,
             (regret_path, "checkpoints/regrets_latest.bin"),
             (meta_path, "checkpoint_meta.json"),
         ]
-        # Also save a timestamped copy of every checkpoint for later analysis
-        iter_tag = f"{iters_done // 1_000_000_000}B" if iters_done >= 1_000_000_000 \
-            else f"{iters_done // 1_000_000}M"
+        # Also save a timestamped copy of every checkpoint for later analysis.
+        # Use "XB" for exact billions, "XM" otherwise (avoids collisions
+        # where e.g. 1.5B and 1B both mapped to "1B" via integer division).
+        if iters_done >= 1_000_000_000 and iters_done % 1_000_000_000 == 0:
+            iter_tag = f"{iters_done // 1_000_000_000}B"
+        else:
+            iter_tag = f"{iters_done // 1_000_000}M"
         uploads.append((regret_path, f"checkpoints/regrets_{iter_tag}.bin"))
         uploads.append((meta_path, f"checkpoints/meta_{iter_tag}.json"))
 
         if label == "final" and os.path.exists(bps_path):
             uploads.append((bps_path, "unified_blueprint.bps"))
-        for local, s3key in uploads:
+
+        # ── Run extract_roots for convergence monitoring ──
+        extract_bin = os.path.join(args.build_dir, "extract_roots")
+        summary_path = None
+        if os.path.exists(extract_bin):
+            summary_path = os.path.join(args.output_dir, f"strategy_{iter_tag}.txt")
+            try:
+                result = subprocess.run(
+                    [extract_bin, regret_path],
+                    capture_output=True, text=True, timeout=1800
+                )
+                with open(summary_path, 'w') as sf:
+                    sf.write(result.stdout)
+                # Print a compact UTG summary to the log
+                for line in result.stdout.splitlines():
+                    if "Summary:" in line or "SANITY" in line or "CHECK:" in line or "OK:" in line:
+                        print(f"  {line.strip()}")
+            except Exception as e:
+                print(f"  [WARN] extract_roots failed: {e}")
+                summary_path = None
+
+        # Upload small files FIRST (summary + meta) so results are visible
+        # immediately, then upload the large regret file once + server-side copy.
+        small_uploads = [(meta_path, "checkpoint_meta.json"),
+                         (meta_path, f"checkpoints/meta_{iter_tag}.json")]
+        if summary_path and os.path.exists(summary_path):
+            small_uploads.append((summary_path, f"summaries/strategy_{iter_tag}.txt"))
+        if label == "final" and os.path.exists(bps_path):
+            small_uploads.append((bps_path, "unified_blueprint.bps"))
+
+        for local, s3key in small_uploads:
             if os.path.exists(local):
                 try:
                     _s3_upload_with_retry(
                         local, f"s3://{args.s3_bucket}/{s3key}")
                 except subprocess.CalledProcessError:
-                    pass  # already logged in _s3_upload_with_retry
-        print(f"  Uploaded to s3://{args.s3_bucket}/ (saved as {iter_tag})")
+                    pass
+        print(f"  Summary uploaded to s3://{args.s3_bucket}/summaries/ ({iter_tag})")
+
+        # Upload regret file ONCE as latest, then server-side copy for timestamped.
+        # Saves uploading 76GB twice (was ~15-20 min overhead per checkpoint).
+        try:
+            _s3_upload_with_retry(
+                regret_path, f"s3://{args.s3_bucket}/checkpoints/regrets_latest.bin")
+            subprocess.run(
+                ["aws", "s3", "cp",
+                 f"s3://{args.s3_bucket}/checkpoints/regrets_latest.bin",
+                 f"s3://{args.s3_bucket}/checkpoints/regrets_{iter_tag}.bin",
+                 "--quiet"],
+                check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            print(f"  [WARN] regret upload/copy failed: {e}")
+        print(f"  Regrets uploaded to s3://{args.s3_bucket}/ ({iter_tag})")
 
 
 if __name__ == "__main__":

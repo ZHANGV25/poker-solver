@@ -963,10 +963,19 @@ static float traverse(TraversalState *ts, int acting_order_idx,
     } else if (street == 1 && ts->postflop_buckets_computed) {
         /* Flop: use precomputed k-means texture buckets */
         bucket = ts->postflop_bucket[ts->sampled_hands[ap]];
+    } else if (street == 2 && ts->num_board == 4 && s->turn_centroids_k > 0) {
+        /* Turn: compute [EHS, PPot, NPot] features for this hand, then
+         * map to nearest precomputed k-means centroid. Matches Pluribus:
+         * k-means on domain-specific features (Johanson 2013). */
+        int hand[1][2];
+        hand[0][0] = s->hands[ap][ts->sampled_hands[ap]][0];
+        hand[0][1] = s->hands[ap][ts->sampled_hands[ap]][1];
+        float feat[1][3];
+        ca_compute_features(ts->board, 4, (const int(*)[2])hand, 1, 200, feat);
+        bucket = ca_nearest_centroid(feat[0], (const float(*)[3])s->turn_centroids,
+                                      s->turn_centroids_k);
     } else if (street >= 2 && ts->num_board >= 4) {
-        /* Turn/River: compute EHS for this specific hand on the current board,
-         * then map to bucket via floor(ehs * num_buckets). This gives a
-         * deterministic per-street bucket that depends on the actual board. */
+        /* River (or turn fallback): EHS percentile with 200 MC samples. */
         int h = ts->sampled_hands[ap];
         int c0 = s->hands[ap][h][0], c1 = s->hands[ap][h][1];
         int blk[52] = {0};
@@ -975,14 +984,11 @@ static float traverse(TraversalState *ts, int acting_order_idx,
         int av[52]; int nav = 0;
         for (int c = 0; c < 52; c++) if (!blk[c]) av[nav++] = c;
         int wins = 0, ties = 0, total = 0;
-        /* Deterministic RNG seeded by board+hand for consistent bucketing */
         uint64_t erng = (uint64_t)c0 * 1000003ULL + (uint64_t)c1 * 999983ULL;
         for (int b = 0; b < ts->num_board; b++)
             erng = erng * 6364136223846793005ULL + (uint64_t)ts->board[b];
-        int cards_needed = 2 + (5 - ts->num_board); /* opp hand + remaining board */
-        /* 30 samples is sufficient for turn/river bucketing (200 buckets = 0.5% width).
-         * River needs only 2 opp cards (no board completion), so it's very fast. */
-        for (int si = 0; si < 30 && nav >= cards_needed; si++) {
+        int cards_needed = 2 + (5 - ts->num_board);
+        for (int si = 0; si < 200 && nav >= cards_needed; si++) {
             partial_shuffle(av, nav, cards_needed, &erng);
             int fb[5];
             for (int b = 0; b < ts->num_board; b++) fb[b] = ts->board[b];
@@ -1090,7 +1096,7 @@ static float traverse(TraversalState *ts, int acting_order_idx,
          * Clamp delta to prevent int32 overflow (UB in C), then
          * clamp result to [REGRET_FLOOR, REGRET_CEILING]. */
         for (int a = 0; a < na; a++) {
-            float raw_delta = (action_values[a] - node_value) * 10.0f;
+            float raw_delta = action_values[a] - node_value;
             int delta;
             if (raw_delta > 2e9f) delta = (int)2e9;
             else if (raw_delta < -2e9f) delta = (int)-2e9;
@@ -1101,9 +1107,14 @@ static float traverse(TraversalState *ts, int acting_order_idx,
             else is->regrets[a] = (int)tmp;
         }
 
-        /* Strategy sum: only for preflop (street == 0) in unified mode,
-         * every strategy_interval iterations. Matches Pluribus: only round 1. */
-        if (street == 0 && (ts->iteration % s->config.strategy_interval) == 0) {
+        /* Strategy sum: accumulate for preflop (street 0) every 10007
+         * iterations. Matches Pluribus: UPDATE-STRATEGY called every
+         * Strategy Interval (10K) for first betting round only.
+         * Using 10007 (prime) instead of 10000 to avoid aliasing with
+         * traverser cycling: gcd(6, 10000)=2 caused only players 1,3,5
+         * to accumulate, permanently excluding SB(0), UTG(2), CO(4).
+         * gcd(6, 10007)=1, so all 6 players get equal accumulation. */
+        if (street == 0 && (ts->iteration % 10007) == 0) {
             ensure_strategy_sum(is);
             for (int a = 0; a < na; a++)
                 is->strategy_sum[a] += strategy[a];
@@ -1112,7 +1123,8 @@ static float traverse(TraversalState *ts, int acting_order_idx,
         return node_value;
 
     } else {
-        /* Non-traverser: sample one action */
+        /* Non-traverser: sample one action from current strategy.
+         * Matches Pluribus Algorithm 1: opponents play according to σ(I). */
         int sampled = sample_action(strategy, na, ts->rng);
 
         TraversalState child = *ts;
@@ -1558,6 +1570,153 @@ int bp_init_unified(BPSolver *s, int num_players,
         printf("[BP] Precomputed %d textures in %.1fs\n", tex_count, pc_elapsed);
     }
     } /* end else (skip if cache loaded) */
+
+    /* Precompute turn k-means centroids.
+     * Sample random turn boards, compute [EHS, PPot, NPot] features for all
+     * valid hands, then run k-means to get 200 centroids. During traversal,
+     * each hand's features are computed inline and mapped to nearest centroid.
+     * This replaces floor(ehs * 200) percentile bucketing on the turn. */
+    {
+        printf("[BP] Precomputing turn k-means centroids...\n");
+        clock_t tc_start = clock();
+
+        int k = s->postflop_num_buckets;
+        if (k > 200) k = 200;
+        int n_turn_boards = 2000;
+        int feat_samples = 200;
+
+        /* Collect feature vectors from sampled turn boards */
+        int max_feat = n_turn_boards * 1200;
+        float (*all_feat)[3] = (float(*)[3])malloc((size_t)max_feat * 3 * sizeof(float));
+        int n_feat = 0;
+
+        uint64_t trng = 0xABCDEF0123456789ULL;
+        for (int ti = 0; ti < n_turn_boards && n_feat < max_feat - 1200; ti++) {
+            /* Sample random 4-card turn board */
+            int deck[52];
+            for (int c = 0; c < 52; c++) deck[c] = c;
+            for (int i = 0; i < 4; i++) {
+                int j = i + (int)(rng_next(&trng) % (uint64_t)(52 - i));
+                int tmp = deck[i]; deck[i] = deck[j]; deck[j] = tmp;
+            }
+            int board[4] = {deck[0], deck[1], deck[2], deck[3]};
+
+            /* Generate valid hands */
+            int bblk[52] = {0};
+            for (int b = 0; b < 4; b++) bblk[board[b]] = 1;
+            int hands[BP_MAX_HANDS][2];
+            int nh = 0;
+            for (int c0 = 0; c0 < 52; c0++) {
+                if (bblk[c0]) continue;
+                for (int c1 = c0 + 1; c1 < 52; c1++) {
+                    if (bblk[c1]) continue;
+                    if (nh >= BP_MAX_HANDS) goto turn_hands_done;
+                    hands[nh][0] = c0;
+                    hands[nh][1] = c1;
+                    nh++;
+                }
+            }
+            turn_hands_done:;
+
+            /* Compute [EHS, PPot, NPot] for all hands on this board */
+            int batch = (nh > 300) ? 300 : nh;  /* subsample for speed */
+            float feats[BP_MAX_HANDS][3];
+            ca_compute_features(board, 4, (const int(*)[2])hands, batch,
+                                feat_samples, feats);
+
+            for (int h = 0; h < batch && n_feat < max_feat; h++) {
+                all_feat[n_feat][0] = feats[h][0];
+                all_feat[n_feat][1] = feats[h][1];
+                all_feat[n_feat][2] = feats[h][2];
+                n_feat++;
+            }
+        }
+
+        /* Run k-means on all collected features.
+         * Sort by EHS for percentile-seeded centroid initialization
+         * (same method as ca_assign_buckets_kmeans). Without sorting,
+         * seeds are effectively random → many empty clusters. */
+        int *sorted_idx = (int*)malloc(n_feat * sizeof(int));
+        for (int f = 0; f < n_feat; f++) sorted_idx[f] = f;
+        /* Simple insertion sort on EHS (feature[0]) — n_feat is ~600K,
+         * too large for insertion sort. Use qsort with a static array ref. */
+        /* Store EHS + index pairs for sorting */
+        typedef struct { float ehs; int idx; } EhsIdx;
+        EhsIdx *sort_buf = (EhsIdx*)malloc(n_feat * sizeof(EhsIdx));
+        for (int f = 0; f < n_feat; f++) {
+            sort_buf[f].ehs = all_feat[f][0];
+            sort_buf[f].idx = f;
+        }
+        /* qsort comparator defined as nested function (GCC extension) or
+         * use a simple shell sort for portability */
+        for (int gap = n_feat / 2; gap > 0; gap /= 2)
+            for (int i = gap; i < n_feat; i++) {
+                EhsIdx tmp = sort_buf[i];
+                int j = i;
+                while (j >= gap && sort_buf[j - gap].ehs > tmp.ehs) {
+                    sort_buf[j] = sort_buf[j - gap];
+                    j -= gap;
+                }
+                sort_buf[j] = tmp;
+            }
+
+        float (*centroids)[3] = (float(*)[3])malloc((size_t)k * 3 * sizeof(float));
+        for (int c = 0; c < k; c++) {
+            int si = (int)((float)c / k * n_feat);
+            if (si >= n_feat) si = n_feat - 1;
+            int fi = sort_buf[si].idx;
+            centroids[c][0] = all_feat[fi][0];
+            centroids[c][1] = all_feat[fi][1];
+            centroids[c][2] = all_feat[fi][2];
+        }
+        free(sort_buf);
+        free(sorted_idx);
+
+        int *counts = (int*)calloc(k, sizeof(int));
+        float (*sums)[3] = (float(*)[3])calloc((size_t)k * 3, sizeof(float));
+        for (int iter = 0; iter < 20; iter++) {
+            memset(counts, 0, k * sizeof(int));
+            memset(sums, 0, (size_t)k * 3 * sizeof(float));
+            for (int f = 0; f < n_feat; f++) {
+                int best_c = 0;
+                float best_d = 1e30f;
+                for (int c = 0; c < k; c++) {
+                    float d0 = all_feat[f][0] - centroids[c][0];
+                    float d1 = all_feat[f][1] - centroids[c][1];
+                    float d2 = all_feat[f][2] - centroids[c][2];
+                    float d = d0*d0 + d1*d1 + d2*d2;
+                    if (d < best_d) { best_d = d; best_c = c; }
+                }
+                counts[best_c]++;
+                sums[best_c][0] += all_feat[f][0];
+                sums[best_c][1] += all_feat[f][1];
+                sums[best_c][2] += all_feat[f][2];
+            }
+            for (int c = 0; c < k; c++) {
+                if (counts[c] > 0) {
+                    centroids[c][0] = sums[c][0] / counts[c];
+                    centroids[c][1] = sums[c][1] / counts[c];
+                    centroids[c][2] = sums[c][2] / counts[c];
+                }
+            }
+        }
+
+        int actual_k = 0;
+        for (int c = 0; c < k; c++) {
+            if (counts[c] > 0 && actual_k < 200) {
+                s->turn_centroids[actual_k][0] = centroids[c][0];
+                s->turn_centroids[actual_k][1] = centroids[c][1];
+                s->turn_centroids[actual_k][2] = centroids[c][2];
+                actual_k++;
+            }
+        }
+        s->turn_centroids_k = actual_k;
+
+        free(all_feat); free(centroids); free(counts); free(sums);
+        double tc_elapsed = (double)(clock() - tc_start) / CLOCKS_PER_SEC;
+        printf("[BP] Turn centroids: %d clusters from %d samples in %.1fs\n",
+               actual_k, n_feat, tc_elapsed);
+    }
 
     return 0;
 }

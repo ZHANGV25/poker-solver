@@ -122,6 +122,8 @@ aws s3 sync "$PROJECT_DIR/src" "s3://$S3_BUCKET/code/src/" \
 aws s3 sync "$PROJECT_DIR/precompute" "s3://$S3_BUCKET/code/precompute/" --quiet
 aws s3 sync "$PROJECT_DIR/python" "s3://$S3_BUCKET/code/python/" \
     --quiet --exclude "__pycache__/*" --exclude "*.pyc"
+aws s3 sync "$PROJECT_DIR/tests" "s3://$S3_BUCKET/code/tests/" \
+    --quiet --exclude "*.o" --exclude "__pycache__/*"
 echo "Code uploaded."
 
 USERDATA=$(cat <<USERDATA
@@ -139,6 +141,8 @@ aws s3 sync s3://$S3_BUCKET/code/ \$WORKDIR/ --quiet
 
 echo "Compiling with -O2 -march=native..."
 gcc -O2 -march=native -fno-strict-aliasing -fPIC -shared -fopenmp -o build/mccfr_blueprint.so src/mccfr_blueprint.c src/card_abstraction.c -I src -lm -lpthread
+gcc -O2 -march=native -o build/extract_roots tests/extract_roots.c -lm
+gcc -O2 -march=native -o build/dump_raw_regrets tests/dump_raw_regrets.c -lm
 echo "Compilation complete."
 
 # Download precomputed texture cache (saves ~40 min precomputation)
@@ -150,14 +154,13 @@ export OMP_NUM_THREADS=\$(nproc)
 
 echo "Starting unified solve: \$(nproc) threads, ${HOURS}h..."
 python3 -u precompute/blueprint_worker_unified.py \
-    --time-limit-hours $HOURS \
+    --iterations 5000000000 \
     --num-threads \$(nproc) \
     --hash-size $HASH_SIZE \
     --output-dir /opt/blueprint_unified \
     --s3-bucket $S3_BUCKET \
-    --checkpoint-interval 2000000000 \
-    --build-dir build \
-    --resume
+    --checkpoint-interval 500000000 \
+    --build-dir build
 
 echo "=== Complete at \$(date) ==="
 aws s3 cp /var/log/blueprint-unified.log s3://$S3_BUCKET/logs/unified.log --quiet

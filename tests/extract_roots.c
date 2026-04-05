@@ -72,6 +72,8 @@ typedef struct {
     int bucket;
     int na;
     int regrets[MAX_ACTIONS];
+    float strategy_sum[MAX_ACTIONS];
+    int has_sum;
     int found;
 } Root;
 
@@ -169,8 +171,9 @@ int main(int argc, char **argv) {
         if (na < 1 || na > MAX_ACTIONS) break;
         if (fread(regrets, 4, na, f) != (size_t)na) break;
         if (fread(&has_sum, 4, 1, f) != 1) break;
+        float ss[MAX_ACTIONS];
+        memset(ss, 0, sizeof(ss));
         if (has_sum) {
-            float ss[MAX_ACTIONS];
             if (fread(ss, 4, na, f) != (size_t)na) break;
         }
 
@@ -182,6 +185,8 @@ int main(int argc, char **argv) {
                     r->bucket = bucket;
                     r->na = na;
                     memcpy(r->regrets, regrets, na * sizeof(int));
+                    memcpy(r->strategy_sum, ss, na * sizeof(float));
+                    r->has_sum = has_sum;
                     r->found = 1;
                 }
             }
@@ -190,6 +195,17 @@ int main(int argc, char **argv) {
         total++;
         if (total % 200000000 == 0)
             fprintf(stderr, "  %lldM entries...\n", total / 1000000);
+
+        /* Early exit: stop scanning once all 6×169 root entries found */
+        int all_found = 1;
+        for (int ri = 0; ri < 6 && all_found; ri++)
+            for (int b = 0; b < 169 && all_found; b++)
+                if (!roots[ri][b].found) all_found = 0;
+        if (all_found) {
+            fprintf(stderr, "  All roots found at entry %lldM, stopping early\n",
+                    total / 1000000);
+            break;
+        }
     }
     fclose(f);
     free(iobuf);
@@ -201,13 +217,17 @@ int main(int argc, char **argv) {
 
         printf("========== %s — %s (player %d) [%d/169 found] ==========\n",
                root_labels[ri], POS[root_players[ri]], root_players[ri], found);
-        printf("%-5s  %5s %5s %5s   %-5s\n", "Hand", "fold", "call", "raise", "best");
+        printf("%-5s  %5s %5s %5s   %-5s  | %5s %5s %5s   %-5s\n",
+               "Hand", "fold", "call", "raise", "best",
+               "aFld", "aCll", "aRse", "avg");
 
         int n_fold = 0, n_call = 0, n_raise = 0, n_miss = 0;
+        int a_fold = 0, a_call = 0, a_raise = 0;
         for (int b = 0; b < 169; b++) {
             Root *r = &roots[ri][b];
-            if (!r->found) { n_miss++; continue; }  /* skip NOT FOUND to reduce noise */
+            if (!r->found) { n_miss++; continue; }
 
+            /* Regret-matched (current snapshot) */
             float strat[MAX_ACTIONS];
             regret_match(r->regrets, strat, r->na);
 
@@ -221,11 +241,32 @@ int main(int argc, char **argv) {
             else if (call_p >= fold_p && call_p >= raise_p) { best = "CALL"; n_call++; }
             else { best = "RAISE"; n_raise++; }
 
-            printf("%-5s  %5.1f %5.1f %5.1f   %-5s\n",
-                   LABELS[b], fold_p*100, call_p*100, raise_p*100, best);
+            /* Average strategy from strategy_sum */
+            float af = 0, ac = 0, ar = 0;
+            const char *abest = "---";
+            if (r->has_sum) {
+                float sum = 0;
+                for (int a = 0; a < r->na; a++) sum += r->strategy_sum[a];
+                if (sum > 0) {
+                    af = (r->na >= 1) ? r->strategy_sum[0] / sum : 0;
+                    ac = (r->na >= 2) ? r->strategy_sum[1] / sum : 0;
+                    ar = 0;
+                    for (int a = 2; a < r->na; a++) ar += r->strategy_sum[a] / sum;
+
+                    if (af >= ac && af >= ar) { abest = "FOLD"; a_fold++; }
+                    else if (ac >= af && ac >= ar) { abest = "CALL"; a_call++; }
+                    else { abest = "RAISE"; a_raise++; }
+                }
+            }
+
+            printf("%-5s  %5.1f %5.1f %5.1f   %-5s  | %5.1f %5.1f %5.1f   %-5s\n",
+                   LABELS[b], fold_p*100, call_p*100, raise_p*100, best,
+                   af*100, ac*100, ar*100, abest);
         }
-        printf("Summary: %d fold, %d call, %d raise, %d missing\n\n",
+        printf("Summary: %d fold, %d call, %d raise, %d missing\n",
                n_fold, n_call, n_raise, n_miss);
+        printf("Avg:     %d fold, %d call, %d raise\n\n",
+               a_fold, a_call, a_raise);
     }
 
     /* Sanity checks */
