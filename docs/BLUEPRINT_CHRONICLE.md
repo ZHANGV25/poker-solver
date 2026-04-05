@@ -394,3 +394,54 @@ Does standard Pluribus-matching ES-MCCFR (no 10x, no AS, fixed bucketing)
 converge correctly for UTG pocket pairs? If TT/99 show raise signal in
 the first few 50M probes, the algorithm works and we just need compute time.
 If not, the issue is in the action abstraction (8 open sizes).
+
+---
+
+## Phase 10: Deep Research — Two Critical Deviations Found (April 5, 2026)
+
+### Research: Pluribus supplementary, Brown thesis, open-source implementations
+
+Deep comparison of our `traverse()` against Pluribus Algorithm 1 pseudocode
+(TRAVERSE-MCCFR-P) revealed two deviations:
+
+### Bug 9: Pruned actions' regrets updated (should be left unchanged)
+
+The regret update loop iterated over ALL actions, giving pruned actions
+`delta = 0 - node_value = -node_value`. Since node_value > 0 for hands with
+positive EV (like TT from UTG), this pushed pruned raise regrets deeper
+negative on every pruned iteration (95% of all iterations).
+
+Pluribus Algorithm 1: `for a in explored do R(I,a) += v(a) - v(h)` — ONLY
+explored actions get regret updates. Pruned actions are left unchanged.
+
+This is the root cause of the call trap: pruned raise actions couldn't recover
+because 95% of iterations actively pushed them to the -310M floor. In Pluribus,
+they'd hold steady and gradually recover during the 5% unpruned iterations.
+
+**Fix:** Added `explored[BP_MAX_ACTIONS]` tracking array. Regret update loop
+now skips pruned actions with `if (!explored[a]) continue`.
+
+### Bug 10: Regret ceiling too low (310M vs ~2B)
+
+`BP_REGRET_CEILING = 310M` was added for int32 overflow protection, but int64
+intermediate arithmetic already prevents overflow. Pluribus has no explicit
+ceiling — only the implicit int32 max (~2.1B), which is 7x higher.
+
+The 310M ceiling caused dominant actions (call) to saturate before fragmented
+raise actions could catch up, contributing to "uniform stuck" failure mode.
+
+**Fix:** Raised ceiling from 310M to 2B.
+
+### Other findings (not implemented)
+
+- **UPDATE-STRATEGY tree walk:** Pluribus does a full-tree walk at opponent
+  nodes (enumerates ALL actions) to accumulate phi. Our code piggybacks on
+  traverse() which samples. Only affects average strategy quality, not
+  training dynamics. Low priority.
+
+- **DCFR parameterization (alpha=1.5, beta=0.5, gamma=2):** Brown's thesis
+  shows this converges faster than Linear CFR. Not a deviation from Pluribus
+  (which uses LCFR), but a potential improvement if bugs 9+10 don't suffice.
+
+- **No open-source implementation solves 6-player:** All are either 2-player,
+  toy games, or incomplete. Nobody has documented this convergence failure.

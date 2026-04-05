@@ -104,6 +104,7 @@ def load_bp_dll(build_dir):
                 ctypes.POINTER(ctypes.c_float), ctypes.c_int,
                 ctypes.c_int
             ]
+            bp.bp_get_regrets.restype = ctypes.c_int
             bp.bp_save_regrets.restype = ctypes.c_int
             bp.bp_save_regrets.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
             bp.bp_load_regrets.restype = ctypes.c_int64
@@ -310,10 +311,6 @@ def main():
     # If the instance dies, we lose at most one chunk of work.
     # The C solver's hash table accumulates regrets across bp_solve calls,
     # so calling bp_solve(N) then bp_solve(M) equals bp_solve(N+M).
-    chunk_size = args.checkpoint_interval
-    if chunk_size <= 0:
-        chunk_size = args.iterations  # no checkpointing
-
     total_iters = args.iterations
     iters_done = iters_already_done
     iters_remaining = total_iters - iters_done
@@ -324,7 +321,7 @@ def main():
         return
 
     print(f"\nStarting solve: {iters_remaining:,} iterations remaining "
-          f"(of {total_iters:,}), checkpoint every {chunk_size:,}...")
+          f"(of {total_iters:,}), adaptive checkpoints...")
     # Crash debugging: flush on every print and catch signals
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
@@ -341,19 +338,43 @@ def main():
 
     t0 = time.time()
 
-    # bp_solve takes int32 max_iterations. If chunk_size > INT32_MAX,
-    # split into sub-chunks for the C call but only checkpoint at chunk_size boundaries.
+    # Adaptive checkpoint schedule: dense early to catch convergence signal,
+    # then ramp up once we know the fix is working.
+    # Phase 1: 200M, 400M, 600M, 2B (diagnose pruning fix)
+    # Phase 2: 2B spacing up to 10B (confirm convergence)
+    # Phase 3: 10B spacing after that (long-run refinement)
+    checkpoint_milestones = [
+        200_000_000, 400_000_000, 600_000_000,
+        2_000_000_000, 4_000_000_000, 6_000_000_000, 8_000_000_000, 10_000_000_000,
+        20_000_000_000, 30_000_000_000, 40_000_000_000,
+    ]
+    # After last explicit milestone, checkpoint every 10B
+    checkpoint_ramp_interval = 10_000_000_000
+    last_milestone = checkpoint_milestones[-1] if checkpoint_milestones else 0
+
+    def _next_checkpoint(current):
+        """Return the next checkpoint iteration after current."""
+        for m in checkpoint_milestones:
+            if m > current:
+                return m
+        # Past all milestones: use ramp interval
+        base = last_milestone
+        while base <= current:
+            base += checkpoint_ramp_interval
+        return base
+
+    next_checkpoint_at = _next_checkpoint(iters_done)
+
+    # bp_solve takes int32 max_iterations for the C call.
     INT32_MAX = 2_147_483_647
-    sub_chunk_max = min(chunk_size, INT32_MAX)
-    next_checkpoint_at = iters_done + chunk_size
 
     # Solve in mini-chunks (50M) with lightweight strategy probes between each.
-    # Full checkpoint (regret save + S3 upload) only at chunk_size (500M) boundaries.
+    # Full checkpoint (regret save + S3 upload) only at adaptive milestones.
     mini_chunk = 50_000_000  # strategy probe every 50M iterations
 
     while iters_done < total_iters:
         # Solve one mini-chunk
-        call_size = min(mini_chunk, total_iters - iters_done, sub_chunk_max)
+        call_size = min(mini_chunk, total_iters - iters_done, INT32_MAX)
         call_size_int = int(call_size)
         print(f"[Solve] {call_size_int:,} iters from {iters_done:,}...", flush=True)
         ret = bp_lib.bp_solve(solver, ctypes.c_int64(call_size_int))
@@ -365,17 +386,19 @@ def main():
         n_is = bp_lib.bp_num_info_sets(solver)
         ips = iters_done / elapsed if elapsed > 0 else 0
 
-        # Lightweight strategy probe: extract UTG pocket pair strategies
-        # directly from memory via bp_get_strategy (no disk I/O).
+        # Lightweight strategy probe: extract strategies + raw regrets
+        # directly from memory via bp_get_strategy/bp_get_regrets (no disk I/O).
         probe = _probe_preflop(bp_lib, solver)
         if probe:
-            print(f"[Probe {iters_done:,}] {probe}", flush=True)
-            # Upload tiny probe file to S3
+            header = f"[Probe {iters_done:,}]"
+            for line in probe.split("\n"):
+                print(f"{header} {line}", flush=True)
+            # Upload probe file to S3
             if args.s3_bucket and args.output_dir:
                 iter_tag = f"{iters_done // 1_000_000}M"
                 probe_path = os.path.join(args.output_dir, "probe_latest.txt")
                 with open(probe_path, 'w') as pf:
-                    pf.write(f"{iters_done} {probe}\n")
+                    pf.write(f"iteration: {iters_done}\n{probe}\n")
                 try:
                     subprocess.run(
                         ["aws", "s3", "cp", probe_path,
@@ -388,7 +411,7 @@ def main():
                 except Exception:
                     pass
 
-        # Full checkpoint at chunk_size boundaries
+        # Full checkpoint at adaptive milestones (200M, 400M, 600M, 2B, 4B, ...)
         if iters_done >= next_checkpoint_at or iters_done >= total_iters:
             remaining_h = (total_iters - iters_done) / ips / 3600 if ips > 0 else 0
             print(f"[Checkpoint] {iters_done:,}/{total_iters:,} iters, "
@@ -396,7 +419,7 @@ def main():
                   f"~{remaining_h:.1f}h remaining, {ips:.0f} iter/s")
             if args.output_dir:
                 _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is)
-            next_checkpoint_at = iters_done + chunk_size
+            next_checkpoint_at = _next_checkpoint(iters_done)
 
     elapsed = time.time() - t0
     n_is = bp_lib.bp_num_info_sets(solver)
@@ -415,38 +438,77 @@ def main():
 
 
 def _probe_preflop(bp_lib, solver):
-    """Extract UTG pocket pair strategies directly from memory.
-    Returns a compact string like 'AA:R83 KK:R75 TT:C62 99:F100'.
-    Uses bp_get_strategy which reads the in-memory hash table — instant."""
+    """Extract preflop strategies and raw regrets for key hands.
+
+    Output format (multi-line):
+      UTG: AA:F0/C2/R98 KK:F0/C5/R95 ... 22:F85/C10/R5
+      BTN: AA:F0/C1/R99 KK:F0/C2/R98 ... 22:F60/C20/R20
+      REGRETS UTG TT: fold=+1234 call=+56789 best_raise=+12345 pruned=3/8
+      REGRETS UTG 99: fold=+5678 call=+45678 best_raise=-1234 pruned=5/8
+      REGRETS UTG 44: fold=+9012 call=-3456 best_raise=-78901 pruned=6/8
+
+    The REGRETS lines show raw int regrets for the 3 diagnostic hands.
+    'pruned=3/8' means 3 of 8 raise actions are below -300M threshold.
+    This directly measures whether the pruning fix is working."""
     try:
-        # Pocket pair bucket indices: AA=0, KK=25, QQ=48, JJ=69, TT=88,
-        # 99=105, 88=120, 77=133, 66=144, 55=153, 44=160, 33=165, 22=168
+        PRUNE_THRESH = -300_000_000
+
+        # Pocket pairs + key broadway/suited connectors that showed
+        # convergence issues (AKo uniform stuck, A5s/K9s/87s/98s fold locked)
         pairs = [
             ("AA", 0), ("KK", 25), ("QQ", 48), ("JJ", 69), ("TT", 88),
             ("99", 105), ("88", 120), ("77", 133), ("66", 144), ("55", 153),
             ("44", 160), ("33", 165), ("22", 168),
+            ("AKo", 2), ("AQs", 3), ("A5s", 17), ("K9s", 32),
+            ("98s", 106), ("87s", 121),
         ]
+        # Diagnostic hands: raw regrets for call trap / fold lock-in / uniform stuck
+        diag_hands = [("TT", 88), ("99", 105), ("44", 160), ("AKo", 2), ("87s", 121)]
+
+        # Positions: UTG=2, BTN=5
+        positions = [("UTG", 2), ("BTN", 5)]
+
         strat_buf = (ctypes.c_float * 16)()
-        parts = []
-        for name, bucket in pairs:
-            # UTG = player 2, preflop = no board cards, root = no action sequence
-            empty_board = (ctypes.c_int * 1)(0)
-            empty_seq = (ctypes.c_int * 1)(0)
-            na = bp_lib.bp_get_strategy(solver, 2, empty_board, 0,
-                                         empty_seq, 0, strat_buf, bucket)
-            if na >= 3:
-                fold_p = strat_buf[0] * 100
-                call_p = strat_buf[1] * 100
-                raise_p = sum(strat_buf[a] for a in range(2, na)) * 100
-                if fold_p >= call_p and fold_p >= raise_p:
-                    parts.append(f"{name}:F{fold_p:.0f}")
-                elif call_p >= raise_p:
-                    parts.append(f"{name}:C{call_p:.0f}")
+        regret_buf = (ctypes.c_int * 16)()
+        empty_board = (ctypes.c_int * 1)(0)
+        empty_seq = (ctypes.c_int * 1)(0)
+
+        lines = []
+
+        # Strategy lines for each position
+        for pos_name, player in positions:
+            parts = []
+            for name, bucket in pairs:
+                na = bp_lib.bp_get_strategy(solver, player, empty_board, 0,
+                                             empty_seq, 0, strat_buf, bucket)
+                if na >= 3:
+                    f_p = strat_buf[0] * 100
+                    c_p = strat_buf[1] * 100
+                    r_p = sum(strat_buf[a] for a in range(2, na)) * 100
+                    parts.append(f"{name}:F{f_p:.0f}/C{c_p:.0f}/R{r_p:.0f}")
                 else:
-                    parts.append(f"{name}:R{raise_p:.0f}")
+                    parts.append(f"{name}:?")
+            lines.append(f"{pos_name}: {' '.join(parts)}")
+
+        # Raw regret lines for diagnostic hands (UTG only)
+        for name, bucket in diag_hands:
+            na = bp_lib.bp_get_regrets(solver, 2, empty_board, 0,
+                                        empty_seq, 0, regret_buf, bucket)
+            if na >= 3:
+                fold_r = regret_buf[0]
+                call_r = regret_buf[1]
+                raise_regrets = [regret_buf[a] for a in range(2, na)]
+                best_raise = max(raise_regrets)
+                n_pruned = sum(1 for r in raise_regrets if r < PRUNE_THRESH)
+                n_raises = len(raise_regrets)
+                lines.append(
+                    f"REGRETS UTG {name}: fold={fold_r:+d} call={call_r:+d} "
+                    f"best_raise={best_raise:+d} pruned={n_pruned}/{n_raises}"
+                )
             else:
-                parts.append(f"{name}:?")
-        return " ".join(parts)
+                lines.append(f"REGRETS UTG {name}: not_found")
+
+        return "\n".join(lines)
     except Exception as e:
         return f"probe_error:{e}"
 

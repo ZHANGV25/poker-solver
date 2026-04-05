@@ -154,12 +154,13 @@ export OMP_NUM_THREADS=\$(nproc)
 
 echo "Starting unified solve: \$(nproc) threads, ${HOURS}h..."
 python3 -u precompute/blueprint_worker_unified.py \
-    --iterations 5000000000 \
+    --iterations 0 \
+    --time-limit-hours $HOURS \
     --num-threads \$(nproc) \
     --hash-size $HASH_SIZE \
     --output-dir /opt/blueprint_unified \
     --s3-bucket $S3_BUCKET \
-    --checkpoint-interval 500000000 \
+    --resume \
     --build-dir build
 
 echo "=== Complete at \$(date) ==="

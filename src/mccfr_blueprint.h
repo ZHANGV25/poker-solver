@@ -44,7 +44,11 @@
 
 /* Pluribus-matched constants */
 #define BP_REGRET_FLOOR      (-310000000)   /* minimum regret per action */
-#define BP_REGRET_CEILING     310000000     /* maximum regret per action (prevents int32 overflow) */
+#define BP_REGRET_CEILING     2000000000    /* ~int32 max. Pluribus has no explicit ceiling (only
+                                            * the implicit int32 max). The old 310M ceiling caused
+                                            * dominant actions to saturate 7x too early, losing
+                                            * ordering information when multiple actions competed.
+                                            * int64 intermediate arithmetic prevents overflow. */
 #define BP_PRUNE_THRESHOLD   (-300000000)   /* skip actions below this */
 #define BP_PRUNE_PROB        0.95f          /* fraction of iters that prune */
 
@@ -260,6 +264,16 @@ BP_EXPORT int bp_get_strategy(const BPSolver *s, int player,
                                const int *board, int num_board,
                                const int *action_seq, int seq_len,
                                float *strategy_out, int bucket);
+
+/**
+ * Extract raw integer regrets at a specific info set.
+ * regrets_out must have space for at least BP_MAX_ACTIONS ints.
+ * Returns num_actions, or 0 if info set not found.
+ */
+BP_EXPORT int bp_get_regrets(const BPSolver *s, int player,
+                              const int *board, int num_board,
+                              const int *action_seq, int seq_len,
+                              int *regrets_out, int bucket);
 
 BP_EXPORT int64_t bp_num_info_sets(const BPSolver *s);
 BP_EXPORT void bp_free(BPSolver *s);

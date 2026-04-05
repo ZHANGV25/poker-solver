@@ -1042,11 +1042,15 @@ static float traverse(TraversalState *ts, int acting_order_idx,
     if (next_order < 0) next_order = acting_order_idx;
 
     if (ap == ts->traverser) {
-        /* Traverser: explore all actions (with optional pruning) */
+        /* Traverser: explore all actions (with optional pruning).
+         * Pluribus Algorithm 1 (TRAVERSE-MCCFR-P): only explored actions
+         * get regret updates. Pruned actions are left unchanged. */
         float action_values[BP_MAX_ACTIONS];
+        int explored[BP_MAX_ACTIONS];
         float node_value = 0;
 
         for (int a = 0; a < na; a++) {
+            explored[a] = 0;
             /* Pruning: skip actions with very negative regret.
              * Pluribus exceptions: never prune on river (num_board >= 5),
              * never prune fold (leads to terminal node). */
@@ -1057,6 +1061,7 @@ static float traverse(TraversalState *ts, int acting_order_idx,
                 }
             }
 
+            explored[a] = 1;
             TraversalState child = *ts;
             child.action_history[child.history_len++] = a;
 
@@ -1091,11 +1096,13 @@ static float traverse(TraversalState *ts, int acting_order_idx,
             node_value += strategy[a] * action_values[a];
         }
 
-        /* Update integer regrets (Hogwild: no lock needed).
-         * With bucket-in-key, regrets is flat [num_actions].
-         * Clamp delta to prevent int32 overflow (UB in C), then
-         * clamp result to [REGRET_FLOOR, REGRET_CEILING]. */
+        /* Update integer regrets for EXPLORED actions only (Hogwild: no lock).
+         * Pluribus Algorithm 1: pruned actions' regrets are left unchanged.
+         * Previously we updated all actions, giving pruned actions
+         * delta = -node_value, pushing them deeper negative and preventing
+         * recovery (the root cause of the call trap at early positions). */
         for (int a = 0; a < na; a++) {
+            if (!explored[a]) continue;
             float raw_delta = action_values[a] - node_value;
             int delta;
             if (raw_delta > 2e9f) delta = (int)2e9;
@@ -2016,6 +2023,37 @@ int bp_get_strategy(const BPSolver *s, int player,
             } else {
                 regret_match(is->regrets, strategy_out, na);
             }
+            return na;
+        }
+    }
+    return 0;
+}
+
+int bp_get_regrets(const BPSolver *s, int player,
+                    const int *board, int num_board,
+                    const int *action_seq, int seq_len,
+                    int *regrets_out, int bucket) {
+    BPInfoKey key;
+    key.player = player;
+    key.street = board_to_street(num_board);
+    key.bucket = bucket;
+    key.board_hash = 0;
+    key.action_hash = compute_action_hash(action_seq, seq_len);
+
+    uint64_t h = hash_combine(key.board_hash, key.action_hash);
+    h = hash_combine(h, (uint64_t)key.player);
+    h = hash_combine(h, (uint64_t)key.street);
+    h = hash_combine(h, (uint64_t)key.bucket);
+    int64_t slot = (int64_t)(h % (uint64_t)s->info_table.table_size);
+
+    for (int probe = 0; probe < 1024; probe++) {
+        int64_t idx = (slot + probe) % s->info_table.table_size;
+        if (!s->info_table.occupied[idx]) return 0;
+        if (key_eq(&s->info_table.keys[idx], &key)) {
+            BPInfoSet *is = &s->info_table.sets[idx];
+            int na = is->num_actions;
+            for (int a = 0; a < na; a++)
+                regrets_out[a] = is->regrets[a];
             return na;
         }
     }

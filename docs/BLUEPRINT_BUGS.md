@@ -327,6 +327,51 @@ float raw_delta = (action_values[a] - node_value) * 10.0f;
 float raw_delta = action_values[a] - node_value;
 ```
 
+## Bug 9: Pruned actions' regrets updated instead of left unchanged
+
+**Problem:** In the regret update loop after traversal, ALL actions had their regrets
+updated — including pruned actions whose `action_values[a] = 0`. This gave pruned
+actions a delta of `0 - node_value = -node_value`, pushing them deeper negative on
+every pruned iteration (95% of iterations after pruning starts).
+
+Pluribus Algorithm 1 (TRAVERSE-MCCFR-P) explicitly only updates explored actions:
+```
+for a in explored do
+    R(I_i, a) <- R(I_i, a) + v(h,a) - v(h)
+```
+
+**Impact:** For UTG TT (call-trapped), `node_value ≈ call_value > 0`. Every pruned
+raise got delta ≈ -300 to -500 per pruned iteration, hammering it to the -310M floor.
+In Pluribus, pruned raises hold steady and recover during the 5% unpruned iterations.
+This is the root cause of the call trap: pruned raises couldn't recover because 95%
+of iterations actively pushed them deeper negative.
+
+**The fix:** Track which actions were explored, skip pruned actions in regret update:
+```c
+int explored[BP_MAX_ACTIONS];
+// ... in action loop: explored[a] = 1 for explored, 0 for pruned ...
+for (int a = 0; a < na; a++) {
+    if (!explored[a]) continue;  // <-- Pluribus: only update explored
+    // ... regret update ...
+}
+```
+
+## Bug 10: Regret ceiling too low (310M vs ~2.1B implicit in Pluribus)
+
+**Problem:** `BP_REGRET_CEILING` was set to 310M (symmetric with the -310M floor),
+added to prevent int32 overflow. But Pluribus has NO explicit ceiling — only the
+implicit int32 max (~2.1B). With int64 intermediate arithmetic already preventing
+overflow, the 310M ceiling was unnecessary and harmful.
+
+With 8 raise sizes, call accumulates regret as a single concentrated action and hits
+310M quickly. Individual raise sizes accumulate slower (signal fragmented across 8
+sizes). Both actions capping at 310M loses the ordering information — the strategy
+becomes more uniform than it should be. In Pluribus, call at 1B vs raise at 1.5B
+maintains a clear ordering.
+
+**The fix:** Raised ceiling from 310M to 2B (~int32 max), matching Pluribus's
+implicit upper bound.
+
 ## Diagnostic tools added (this session)
 
 | Tool | Purpose |
