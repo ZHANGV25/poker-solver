@@ -465,22 +465,32 @@ def _probe_preflop(bp_lib, solver):
         # Diagnostic hands: raw regrets for call trap / fold lock-in / uniform stuck
         diag_hands = [("TT", 88), ("99", 105), ("44", 160), ("AKo", 2), ("87s", 121)]
 
-        # Positions: UTG=2, BTN=5
-        positions = [("UTG", 2), ("BTN", 5)]
+        # Positions with their "folds to me" action sequences.
+        # Preflop order: UTG(2), MP(3), CO(4), BTN(5), SB(0), BB(1).
+        # Action index 0 = fold. Each position's root = all prior players folded.
+        positions = [
+            ("UTG", 2, []),              # first to act
+            ("BTN", 5, [0, 0, 0]),       # UTG, MP, CO folded
+        ]
 
         strat_buf = (ctypes.c_float * 16)()
         regret_buf = (ctypes.c_int * 16)()
         empty_board = (ctypes.c_int * 1)(0)
-        empty_seq = (ctypes.c_int * 1)(0)
 
         lines = []
 
         # Strategy lines for each position
-        for pos_name, player in positions:
+        for pos_name, player, action_seq in positions:
+            if action_seq:
+                c_seq = (ctypes.c_int * len(action_seq))(*action_seq)
+                seq_len = len(action_seq)
+            else:
+                c_seq = (ctypes.c_int * 1)(0)
+                seq_len = 0
             parts = []
             for name, bucket in pairs:
                 na = bp_lib.bp_get_strategy(solver, player, empty_board, 0,
-                                             empty_seq, 0, strat_buf, bucket)
+                                             c_seq, seq_len, strat_buf, bucket)
                 if na >= 3:
                     f_p = strat_buf[0] * 100
                     c_p = strat_buf[1] * 100
