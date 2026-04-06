@@ -501,9 +501,10 @@ def _probe_preflop(bp_lib, solver):
             lines.append(f"{pos_name}: {' '.join(parts)}")
 
         # Raw regret lines for diagnostic hands (UTG only)
+        utg_regret_seq = (ctypes.c_int * 1)(0)
         for name, bucket in diag_hands:
             na = bp_lib.bp_get_regrets(solver, 2, empty_board, 0,
-                                        empty_seq, 0, regret_buf, bucket)
+                                        utg_regret_seq, 0, regret_buf, bucket)
             if na >= 3:
                 fold_r = regret_buf[0]
                 call_r = regret_buf[1]
