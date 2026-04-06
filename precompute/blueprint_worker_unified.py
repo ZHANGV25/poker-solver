@@ -45,7 +45,7 @@ INITIAL_STACK = 10000 # $10,000 = 100BB
 
 # Pluribus bet sizes: up to 14 for preflop, 3 for later rounds
 # Flat preflop sizes (used as fallback if tiered not set)
-PREFLOP_BET_SIZES = [0.4, 0.5, 0.7, 1.0, 1.5, 2.5, 4.0, 8.0]
+PREFLOP_BET_SIZES = [0.5, 0.7, 1.0]
 # Postflop first raise: Pluribus turn/river = {0.5x, 1x, all-in}
 # (all-in added automatically by generate_actions; subsequent raises use {1x, all-in})
 POSTFLOP_BET_SIZES = [0.5, 1.0]
@@ -54,10 +54,10 @@ POSTFLOP_BET_SIZES = [0.5, 1.0]
 # Open gets fine-grained sizes; 3-bet/4-bet/5-bet get progressively fewer.
 # Enumerated tree: 2.28M preflop nodes × 169 = 386M preflop info sets (vs 7.4B flat).
 PREFLOP_TIERS = {
-    0: [0.4, 0.5, 0.7, 1.0, 1.5, 2.5, 4.0, 8.0],  # open raise: 8 sizes
-    1: [0.7, 1.0, 2.5],                               # 3-bet: 3 sizes
-    2: [1.0, 4.0],                                     # 4-bet: 2 sizes
-    3: [8.0],                                          # 5-bet: shove only
+    0: [0.5, 0.7, 1.0],    # open raise: 3 sizes (1.75BB, 2.05BB, 2.5BB)
+    1: [0.7, 1.0],          # 3-bet: 2 sizes
+    2: [1.0],               # 4-bet: 1 size
+    3: [8.0],               # 5-bet: shove only
 }
 PREFLOP_MAX_RAISES = 4
 
