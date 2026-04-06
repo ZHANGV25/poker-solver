@@ -445,3 +445,113 @@ raise actions could catch up, contributing to "uniform stuck" failure mode.
 
 - **No open-source implementation solves 6-player:** All are either 2-player,
   toy games, or incomplete. Nobody has documented this convergence failure.
+
+---
+
+## Phase 11: Performance & Sizing Analysis (April 6, 2026)
+
+### 3B hash table is the speed bottleneck
+
+The Bug 9 fix (correctly leaving pruned regrets unchanged) has a side effect:
+fewer actions reach -310M floor → less tree pruning → less speedup from pruning.
+The old broken code had most actions hammered to -310M, causing 95% of the tree
+to be skipped → 200-350K iter/s. With the fix, more of the tree stays alive.
+
+Measured sustained speed with 3B hash table on c7a.metal-48xl (192 cores):
+
+| Chunk | Speed | Info Sets |
+|-------|-------|-----------|
+| 200M→250M | 12,231/s | 1.32B |
+| 250M→300M | 12,176/s | 1.41B |
+| 300M→350M | 12,491/s | 1.48B |
+| 350M→400M | 13,251/s | 1.55B |
+| 400M→450M | 13,142/s | 1.60B |
+
+Average: ~12,600 iter/s. At this speed, 10B iterations = 8.75 days (~$1,100).
+
+Root cause: 3B hash table = 180GB metadata. 1.6B entries scattered across 180GB.
+Every hash lookup is a random memory access that misses CPU cache. 192 threads
+all doing random reads saturate memory bandwidth.
+
+Discount overhead is secondary: 8.75M discount_interval causes 6 full table scans
+per 50M chunk during discount phase (steps 1-40, first 350M iters). Each scan
+touches 1.6B entries with random pointer dereferences into 75GB of arena = ~120s
+per scan, single-threaded while 192 threads idle. But this only adds ~16% overhead
+during the discount phase and stops after 350M.
+
+### 8 open raise sizes → 2.4x more info sets than Pluribus
+
+Info set growth:
+- 200M iters: 1.21B info sets
+- 400M iters: 1.55B info sets
+- 470M iters: 1.63B info sets (still growing, expect plateau ~1.8-2.0B)
+
+Pluribus had 665M total action sequences, 414M encountered. We have 2.4x more.
+The extra info sets come from 8 open raise sizes creating more preflop paths
+to flops, each spawning a full postflop tree.
+
+### 200M checkpoint analysis: raise size preferences
+
+Per-raise regret analysis at 200M (UTG, across 13 pocket pairs):
+
+| Size | BB equiv | Pairs with +regret | Total regret | Verdict |
+|------|----------|-------------------|--------------|---------|
+| r0.7x | 2.05 BB | 7/13 | +1.2M | **Best** |
+| r1.0x | 2.5 BB | 6/13 | -16M | OK |
+| r0.5x | 1.75 BB | 5/13 | -15M | OK |
+| r0.4x | 1.6 BB | 4/13 | -10M | Marginal |
+| r1.5x | 3.25 BB | 4/13 | -20M | Marginal |
+| r2.5x | 4.75 BB | 4/13 | -24M | Dead weight |
+| r4.0x | 7.0 BB | 3/13 | -28M | Dead weight |
+| r8.0x | 13.0 BB | 4/13 | -47M | Dead weight |
+
+Pluribus opened to ~2.0-2.25 BB in published hand histories. Our r0.7x (2.05 BB)
+matches this exactly and is the only size with net positive regret.
+
+### Preflop tree size enumeration (tests/count_tiered.py)
+
+| Config | Preflop Nodes | × 169 = IS | Lines to Flop | Est Total IS |
+|--------|--------------|------------|---------------|-------------|
+| 8/3/2/1 (current) | 2,283,138 | 386M | 2,283,107 | ~1.8B |
+| 6/3/2/1 | 2,404,158 | 406M | 2,404,127 | ~1.9B |
+| 5/3/2/1 | 2,091,144 | 353M | 2,091,113 | ~1.7B |
+| 4/2/1/1 | 1,332,108 | 225M | 1,332,077 | ~950M |
+| **3/2/1/1** | **1,166,274** | **197M** | **1,166,243** | **~830M** |
+| 3/2/1 max3 | 380,825 | 64M | 380,794 | ~270M |
+
+3/2/1/1 config (open: 0.5x, 0.7x, 1.0x; 3-bet: 0.7x, 1.0x; 4-bet: 1.0x;
+5-bet: 8.0x) produces ~830M total IS — closest to Pluribus's 665M.
+Fits in a 1B hash table (60GB metadata) → dramatically better cache performance.
+Estimated 30-50K iter/s instead of 13K → 3-4x faster convergence.
+
+### AA calling from UTG
+
+At 200M, AA shows call=+405K(100%) with every raise size negative. Cross-position
+analysis shows a clean monotonic gradient: UTG 100% call → CO 76% → BTN 79% →
+SB 0% call (81% raise). This is structural (OOP multiway = calling favored for
+strongest hands) but the 100% magnitude is likely a convergence artifact.
+
+Notably, QQ-88 raise 95-99% from UTG while AA/KK call 79-100%. This "premium
+paradox" makes strategic sense: AA doesn't need to thin the field (dominates
+everything), while QQ-TT are vulnerable to overcards multiway.
+
+### Mystery instance incident
+
+An untagged c7a.metal-48xl instance kept respawning after being terminated.
+Root cause: a persistent spot request (`sir-piife22n`) created by the watchdog
+script on April 4. `InstanceInterruptionBehavior: stop` meant AWS restarted the
+instance every time we terminated it. The spot request was cancelled.
+
+The mystery instance ran with a 536M hash table (99.7% full at 535M info sets),
+producing corrupted checkpoints and broken probes that polluted S3. All corrupted
+data has been cleaned.
+
+### Current state (end of April 6)
+
+Running: `i-06b5d4556f0f9e076` (c7a.metal-48xl), resumed from 200M checkpoint,
+currently at ~470M, 12.6K iter/s. Probes broken (`empty_seq` reference bug in
+BTN fix). Valid 400M checkpoint on S3. Analysis instance loading 400M checkpoint
+for per-raise and limp-reraise diagnostics.
+
+Pending decision: reduce open raise sizes from 8 to 3 (0.5x, 0.7x, 1.0x) based
+on 200M analysis. Waiting for 400M analysis to confirm before making the change.
