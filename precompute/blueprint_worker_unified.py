@@ -338,18 +338,17 @@ def main():
 
     t0 = time.time()
 
-    # Adaptive checkpoint schedule: dense early to catch convergence signal,
-    # then ramp up once we know the fix is working.
-    # Phase 1: 200M, 400M, 600M, 2B (diagnose pruning fix)
-    # Phase 2: 2B spacing up to 10B (confirm convergence)
-    # Phase 3: 10B spacing after that (long-run refinement)
+    # Checkpoint schedule: dense early, then every 300M for spot safety.
+    # Target: 4B iterations. Every checkpoint uploaded to S3 so spot
+    # reclamation loses at most ~300M iterations (~5.5h at 15K iter/s).
     checkpoint_milestones = [
         200_000_000, 400_000_000, 600_000_000,
-        2_000_000_000, 4_000_000_000, 6_000_000_000, 8_000_000_000, 10_000_000_000,
-        20_000_000_000, 30_000_000_000, 40_000_000_000,
+        900_000_000, 1_200_000_000, 1_500_000_000, 1_800_000_000,
+        2_100_000_000, 2_400_000_000, 2_700_000_000, 3_000_000_000,
+        3_300_000_000, 3_600_000_000, 4_000_000_000,
     ]
-    # After last explicit milestone, checkpoint every 10B
-    checkpoint_ramp_interval = 10_000_000_000
+    # After last explicit milestone, checkpoint every 300M
+    checkpoint_ramp_interval = 300_000_000
     last_milestone = checkpoint_milestones[-1] if checkpoint_milestones else 0
 
     def _next_checkpoint(current):
