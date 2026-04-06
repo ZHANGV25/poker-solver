@@ -103,39 +103,259 @@ We offer 6-way, which is strictly superior.
 
 ## Feature Roadmap
 
-### MVP (Launch — Target: 6-8 weeks after blueprint completes)
+### Phase 1: Preflop-Only Launch (Target: 2-3 weeks after blueprint completes)
 
-**Must have:**
+Launch with preflop only. Zero compute cost at any scale — static data served from
+Vercel. Postflop goes behind a waitlist to validate demand before committing to GPU
+infrastructure ($200-500/mo EC2 burn).
+
+**Three access levels:**
+- **No account (landing page visitor):** One position visible (UTG, 100bb, open).
+  Interactive grid, can hover hands and see frequencies. AI Coach visible on a few
+  hands, rest blurred with "sign up to see." This is the demo.
+- **Free account (email signup):** Full preflop access. All positions, scenarios, stack
+  depths. AI Coach on every hand. Preflop trainer with explanations. Range comparison.
+  This is generous on purpose — it builds the user base and generates word of mouth.
+- **Pro account ($49/mo, introduced later with postflop):** Everything free has, plus
+  postflop solver, deeper trainer, hand history upload, session reports.
+
+**No paid tiers at launch.** Free only for 4-6 weeks while user base grows and postflop
+is built. Introducing Pro when there are thousands of free users who already trust the
+product converts better than charging day one with no social proof.
+
+**Must have for launch:**
 1. Web-based preflop strategy viewer
    - All 6 positions (UTG, MP, CO, BTN, SB, BB)
    - Color-coded range grids with raise/call/fold/3bet frequencies
    - Stack depth selection (50bb, 100bb, 150bb, 200bb)
-2. Postflop spot solver
+   - Scenario selection (open, vs open, vs 3-bet, vs 4-bet)
+2. AI Strategy Coach — pregenerated explanations on every hand (see section below)
+   - Click any hand → panel slides out with 2-3 sentence explanation
+   - 16,224 explanations pregenerated as static JSON (~$2 to generate)
+   - Zero runtime cost, zero latency, zero hallucination risk
+3. Preflop trainer / drill mode
+   - Random spot generation, user picks action, reveal GTO answer + AI explanation
+   - Session stats (accuracy %, EV loss tracking)
+   - Already built in frontend — wire to real blueprint data
+4. Range comparison across positions
+   - Side-by-side diff view (already built)
+   - Add: single-hand position sweep — show how one hand's strategy changes
+     across all 6 positions in one view (e.g., "AJo: UTG fold 72%, MP fold 55%,
+     CO raise 80%, BTN raise 95%")
+5. Multi-way impact toggle (landing page hero feature)
+   - Toggle between HU baseline ranges and 6-player ranges
+   - Watch the grid reshape in real time
+   - Uses publicly available HU data as baseline, our blueprint as 6-player
+   - Single most powerful marketing visual — demonstrates the product's
+     reason to exist in one interaction
+6. User accounts (Supabase auth, already built)
+   - No Stripe at launch — no paid tier yet
+7. Feedback button + Discord link
+   - Simple text form → Supabase table
+   - Discord server with #suggestions, #bugs, #general channels
+8. Public roadmap page
+   - Static page: what's built, what's in progress, what's planned
+   - Replaces FAQ for "when is postflop coming?"
+9. Postflop waitlist
+   - Signup form on the postflop page (already shows "coming soon")
+   - Track signups to gauge demand before investing in GPU infra
+
+### Phase 2: Postflop Launch (4-8 weeks after Phase 1)
+
+Only proceed if postflop waitlist shows strong demand. Introduces paid tier.
+
+**Must have:**
+1. Postflop spot solver
    - User inputs: positions, board, stack depth, action history
    - Returns strategy for each hand/bucket at decision point
    - Color-coded grid + EV display
-3. Strategy visualization
-   - Range grids (the standard poker solver UI)
-   - Action frequency bars
-   - EV comparison across actions
-4. User accounts + Stripe billing
+   - GPU-accelerated: ~200ms per solve on RTX 3060
+2. "What would villain do?" — Reverse range viewer
+   - Toggle "Hero" / "Villain" on any solved spot
+   - Shows villain's strategy weighted by Bayesian-narrowed range
+   - Opacity layer: hands still in villain's range are bright, narrowed-out
+     hands are ghosted
+   - Aggregate bar: "Villain's likely next action: bet large 45%, bet small
+     20%, check 35%" — weighted across entire narrowed range
+   - "If villain does X" branches: click to walk the game tree forward one
+     step, see hero's response, villain's range narrows further
+   - AI Coach works from villain's perspective too: "If villain has KsQh here,
+     the solver says they bet 85% of the time because they have top pair good
+     kicker on a board where most draws missed."
+   - Why this is unique: every other solver shows both players' strategies,
+     but none show the narrowed range — the Bayesian update of what villain
+     likely has based on observed actions. Our solver does this in real time.
+3. AI Coach — postflop runtime explanations
+   - Classify-then-phrase pipeline (see AI Coach section below)
+   - Deterministic reason classification in our code, LLM only phrases it
+   - Temperature 0, structured input, output validation, aggressive caching
+4. Hand replay with solver overlay
+   - Upload hand history → replay street by street
+   - At each decision point: show solver's recommendation overlaid on
+     what the user actually did, with EV difference
+   - AI Coach explains each deviation
+   - First 6-player hand replay tool that exists
+5. Session leak report ("Table Scanner")
+   - Upload batch of hands → one-page report of biggest leaks
+   - Ranked by total EV lost: "You lost 12bb by c-betting too often in
+     3-way pots" / "You lost 8bb folding too much to river bets"
+   - AI Coach explains each leak
+   - Actionable, specific, tied to real hands
+6. Stripe billing (Pro tier: $49/mo)
+7. Hand history parsing (already built in API — ACR, Stars, GG, Winamax, 888)
 
-**Should have (within 4 weeks of launch):**
-5. GTO Trainer / drill mode
-   - Interactive: system deals a hand, user picks action, system scores vs GTO
-   - Tracks accuracy over time, identifies leaks
-   - This is GTO Wizard's stickiest feature — critical for retention
-6. Hand history upload
-   - Parse HH from PokerStars, GGPoker, ACR, 888, Winamax
-   - Show solver recommendation for each decision point
-   - Leak identification: "You folded here but GTO says call 73% of the time"
+### Phase 3: Growth Features (Months 3-6)
 
-**Nice to have (months 3-6):**
-7. Node locking (exploitative adjustments)
-8. Aggregated reports (flop/turn/river strategy heatmaps across textures)
-9. ICM / tournament mode
-10. Mobile-responsive design (or native app)
+8. Node locking (exploitative adjustments)
+9. Aggregated reports (flop/turn/river strategy heatmaps across textures)
+10. ICM / tournament mode
 11. API access for power users
+12. Mobile-responsive polish (or native app)
+
+### AI Strategy Coach (All Tiers — Signature Feature)
+
+**The problem:** The #1 complaint across all poker solvers is "it tells me WHAT to do
+but not WHY." GTO Wizard, PioSOLVER, and every other tool output raw frequencies
+(raise 60%, call 30%, fold 10%) with no explanation. Players memorize numbers without
+building intuition.
+
+**The feature:** An LLM (Claude) explains solver decisions in plain language, grounded
+in the actual solver output. Not generic poker tips — specific explanations tied to the
+exact board, ranges, and EV data from the solver.
+
+**Critical design decision: NOT a chat.** This is a click-to-explain panel, not a
+conversational interface. Chat invites open-ended questions that lead to hallucination.
+The explanation box gives a controlled, grounded output for a fixed input (this hand,
+this position, this scenario). The user clicks a hand on the range grid, a panel slides
+out with 2-3 sentences explaining why.
+
+**Example UX:**
+> **Td9s — Under the Gun, 100bb, Open**
+>
+> Fold 72% · Call 0% · Raise 28%
+>
+> This hand is a marginal open from early position. When you raise, multiple players
+> behind you will call with hands that dominate you — AT, KT, and overpairs all have
+> you crushed. The solver raises occasionally to balance its range with suited broadways,
+> but folds most of the time because the risk of playing a dominated hand out of position
+> against multiple callers outweighs the reward.
+
+**Available at every tier (including free).** Rationale:
+- The people who need explanations most are the free/low-tier users still learning
+- The cost is negligible (see pregeneration below)
+- It's the single biggest differentiator vs every competitor — making it free makes it
+  our brand identity, not a locked upsell
+- A free user who can tap "why?" on any preflop hand and get a real explanation is a
+  user who tells their friends about the product
+
+**Tier gating — not the explanation, but the depth of what gets explained:**
+- **Free:** AI Coach on preflop decisions (preflop viewer + explanations = best free
+  poker tool that exists)
+- **Pro:** AI Coach on postflop decisions, trainer feedback, hand history analysis
+- **Elite:** AI Coach everywhere + deeper analysis ("how does this change if villain
+  is tighter/looser"), comparative explanations across positions
+
+#### Preflop Pregeneration (All Explanations Pre-Computed)
+
+Preflop is small enough to pregenerate every explanation. No runtime API calls needed.
+
+**Matrix:**
+- 169 hand classes × 6 positions × 4 scenarios × 4 stack depths = **16,224 explanations**
+- ~30-40% have non-obvious strategies worth detailed explanations (~6,000)
+- Trivial spots (72o UTG = fold) get simple templated explanations
+
+**Cost to pregenerate all 16,224:** ~$2 total using Claude Haiku
+(~150 input tokens + ~80 output tokens per explanation at Haiku pricing).
+
+**Implementation:**
+- Pregenerate all explanations as a JSON file alongside preflop data
+- Store as `{ position, hand, scenario, stack_depth } → explanation string`
+- Serve as static lookups — zero latency, zero API cost, works offline
+- Can review every explanation by hand before shipping (only 16K entries)
+- Regenerate the full set when blueprint data updates
+
+#### Postflop Runtime Explanations
+
+Postflop combinations are too large to pregenerate (boards × ranges × actions × stacks).
+Use a classify-then-phrase pipeline at runtime:
+
+**Step 1 — Deterministic classification (our code, no LLM):**
+```
+Solver data → reason tag
+Examples: "value_raise", "bluff_raise", "fold_dominated", "draw_priced_out",
+          "deny_equity", "range_balance", "position_disadvantage"
+```
+Based on hero equity, EV gaps, range composition, board texture. The reasoning is
+computed by our code — not the LLM.
+
+**Step 2 — LLM phrasing (Claude Haiku, temperature 0):**
+Feed structured solver data + reason tag. The model's job is translation, not analysis.
+
+**Structured input format:**
+```json
+{
+  "hero_hand": "Td9h",
+  "hero_position": "BB",
+  "board": "Ks9d4h",
+  "street": "flop",
+  "villain_position": "CO",
+  "villain_action": "bet 75% pot",
+  "villain_range_summary": {
+    "top_pair_plus": 0.35, "flush_draws": 0.15,
+    "overcards": 0.25, "air": 0.25
+  },
+  "solver_actions": {
+    "check_raise": { "frequency": 0.73, "ev": 2.3 },
+    "call": { "frequency": 0.22, "ev": 0.8 },
+    "fold": { "frequency": 0.05, "ev": 0.0 }
+  },
+  "hero_equity_vs_range": 0.54,
+  "reason_tag": "value_raise"
+}
+```
+
+**System prompt constraints:**
+- Only reference numbers provided in the input
+- Never invent equity percentages, frequencies, or EV values
+- Exactly 2-3 sentences
+- Temperature 0 for deterministic output
+
+**Step 3 — Output validation (our code):**
+- Check: does explanation mention numbers not in the input? Flag.
+- Check: does it reference cards not on the board? Flag.
+- Check: longer than 4 sentences? Truncate or regenerate.
+
+**Step 4 — Cache aggressively:**
+Same board texture + same hand class + same action pattern → serve cached explanation.
+Most users hit common spots. Cache hit rate will be high.
+
+**Runtime cost per postflop explanation:** ~$0.0003 (Haiku). Negligible even at scale.
+
+#### Hallucination Mitigation Summary
+
+| Layer | What It Does |
+|-------|-------------|
+| Structured input | LLM sees only exact solver data, can't invent context |
+| Reason classification | Reasoning is deterministic code, LLM only phrases it |
+| Temperature 0 | Same input → same output, no creative drift |
+| Output validation | Flag any numbers/cards not in input before showing user |
+| Short output (2-3 sentences) | Hallucination risk scales with length |
+| Pregeneration (preflop) | No runtime LLM at all for preflop — fully static |
+| Caching (postflop) | Common spots served from cache, no regeneration |
+
+**Competitive landscape:**
+- Octopi Poker ($15/mo) has "George" AI assistant — navigation helper, not grounded
+  in real solver output.
+- AceSolver claims AI "why" explanations — controversial accuracy, banned from
+  r/Poker_Theory. Community skeptical.
+- GTO Wizard — no AI explanation feature. Raw frequencies only.
+- PioSOLVER — nothing. Pure data.
+- **Nobody has LLM explanations grounded in actual solver output.** This is an open lane.
+
+**Why we're uniquely positioned:** Our solver provides richer context than anyone else
+can feed an LLM — actual narrowed ranges from Bayesian updates, bucket compositions,
+per-action EVs, and blueprint probabilities. GTO Wizard's neural net approach doesn't
+expose this intermediate data the same way.
 
 ### What Competitors Do Well (Copy These)
 
