@@ -555,3 +555,63 @@ for per-raise and limp-reraise diagnostics.
 
 Pending decision: reduce open raise sizes from 8 to 3 (0.5x, 0.7x, 1.0x) based
 on 200M analysis. Waiting for 400M analysis to confirm before making the change.
+
+---
+
+## Phase 7: 3-Size Run Analysis & Bug 11 (April 6, 2026)
+
+### 200M 3-size analysis
+
+The 3-size run (0.5x, 0.7x, 1.0x pot) reached 200M iterations. Analysis of the
+checkpoint revealed 6 actions per decision point (not 5): fold, call, r0.5x, r0.7x,
+r1.0x, and an automatic all-in shove (100BB). The shove is added by
+`generate_actions()` at every decision point — Pluribus-style.
+
+**Probe convergence 50M→200M:**
+- AA UTG: C34/R66 → C70/R30 → C47/R53 → C63/R37 — oscillating, NOT collapsing
+  to pure call like the 8-size run. Amplitude decreasing.
+- QQ UTG: Pure raise since 50M — locked.
+- JJ, AQs: Stuck at call — expected to resolve with more iterations.
+- 0.7x (2.05BB) is the preferred UTG open size: 7/13 pairs positive, least
+  negative total regret. Matches Pluribus published range.
+
+**Raise size convergence is poor at 200M.** The fold/call/raise decision is
+reasonably stable, but which raise size diverges significantly between current
+regrets and average strategy. QQ UTG: average strategy 96% r0.5x, but current
+regrets prefer r1.0x (56%). The average strategy lags behind oscillating regrets.
+
+### Bug 11: Hogwild hash table duplicate keys
+
+Deep analysis of anomalous hands (22, KTs, AKo all showing zero/tiny regrets)
+led to discovery of a race condition in `info_table_find_or_create`. See
+BLUEPRINT_BUGS.md for full details.
+
+**Discovery path:**
+1. Analysis showed 22 UTG with exactly zero regrets across all 6 actions — impossible
+   at 200M iterations (~150K samples expected)
+2. AKo had regrets in the hundreds vs AKs in the millions
+3. Built a C streaming checkpoint scanner (`diagnose_checkpoint.c`) — streamed
+   26.4GB from S3 in 20 minutes
+4. Found 38 duplicate root keys, all UTG, including all anomalous hands
+5. 19.3M all-zero preflop entries out of 34.2M total (56%)
+
+**The race:** Thread B's spin on a state=2 slot times out (1M iterations, ~1ms).
+B moves to next slot, creates duplicate entry. B's de-dup scan skips the original
+slot because it's still state=2 (only checks state=1).
+
+**Two fixes applied:**
+1. `spin_until_ready()` — unbounded spin with yield fallback, never skip state=2
+2. `bp_load_regrets` merge-on-load — ADD regrets for duplicate keys instead of
+   overwriting, recovering the split data from old checkpoints
+
+**Verified:** 16-thread stress test, 50K table at 100% capacity → 0 duplicates.
+
+### Current state (end of April 6, late)
+
+- On-demand solver instance terminated (analysis complete, checkpoint on S3)
+- Zero instances running
+- 200M checkpoint at `s3://poker-blueprint-unified/checkpoints/regrets_latest.bin`
+  (26.4GB, 623M info sets, 38 duplicate UTG root entries to be merged on load)
+- Bug 11 fix ready: `spin_until_ready` prevents new duplicates, merge-on-load
+  recovers existing ones
+- Next: launch spot in us-east-1f, resume from 200M, target 4B iterations

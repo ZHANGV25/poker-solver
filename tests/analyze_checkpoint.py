@@ -127,7 +127,7 @@ positions = [
 for pos_name, player, seq, seq_len in positions:
     out.write("\n=== %s (player %d) ===\n" % (pos_name, player))
     out.write("%-5s  %-12s %-12s " % ("Hand", "fold", "call"))
-    for i in range(2, 10):
+    for i in range(2, len(SIZES)):
         out.write("%-14s " % ("%s(%s)" % (SIZES[i], BB_EQUIV.get(SIZES[i], ""))))
     out.write("\n")
     out.write("-" * 140 + "\n")
@@ -158,7 +158,7 @@ for pos_name, player, seq, seq_len in positions:
 # Summary: which raise sizes have positive regret across premium hands
 out.write("\n=== RAISE SIZE SUMMARY (UTG, positive regret count across top 13 pairs) ===\n")
 utg_player = 2
-for i in range(2, 10):
+for i in range(2, len(SIZES)):
     label = SIZES[i]
     bb = BB_EQUIV.get(label, "")
     pos_count = 0

@@ -22,6 +22,9 @@
 #include <math.h>
 #include <stdio.h>
 #include <time.h>
+#ifdef _POSIX_VERSION
+#include <sched.h>
+#endif
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -300,6 +303,28 @@ static inline int key_eq(const BPInfoKey *a, const BPInfoKey *b) {
            a->action_hash == b->action_hash;
 }
 
+/* Spin until a state=2 slot finishes initialization (becomes 1).
+ * The initializer already won its CAS, so it WILL complete — the only
+ * question is when. On 192-core machines, OS preemption can delay the
+ * initializer by milliseconds, so we use a long spin (~100ms) and then
+ * yield to avoid burning a core indefinitely. */
+static inline void spin_until_ready(const int *flag) {
+    int spins = 0;
+    while (__atomic_load_n(flag, __ATOMIC_ACQUIRE) == 2) {
+        #ifdef __x86_64__
+        __builtin_ia32_pause();
+        #elif defined(__aarch64__)
+        __asm__ volatile("yield");
+        #endif
+        if (++spins > 10000000) {   /* ~10ms, yield then retry */
+            spins = 0;
+            #ifdef _POSIX_VERSION
+            sched_yield();
+            #endif
+        }
+    }
+}
+
 static int64_t info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
                                           int num_actions) {
     uint64_t h = hash_combine(key.board_hash, key.action_hash);
@@ -331,17 +356,24 @@ static int64_t info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
                 /* De-dup check: scan backwards from our position to the
                  * hash start. If the same key was published at an earlier
                  * slot by another thread, we are the duplicate — return
-                 * the earlier slot and undo our counter increment.
-                 * This prevents split regrets and counter inflation. */
+                 * the earlier slot.
+                 *
+                 * BUG FIX: must spin-wait on state=2 slots during the scan.
+                 * Without this, if thread A is still initializing slot S+2
+                 * (state=2) when thread B scans, B skips it, misses the
+                 * duplicate, and both copies accumulate separate regrets. */
                 for (int p2 = 0; p2 < probe; p2++) {
                     int64_t idx2 = (slot + p2) % t->table_size;
-                    if (__atomic_load_n(&t->occupied[idx2], __ATOMIC_ACQUIRE) == 1) {
-                        if (key_eq(&t->keys[idx2], &key)) {
-                            /* Earlier copy exists — we're the duplicate.
-                             * Slot is wasted (can't reclaim with linear
-                             * probing) but regrets go to the right place. */
-                            return idx2;
-                        }
+                    int st2 = __atomic_load_n(&t->occupied[idx2], __ATOMIC_ACQUIRE);
+                    if (st2 == 2) {
+                        spin_until_ready(&t->occupied[idx2]);
+                        st2 = __atomic_load_n(&t->occupied[idx2], __ATOMIC_ACQUIRE);
+                    }
+                    if (st2 == 1 && key_eq(&t->keys[idx2], &key)) {
+                        /* Earlier copy exists — we're the duplicate.
+                         * Slot is wasted (can't reclaim with linear
+                         * probing) but regrets go to the right place. */
+                        return idx2;
                     }
                 }
                 __atomic_fetch_add(&t->num_entries, 1, __ATOMIC_RELAXED);
@@ -351,16 +383,11 @@ static int64_t info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
         }
 
         if (state == 2) {
-            /* Another thread is initializing this slot. Spin-wait for it
-             * to finish (state 2 → 1). Use a generous spin count because
-             * the initializer only needs ~100ns (3 memory writes). */
-            int spins = 0;
-            while (__atomic_load_n(&t->occupied[idx], __ATOMIC_ACQUIRE) == 2) {
-                if (++spins > 1000000) break;  /* ~1ms safety limit */
-                #ifdef __x86_64__
-                __builtin_ia32_pause();  /* reduce contention on HT cores */
-                #endif
-            }
+            /* Another thread is initializing this slot. We MUST wait for it
+             * to finish — skipping past could cause us to create a duplicate
+             * at a later slot. spin_until_ready handles OS preemption with
+             * yield fallback. */
+            spin_until_ready(&t->occupied[idx]);
             if (__atomic_load_n(&t->occupied[idx], __ATOMIC_ACQUIRE) == 1) {
                 if (key_eq(&t->keys[idx], &key)) return idx;
             }
@@ -2147,6 +2174,10 @@ int64_t bp_load_regrets(BPSolver *s, const char *path) {
 
     BPInfoTable *t = &s->info_table;
     int64_t loaded = 0;
+    int64_t merged = 0;
+
+    int tmp_regrets[BP_MAX_ACTIONS];
+    float tmp_ss[BP_MAX_ACTIONS];
 
     for (int64_t e = 0; e < saved_entries; e++) {
         BPInfoKey key;
@@ -2158,6 +2189,7 @@ int64_t bp_load_regrets(BPSolver *s, const char *path) {
         if (fread(&key.board_hash, sizeof(uint64_t), 1, f) != 1) break;
         if (fread(&key.action_hash, sizeof(uint64_t), 1, f) != 1) break;
         if (fread(&na, sizeof(int), 1, f) != 1) break;
+        if (na > BP_MAX_ACTIONS) na = BP_MAX_ACTIONS;
 
         int64_t slot = info_table_find_or_create(t, key, na);
         if (slot < 0) {
@@ -2169,7 +2201,20 @@ int64_t bp_load_regrets(BPSolver *s, const char *path) {
         }
 
         BPInfoSet *is = &t->sets[slot];
-        fread(is->regrets, sizeof(int), na, f);
+
+        /* Read regrets into temp buffer, then ADD to slot.
+         * For fresh slots (arena zeroed): 0 + new = new (normal load).
+         * For duplicate keys (Hogwild race bug): existing + new = merged.
+         * This recovers split regrets from the duplicate-key bug where
+         * two hash table entries accumulated partial regrets separately. */
+        fread(tmp_regrets, sizeof(int), na, f);
+        int is_dup = 0;
+        for (int a = 0; a < na; a++) {
+            if (is->regrets[a] != 0) { is_dup = 1; break; }
+        }
+        for (int a = 0; a < na; a++) {
+            is->regrets[a] += tmp_regrets[a];
+        }
 
         int has_ss;
         fread(&has_ss, sizeof(int), 1, f);
@@ -2177,19 +2222,35 @@ int64_t bp_load_regrets(BPSolver *s, const char *path) {
             if (!is->strategy_sum) {
                 is->strategy_sum = (float*)arena_alloc(na);
             }
-            if (is->strategy_sum)
-                fread(is->strategy_sum, sizeof(float), na, f);
-            else
+            if (is->strategy_sum) {
+                fread(tmp_ss, sizeof(float), na, f);
+                for (int a = 0; a < na; a++)
+                    is->strategy_sum[a] += tmp_ss[a];
+            } else {
                 fseek(f, na * sizeof(float), SEEK_CUR);
+            }
         }
 
+        if (is_dup) {
+            merged++;
+            if (merged <= 50) {
+                printf("[BP] Merged duplicate: player=%d street=%d bucket=%d "
+                       "ah=%016llx\n", key.player, key.street, key.bucket,
+                       (unsigned long long)key.action_hash);
+            }
+        }
         loaded++;
     }
 
     s->iterations_run = saved_iters;
     fclose(f);
-    printf("[BP] Loaded %lld/%lld info sets (table %lld/%lld)\n",
-           (long long)loaded, (long long)saved_entries, (long long)t->num_entries, (long long)t->table_size);
+    if (merged > 0) {
+        printf("[BP] WARNING: merged %lld duplicate entries (Hogwild race bug). "
+               "Split regrets have been recovered.\n", (long long)merged);
+    }
+    printf("[BP] Loaded %lld/%lld info sets (%lld merged), table %lld/%lld\n",
+           (long long)loaded, (long long)saved_entries, (long long)merged,
+           (long long)t->num_entries, (long long)t->table_size);
     return loaded;
 }
 

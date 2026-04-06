@@ -378,3 +378,55 @@ implicit upper bound.
 |------|---------|
 | `tests/dump_raw_regrets.c` | Dump raw regret + strategy_sum for specific hands (fixed bucket indices) |
 | `tests/extract_roots.c` | Extract root strategies for all 6 positions, now shows strategy_sum average alongside regret-matched |
+
+## Bug 11: Hogwild hash table race creates duplicate info set entries
+
+**Problem:** The lock-free `info_table_find_or_create` has a race condition that
+creates duplicate entries for the same key. When two threads simultaneously insert
+the same key:
+
+1. Thread A CAS's slot S+2 (state 0→2), begins writing key
+2. Thread B arrives at S+2, sees state=2, spin-waits (1M iteration limit)
+3. Thread A is OS-preempted on the 192-core machine — state stays 2 past B's limit
+4. B's spin **times out**, `continue` to next probe slot
+5. B CAS's slot S+3, writes the **same key K**, sets state=1
+6. B runs de-dup scan over earlier slots — but S+2 is **still state=2**
+7. De-dup only checks `state == 1` slots → **skips S+2** → no duplicate detected
+8. A eventually finishes. Now key K exists at both S+2 and S+3.
+
+**Impact:** 38 duplicate UTG root entries in the 200M checkpoint. During training,
+iterations randomly update copy A or copy B. Regrets are **split** between two
+entries instead of accumulating in one. At checkpoint save, both copies are written.
+At checkpoint load, the second copy **overwrites** the first — typically the weaker
+copy (all-zero or tiny regrets) wins.
+
+**Evidence (C streaming diagnostic over 26.4GB checkpoint):**
+- 38 duplicate root keys, **all UTG** (hottest node, max thread contention)
+- Affected hands: 22, KTs, AKo, A8s, KJo, K9o, K8o, K6o, K3o, QJo, Q8o, Q4o,
+  J8o, J3o, J2s, T9o, T7s, T7o, T6o, T2s, 98o, 97o, 96o, 95o, 94o, 87o, 83o,
+  76o, 75o, 65o, 63o, 62o, 54o, 53o, 52o, 43o, 42o, 32o
+- 19.3M all-zero preflop entries out of 34.2M total (56%) — many from split regrets
+- AKo regrets in the hundreds vs AKs in the millions (5 orders of magnitude off)
+
+**The fix (two parts):**
+
+1. **`spin_until_ready()` — never skip state=2 slots.** Replaces bounded spin with
+   unbounded spin + `sched_yield()` fallback. Applied in both the main probe loop
+   AND the de-dup scan. A thread waiting for another's initialization will never
+   give up and probe forward.
+
+2. **Merge-on-load in `bp_load_regrets`.** When loading a checkpoint with duplicate
+   keys, ADD regrets to the existing slot instead of overwriting. For fresh slots
+   (arena-zeroed), `0 + new = new`. For duplicates, `existing + new = merged`.
+   Logs each merge with a warning.
+
+**Verification:** Stress test with 16 threads, 100K iterations, 50K hash table at
+100% capacity → **PASS: 0 duplicate keys**.
+
+## Diagnostic tools added (this session)
+
+| Tool | Purpose |
+|------|---------|
+| `tests/diagnose_checkpoint.c` | Stream BPR4 checkpoint from stdin, scan for all-zero regrets, tiny regrets, duplicate keys, and root completeness |
+| `tests/test_hash_dedup.c` | Concurrency stress test: many threads inserting same keys, verifies 0 duplicates |
+| `tests/analyze_checkpoint.py` | Per-raise regrets for all key hands across 4 positions with 3 open sizes |
