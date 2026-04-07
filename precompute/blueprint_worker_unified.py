@@ -114,6 +114,19 @@ def load_bp_dll(build_dir):
             bp.bp_load_texture_cache.restype = ctypes.c_int
             bp.bp_load_texture_cache.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
             bp.bp_free.restype = None
+            # Hash table health stats (added for v2)
+            try:
+                bp.bp_get_table_stats.restype = None
+                bp.bp_get_table_stats.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_int64),
+                    ctypes.POINTER(ctypes.c_int64),
+                    ctypes.POINTER(ctypes.c_int64),
+                    ctypes.POINTER(ctypes.c_int64),
+                ]
+            except AttributeError:
+                # Older .so without the new symbol — silently disable.
+                bp.bp_get_table_stats = None
             return bp
     raise FileNotFoundError(f"mccfr_blueprint not found in {build_dir}")
 
@@ -384,6 +397,37 @@ def main():
         elapsed = time.time() - t0
         n_is = bp_lib.bp_num_info_sets(solver)
         ips = iters_done / elapsed if elapsed > 0 else 0
+
+        # Hash table health stats. New API as of v2; gated on availability so
+        # the script still works against older .so builds.
+        if getattr(bp_lib, 'bp_get_table_stats', None) is not None:
+            ht_entries = ctypes.c_int64(0)
+            ht_size = ctypes.c_int64(0)
+            ht_fails = ctypes.c_int64(0)
+            ht_max_probe = ctypes.c_int64(0)
+            bp_lib.bp_get_table_stats(
+                solver,
+                ctypes.byref(ht_entries),
+                ctypes.byref(ht_size),
+                ctypes.byref(ht_fails),
+                ctypes.byref(ht_max_probe),
+            )
+            if ht_size.value > 0:
+                load_pct = 100.0 * ht_entries.value / ht_size.value
+                print(
+                    f"[Table] entries={ht_entries.value:,} "
+                    f"({load_pct:.2f}% load), "
+                    f"ins_fails={ht_fails.value}, "
+                    f"max_probe={ht_max_probe.value}",
+                    flush=True,
+                )
+                if ht_fails.value > 0:
+                    print(
+                        f"[Table] WARNING: {ht_fails.value} insertion failures — "
+                        f"hash table too small or pathologically clustered. "
+                        f"Bump --hash-size for next run.",
+                        flush=True,
+                    )
 
         # Lightweight strategy probe: extract strategies + raw regrets
         # directly from memory via bp_get_strategy/bp_get_regrets (no disk I/O).

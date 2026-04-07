@@ -24,11 +24,13 @@ REGION="${AWS_REGION:-us-east-1}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-c7a.metal-48xl}"  # 192 vCPU, 384 GB
 KEY_NAME="${KEY_NAME:-poker-solver-key}"
 SECURITY_GROUP="${SECURITY_GROUP:-poker-solver-sg}"
-S3_BUCKET="${S3_BUCKET:-poker-blueprint-unified}"
+S3_BUCKET="${S3_BUCKET:-poker-blueprint-unified-v2}"  # v2: isolated from v1
 PROFILE_NAME="poker-solver-profile"
 
 HOURS=192           # 8 days (Pluribus)
-HASH_SIZE=3000000000 # 3B slots (~180GB metadata) — tiered preflop (8/3/2/1)
+ITER_TARGET=8000000000  # 8B iters (~74h on 192 threads at 30K iter/s, ~Pluribus core-hour eq + buffer)
+HASH_SIZE=2000000000    # 2B slots (~52% load at 1.05B entries — safe linear-probing regime)
+USE_SPOT=1              # 1 = spot one-time terminate-on-interruption, 0 = on-demand
 DRY_RUN=0
 STATUS_ONLY=0
 DOWNLOAD_ONLY=0
@@ -40,10 +42,12 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 while [[ $# -gt 0 ]]; do
     case $1 in
         --hours)          HOURS="$2"; shift 2;;
+        --iterations)     ITER_TARGET="$2"; shift 2;;
         --instance-type)  INSTANCE_TYPE="$2"; shift 2;;
         --hash-size)      HASH_SIZE="$2"; shift 2;;
         --key)            KEY_NAME="$2"; shift 2;;
         --bucket)         S3_BUCKET="$2"; shift 2;;
+        --on-demand)      USE_SPOT=0; shift;;
         --dry-run)        DRY_RUN=1; shift;;
         --status)         STATUS_ONLY=1; shift;;
         --download)       DOWNLOAD_ONLY=1; shift;;
@@ -131,9 +135,12 @@ USERDATA=$(cat <<USERDATA
 set -euxo pipefail
 exec > /var/log/blueprint-unified.log 2>&1
 
-echo "=== Unified Blueprint starting at \$(date) ==="
+echo "=== Unified Blueprint v2 starting at \$(date) ==="
 
-yum install -y gcc gcc-c++ python3 python3-pip libgomp
+# Bug α fix: install numactl for NUMA interleave (required by --interleave=all
+# wrapper below). Without this the python solver runs on a single NUMA node and
+# saturates one socket's memory bandwidth, costing ~30% throughput.
+yum install -y gcc gcc-c++ python3 python3-pip libgomp numactl
 
 WORKDIR=/opt/poker-solver
 mkdir -p \$WORKDIR/build /opt/blueprint_unified && cd \$WORKDIR
@@ -145,22 +152,43 @@ gcc -O2 -march=native -o build/extract_roots tests/extract_roots.c -lm
 gcc -O2 -march=native -o build/dump_raw_regrets tests/dump_raw_regrets.c -lm
 echo "Compilation complete."
 
+# Bug α fix: enable transparent hugepages in madvise mode. The C code at
+# mccfr_blueprint.c:1985 calls madvise(MADV_HUGEPAGE) on the hash table
+# arrays, but this is a no-op unless the kernel allows it. Without THP, the
+# hash table uses 4KB pages → ~40 million page table entries for a 2B slot
+# table → catastrophic dTLB thrashing on every probe.
+echo madvise > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
+echo defer+madvise > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || true
+
 # Download precomputed texture cache (saves ~40 min precomputation)
 aws s3 cp s3://$S3_BUCKET/texture_cache.bin /tmp/texture_cache.bin --quiet 2>/dev/null || true
 echo "Texture cache: \$(ls -lh /tmp/texture_cache.bin 2>/dev/null || echo 'not found, will precompute')"
 
+# Show NUMA topology for diagnosis
+numactl --hardware >> /var/log/blueprint-unified.log 2>&1 || true
+
+# Bug α fix: pin threads to specific cores via OMP_PROC_BIND=spread +
+# OMP_PLACES=cores. Without this, the OS bounces threads between cores at
+# every barrier, losing L1/L2 cache state and costing ~15% throughput.
+# OMP_WAIT_POLICY=ACTIVE makes threads busy-wait at barriers instead of
+# sleeping (low-latency sync between batches, no futex syscalls).
 export OMP_STACKSIZE=64m
 export OMP_NUM_THREADS=\$(nproc)
+export OMP_PROC_BIND=spread
+export OMP_PLACES=cores
+export OMP_WAIT_POLICY=ACTIVE
 
-echo "Starting unified solve: \$(nproc) threads, ${HOURS}h..."
-python3 -u precompute/blueprint_worker_unified.py \
-    --iterations 0 \
-    --time-limit-hours $HOURS \
+echo "Starting unified solve: \$(nproc) threads, $ITER_TARGET iterations..."
+# Bug α fix: numactl --interleave=all distributes the hash table across all
+# NUMA nodes so that all 4 sockets contribute memory bandwidth instead of
+# bottlenecking one socket. This is the single largest perf win on
+# c7a.metal-48xl.
+numactl --interleave=all python3 -u precompute/blueprint_worker_unified.py \
+    --iterations $ITER_TARGET \
     --num-threads \$(nproc) \
     --hash-size $HASH_SIZE \
     --output-dir /opt/blueprint_unified \
     --s3-bucket $S3_BUCKET \
-    --resume \
     --build-dir build
 
 echo "=== Complete at \$(date) ==="
@@ -172,6 +200,14 @@ USERDATA
 USERDATA_B64=$(echo "$USERDATA" | base64 | tr -d '\n')
 
 echo "Launching instance..."
+
+# Bug ζ fix: spot one-time terminate. ~70% cost savings vs on-demand.
+# Pass --on-demand to revert to the previous behavior.
+SPOT_ARGS=""
+if [ "$USE_SPOT" = "1" ]; then
+    SPOT_ARGS='--instance-market-options {"MarketType":"spot","SpotOptions":{"SpotInstanceType":"one-time","InstanceInterruptionBehavior":"terminate"}}'
+fi
+
 INSTANCE_ID=$(aws ec2 run-instances \
     --region "$REGION" \
     --image-id "$AMI_ID" \
@@ -180,8 +216,9 @@ INSTANCE_ID=$(aws ec2 run-instances \
     --security-groups "$SECURITY_GROUP" \
     --iam-instance-profile "Name=$PROFILE_NAME" \
     --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":200,"VolumeType":"gp3"}}]' \
+    $SPOT_ARGS \
     --user-data "$USERDATA_B64" \
-    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=bp-unified},{Key=Project,Value=poker-solver-unified}]" \
+    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=bp-unified-v2},{Key=Project,Value=poker-solver-unified-v2}]" \
     --query "Instances[0].InstanceId" \
     --output text)
 

@@ -82,7 +82,9 @@ typedef struct {
     BPInfoSet *sets;
     int *occupied;
     int64_t num_entries;
-    int64_t table_size;    /* actual hash table size (supports up to 4B+) */
+    int64_t table_size;             /* actual hash table size (supports up to 4B+) */
+    int64_t insertion_failures;     /* atomic, lifetime count of probe-cap-exceeded returns */
+    int64_t max_probe_observed;     /* atomic, lifetime maximum probe distance */
 } BPInfoTable;
 
 /* Blueprint solver configuration */
@@ -277,6 +279,22 @@ BP_EXPORT int bp_get_regrets(const BPSolver *s, int player,
 
 BP_EXPORT int64_t bp_num_info_sets(const BPSolver *s);
 BP_EXPORT void bp_free(BPSolver *s);
+
+/**
+ * Hash table health stats. All four out-pointers may be NULL to skip.
+ * Safe to call concurrently with bp_solve (counters use relaxed atomics).
+ *
+ * insertion_failures: lifetime count of info_table_find_or_create calls that
+ *   exhausted the 4096-probe cap and silently returned -1. Should always be 0
+ *   in a properly-sized table. Nonzero indicates strategy_sum corruption.
+ * max_probe_observed: lifetime maximum probe distance for any successful
+ *   insertion. Approaching 4096 indicates the table is too full.
+ */
+BP_EXPORT void bp_get_table_stats(const BPSolver *s,
+                                   int64_t *out_entries,
+                                   int64_t *out_table_size,
+                                   int64_t *out_insertion_failures,
+                                   int64_t *out_max_probe_observed);
 
 /**
  * Save/load precomputed texture bucket cache to skip the 65-90 min

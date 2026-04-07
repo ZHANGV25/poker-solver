@@ -220,6 +220,14 @@ static void arena_free_all(void) {
 
 /* ── Hash table ───────────────────────────────────────────────────── */
 
+/* Hash table probe caps. INSERT and READ MUST be equal — making them differ
+ * silently corrupts data: an entry placed at insert-distance > READ cap becomes
+ * invisible to readers but still occupies a slot. Both at 4096 means the table
+ * is correctly observable up to ~99% load (above which insertion_failures fires
+ * and we know to bump table_size in the next run). */
+#define HASH_PROBE_LIMIT_INSERT 4096
+#define HASH_PROBE_LIMIT_READ   4096
+
 static uint64_t hash_combine(uint64_t a, uint64_t b) {
     a ^= b + 0x9e3779b97f4a7c15ULL + (a << 6) + (a >> 2);
     return a;
@@ -332,6 +340,8 @@ static void info_table_init(BPInfoTable *t, int64_t table_size) {
     t->sets = (BPInfoSet*)calloc((size_t)table_size, sizeof(BPInfoSet));
     t->occupied = (int*)calloc((size_t)table_size, sizeof(int));
     t->num_entries = 0;
+    t->insertion_failures = 0;
+    t->max_probe_observed = 0;
 }
 
 /* Lock-free find-or-create using atomic CAS on the occupied flag.
@@ -381,12 +391,22 @@ static int64_t info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
     h = hash_combine(h, (uint64_t)key.bucket);
     int64_t slot = (int64_t)(h % (uint64_t)t->table_size);
 
-    for (int probe = 0; probe < 4096; probe++) {
+    for (int probe = 0; probe < HASH_PROBE_LIMIT_INSERT; probe++) {
         int64_t idx = (slot + probe) % t->table_size;
         int state = __atomic_load_n(&t->occupied[idx], __ATOMIC_ACQUIRE);
 
         if (state == 1) {
-            if (key_eq(&t->keys[idx], &key)) return idx;
+            if (key_eq(&t->keys[idx], &key)) {
+                /* Track max probe distance even on existing-key hits, since
+                 * later reads will need to walk this same distance. */
+                if (probe > 0) {
+                    int64_t cur = __atomic_load_n(&t->max_probe_observed, __ATOMIC_RELAXED);
+                    while ((int64_t)probe > cur &&
+                           !__atomic_compare_exchange_n(&t->max_probe_observed, &cur, (int64_t)probe,
+                                                         1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { }
+                }
+                return idx;
+            }
             continue;
         }
 
@@ -425,6 +445,13 @@ static int64_t info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
                     }
                 }
                 __atomic_fetch_add(&t->num_entries, 1, __ATOMIC_RELAXED);
+                /* Track max probe distance for the successful insert. */
+                if (probe > 0) {
+                    int64_t cur = __atomic_load_n(&t->max_probe_observed, __ATOMIC_RELAXED);
+                    while ((int64_t)probe > cur &&
+                           !__atomic_compare_exchange_n(&t->max_probe_observed, &cur, (int64_t)probe,
+                                                         1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { }
+                }
                 return idx;
             }
             state = __atomic_load_n(&t->occupied[idx], __ATOMIC_ACQUIRE);
@@ -441,6 +468,17 @@ static int64_t info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
             }
             continue;
         }
+    }
+    /* Probe cap exhausted — table is too full or pathologically clustered.
+     * Caller will silently treat this as EV=0 which biases parent regrets.
+     * Increment the failure counter so monitoring catches it. */
+    __atomic_fetch_add(&t->insertion_failures, 1, __ATOMIC_RELAXED);
+    /* Also record max probe = HASH_PROBE_LIMIT_INSERT for diagnostics. */
+    {
+        int64_t cur = __atomic_load_n(&t->max_probe_observed, __ATOMIC_RELAXED);
+        while ((int64_t)HASH_PROBE_LIMIT_INSERT > cur &&
+               !__atomic_compare_exchange_n(&t->max_probe_observed, &cur, (int64_t)HASH_PROBE_LIMIT_INSERT,
+                                             1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { }
     }
     return -1;
 }
@@ -1231,17 +1269,23 @@ static float traverse(TraversalState *ts, int acting_order_idx,
             else is->regrets[a] = (int)tmp;
         }
 
-        /* Strategy sum: accumulate for preflop (street 0) every 10007
-         * iterations. Matches Pluribus: UPDATE-STRATEGY called every
-         * Strategy Interval (10K) for first betting round only.
-         * Using 10007 (prime) instead of 10000 to avoid aliasing with
-         * traverser cycling: gcd(6, 10000)=2 caused only players 1,3,5
-         * to accumulate, permanently excluding SB(0), UTG(2), CO(4).
-         * gcd(6, 10007)=1, so all 6 players get equal accumulation. */
-        if (street == 0 && (ts->iteration % 10007) == 0) {
+        /* Strategy sum: accumulate for preflop (street 0) on every traverser
+         * visit. This matches Bug 6's documented fix in BLUEPRINT_BUGS.md:
+         * "Remove the interval check entirely. Accumulate strategy_sum on
+         * every traverser visit for preflop. This is cheap (preflop info
+         * sets are tiny) and ensures all 6 players accumulate."
+         *
+         * The previous gate `% 10007` was a Bug 6 regression — re-added with
+         * a coprime constant to fix the gcd(6, 10000)=2 aliasing while
+         * preserving sparsity. Without the gate there is no aliasing issue
+         * (every visit accumulates regardless of iteration parity), so all
+         * 6 players accumulate equally. */
+        if (street == 0) {
             ensure_strategy_sum(is);
-            for (int a = 0; a < na; a++)
-                is->strategy_sum[a] += strategy[a];
+            if (is->strategy_sum) {
+                for (int a = 0; a < na; a++)
+                    is->strategy_sum[a] += strategy[a];
+            }
         }
 
         return node_value;
@@ -1339,16 +1383,32 @@ static void apply_discount(BPInfoTable *t, float discount) {
 
 void bp_default_config(BPConfig *config) {
     memset(config, 0, sizeof(BPConfig));
-    /* Pluribus timing converted to iterations assuming ~1000 iter/min on 64 cores */
-    config->discount_stop_iter = 400000;    /* 400 min * ~1000 iter/min */
-    config->discount_interval  = 10000;     /* 10 min * ~1000 iter/min */
-    config->prune_start_iter   = 200000;    /* 200 min */
-    config->snapshot_start_iter = 800000;   /* 800 min */
-    config->snapshot_interval  = 200000;    /* 200 min */
-    config->strategy_interval  = 10000;     /* Pluribus: every 10K iterations */
-    config->num_threads = 0;                /* auto */
-    config->hash_table_size = 0;            /* auto */
-    config->snapshot_dir = NULL;
+    /* Pluribus timing as fractions of training duration. The previous defaults
+     * were calibrated to "1000 iter/min" (Pluribus's hardware), which is ~30x
+     * slower than ours and produces wildly wrong behavior on modern HW.
+     *
+     * These defaults assume a ~1B iteration baseline target, scaled from
+     * Pluribus's actual wall-clock fractions:
+     *   discount_stop:  3.47% (Pluribus 400 min / 11520 min)
+     *   prune_start:    1.74% (Pluribus 200 min / 11520 min)
+     *   snapshot_start: 6.94% (Pluribus 800 min / 11520 min)
+     *   snapshot_interval: 1.74% (Pluribus 200 min / 11520 min)
+     *
+     * Source: pluribus_technical_details.md §1, supplementary materials of
+     * Brown & Sandholm 2019.
+     *
+     * Production callers (precompute/blueprint_worker_unified.py) should
+     * override these via the args.iterations target. These defaults are a
+     * safe fallback for any caller that forgets to override. */
+    config->discount_stop_iter  = 35000000;    /* 3.5% of 1B */
+    config->discount_interval   =   875000;    /* 0.087% of 1B */
+    config->prune_start_iter    = 17000000;    /* 1.7% of 1B */
+    config->snapshot_start_iter = 70000000;    /* 7% of 1B */
+    config->snapshot_interval   = 17000000;    /* 1.7% of 1B */
+    config->strategy_interval   =    10000;    /* Pluribus's only iter-count threshold */
+    config->num_threads         = 0;           /* auto */
+    config->hash_table_size     = 0;           /* auto = BP_HASH_SIZE_LARGE */
+    config->snapshot_dir        = NULL;
 }
 
 int bp_init(BPSolver *s, int num_players,
@@ -1935,6 +1995,21 @@ int bp_solve(BPSolver *s, int64_t max_iterations) {
     }
     #endif
 
+    /* Bug C/F sanity check: warn if any timing field looks dangerously stale.
+     * The previous defaults (400000, 200000, 800000) were calibrated to
+     * ~1000 iter/min hardware and produce wildly wrong behavior at our rate.
+     * If a caller passed those literal values, scream so the operator notices. */
+    if (s->config.discount_stop_iter > 0 && s->config.discount_stop_iter < 1000000) {
+        fprintf(stderr, "[BP] WARNING: discount_stop_iter=%lld is suspiciously small. "
+                "Pluribus uses 3.5%% of training (e.g. 35M for a 1B target, 280M for 8B).\n",
+                (long long)s->config.discount_stop_iter);
+    }
+    if (s->config.prune_start_iter > 0 && s->config.prune_start_iter < 500000) {
+        fprintf(stderr, "[BP] WARNING: prune_start_iter=%lld is suspiciously small. "
+                "Pluribus uses 1.74%% of training.\n",
+                (long long)s->config.prune_start_iter);
+    }
+
     printf("[BP] Starting %d-player MCCFR: %lld iterations, %d threads, "
            "hash=%lld, buckets=%s\n",
            NP, (long long)max_iterations, nt, (long long)s->info_table.table_size,
@@ -2199,8 +2274,17 @@ int bp_solve(BPSolver *s, int64_t max_iterations) {
                     traverse(&ts, 0, acting_order, NP);
                 }
 
-                if (tid == 0) {
-                    s->iterations_run = global_iter;
+                /* Bug γ fix: atomic monotonic update so resume from a partial
+                 * checkpoint doesn't underflow the iter offset. Previously only
+                 * tid 0 wrote, with no atomic, and could write a value behind
+                 * what other threads had already executed. Use a CAS loop with
+                 * RELEASE so the saved iter count is always >= the highest
+                 * executed iter at the time of the save. */
+                {
+                    int64_t cur = __atomic_load_n(&s->iterations_run, __ATOMIC_RELAXED);
+                    while (global_iter > cur &&
+                           !__atomic_compare_exchange_n(&s->iterations_run, &cur, global_iter,
+                                                         1, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) { }
                 }
             }
             /* implicit barrier after omp for */
@@ -2305,7 +2389,7 @@ int bp_get_strategy(const BPSolver *s, int player,
     h = hash_combine(h, (uint64_t)key.bucket);
     int64_t slot = (int64_t)(h % (uint64_t)s->info_table.table_size);
 
-    for (int probe = 0; probe < 1024; probe++) {
+    for (int probe = 0; probe < HASH_PROBE_LIMIT_READ; probe++) {
         int64_t idx = (slot + probe) % s->info_table.table_size;
         if (!s->info_table.occupied[idx]) return 0;
         if (key_eq(&s->info_table.keys[idx], &key)) {
@@ -2351,7 +2435,7 @@ int bp_get_regrets(const BPSolver *s, int player,
     h = hash_combine(h, (uint64_t)key.bucket);
     int64_t slot = (int64_t)(h % (uint64_t)s->info_table.table_size);
 
-    for (int probe = 0; probe < 1024; probe++) {
+    for (int probe = 0; probe < HASH_PROBE_LIMIT_READ; probe++) {
         int64_t idx = (slot + probe) % s->info_table.table_size;
         if (!s->info_table.occupied[idx]) return 0;
         if (key_eq(&s->info_table.keys[idx], &key)) {
@@ -2367,6 +2451,23 @@ int bp_get_regrets(const BPSolver *s, int player,
 
 int64_t bp_num_info_sets(const BPSolver *s) {
     return s->info_table.num_entries;
+}
+
+void bp_get_table_stats(const BPSolver *s,
+                         int64_t *out_entries,
+                         int64_t *out_table_size,
+                         int64_t *out_insertion_failures,
+                         int64_t *out_max_probe_observed) {
+    /* Relaxed loads — these are stat counters with no synchronization
+     * requirements, racy reads are acceptable. */
+    if (out_entries)
+        *out_entries = __atomic_load_n(&s->info_table.num_entries, __ATOMIC_RELAXED);
+    if (out_table_size)
+        *out_table_size = s->info_table.table_size;
+    if (out_insertion_failures)
+        *out_insertion_failures = __atomic_load_n(&s->info_table.insertion_failures, __ATOMIC_RELAXED);
+    if (out_max_probe_observed)
+        *out_max_probe_observed = __atomic_load_n(&s->info_table.max_probe_observed, __ATOMIC_RELAXED);
 }
 
 int bp_save_regrets(const BPSolver *s, const char *path) {
@@ -2522,6 +2623,15 @@ int64_t bp_load_regrets(BPSolver *s, const char *path) {
 
     s->iterations_run = saved_iters;
     fclose(f);
+
+    /* Reset health stat counters — they describe in-memory operations on this
+     * solver instance, not anything that happened during the previous run that
+     * created the checkpoint. The merge-on-load loop above may have triggered
+     * insertion failures into the new table, which we want to count, but only
+     * those — not anything from the source checkpoint. */
+    t->insertion_failures = 0;
+    t->max_probe_observed = 0;
+
     if (merged > 0) {
         printf("[BP] WARNING: merged %lld duplicate entries (Hogwild race bug). "
                "Split regrets have been recovered.\n", (long long)merged);
