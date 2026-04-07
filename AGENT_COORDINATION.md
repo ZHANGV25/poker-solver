@@ -121,23 +121,75 @@ first action of any new session. Append your status when finishing.
 
 ### BUG-C: discount_stop_iter = 400000, never re-fires after resume from 200M
 
-- **Owner:** unresolved — needs to be set correctly for the NEXT training run
-- **Status:** confirmed real, fixed-in-config not yet (no patch needed in code,
-  just a different value passed at training launch)
-- **Severity:** 🟡 moderate (revised from earlier 🔴) — Victor clarified that
-  only 19 of 40 discount phases were skipped (phases 21-40, after iter 200M),
-  not all 40. The original 200M training did the first 21 phases up to iter
-  ~350M. So 21/40 = ~52% of the intended discounting did happen. The 1.6B
-  end-to-end test showed strategy_sum quality is good for premium hands but
-  noisy for tail hands — the discount issue is contributing but not the only
-  factor.
-- **Pluribus comparison:** Pluribus discounts during the first 35% of training.
-  For a 4B target, `discount_stop_iter` should be ≈ 1.4B (35% of 4B). The
-  current value of 400K was calibrated for Pluribus's slow hardware
-  (~1K iter/min × 400 min = 400K iters of discount), not ours (~28K iter/s
-  × 192 threads).
-- **Required for next training run:** `discount_stop_iter = 1400000000`.
-  Cannot be patched into the running solver — has to be set at launch time.
+- **Owner:** solver-agent (research-agent)
+- **Status:** ✅ FIXED in v2 (2026-04-07). C default zeroed-equivalent: now
+  set to 35M (3.5% of 1B baseline) instead of 400K. Soft warning at solve start
+  if discount_stop_iter < 1M. Production callers (canonical Python driver)
+  override correctly. See `docs/SOLVER_CONFIG.md` Decision log.
+- **Severity:** 🟡 moderate
+- **CRITICAL CORRECTION (2026-04-07 by research-agent):** The "Pluribus
+  discounts during the first 35% of training" claim that propagated through
+  this doc and elsewhere is **WRONG**. Per `pluribus_technical_details.md` §1
+  (verbatim from the Brown & Sandholm 2019 supplementary materials), Pluribus
+  discounts for the first **400 minutes** of an 8-day (11,520 min) training =
+  **3.47%** of training, NOT 35%. The previous "35%" claim was a fabricated
+  10× over-estimate.
+- **Implication:** The canonical `blueprint_worker_unified.py` line 184
+  formula `args.iterations * 35 // 1000` produces 3.5% which is **already
+  Pluribus-aligned**. It is NOT off by 10× as previously claimed. Same goes
+  for prune_start_iter (1.7% ≈ Pluribus 1.74%), snapshot_start_iter (7% ≈
+  Pluribus 6.94%), and snapshot_interval (1.7% ≈ Pluribus 1.74%). The Python
+  driver was correct all along; only the C-level defaults were broken.
+- **Required for next training run (v2):** Apply the source-of-truth doc's
+  v2 column. The C default fix lands automatically with the new compile.
+  Canonical Python driver requires no changes.
+
+### BUG-G: Hash table fill rate / sizing for next training run
+
+- **Owner:** research-agent
+- **Status:** ✅ ANSWERED (2026-04-07): **2B slots** for v2.
+- **Reasoning:**
+  - Empirical projection: ~1.05B entries at 8B target → 52% load (safe linear
+    probing regime)
+  - 1B (current run's 1B) is too small at 96% load = insertion failures + read
+    failures + biased regrets at the tail
+  - 3B is no better than 2B for cache locality (both >> L3) and uses 56 GB more
+    metadata RAM unnecessarily
+  - The original 3B perf concerns from BLUEPRINT_BUGS.md Bug 4 are addressed by
+    the recent fixes (pre-fault commit e749967, NUMA interleave + THP madvise
+    in launch script Bug α fix)
+- **Memory:** 2B × 56 bytes ≈ 112 GB metadata + ~50 GB arena = ~162 GB on the
+  384 GB c7a.metal-48xl. Plenty of headroom.
+- **Instrumentation added:** new `bp_get_table_stats()` API exposes
+  `insertion_failures` and `max_probe_observed` counters. Live visibility into
+  health via the `[Table] entries=X% load, ins_fails=Y, max_probe=Z` log line
+  printed after each chunk by the canonical Python driver.
+
+### v2 launch declaration (2026-04-07 by solver-agent / research-agent)
+
+A fresh training run is being launched with the following config. See
+`docs/SOLVER_CONFIG.md` for the full source of truth.
+
+- **Bucket:** `s3://poker-blueprint-unified-v2` (isolated from v1)
+- **Iterations:** 8B (no resume, fresh start)
+- **Hash table:** 2B slots
+- **Hardware:** c7a.metal-48xl spot (one-time, terminate-on-interruption)
+- **Wall clock estimate:** ~74 hours at 30K iter/s (~3 days)
+- **Bug fixes bundled:**
+  - Bug B: hash probe cap symmetry (4096/4096)
+  - Bug C/F: C default timing values updated to Pluribus-aligned fractions
+  - Bug E: % 10007 strategy_sum gate removed (Bug 6 regression)
+  - Bug γ: iterations_run race fixed (atomic CAS)
+  - Bug α: launch script now installs numactl, enables THP, sets OMP env vars,
+    wraps python in numactl --interleave=all
+  - Bug ζ: spot mode (was on-demand)
+  - New: insertion_failures + max_probe_observed instrumentation, exposed via
+    bp_get_table_stats()
+
+**v1 termination:** The previous c7a.metal-48xl instance i-08b967d731137c9b6
+was terminated 2026-04-07 by user. Reached ~1.7B / 4B before termination. The
+1.6B `unified_blueprint_1600M.bps` export remains in the original bucket as
+the v1 baseline for v2 comparison.
 
 ### BUG-G: Hash table fill rate / sizing for next training run
 
