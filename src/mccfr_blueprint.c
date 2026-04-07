@@ -2629,7 +2629,32 @@ int bp_export_strategies(const BPSolver *s,
         unsigned char na_byte = (unsigned char)na;
         memcpy(p, &na_byte, 1); p += 1;
 
-        regret_match(is->regrets, strategy_buf, na);
+        /* Bug B fix: export the AVERAGE strategy from strategy_sum, not the
+         * current regret-matched strategy. The average strategy is what
+         * converges to Nash in CFR; the regret-matched current strategy is
+         * just an instantaneous noisy snapshot.
+         *
+         * Mirrors bp_get_strategy(): normalize strategy_sum, fall back to
+         * regret_match if no strategy_sum was accumulated for this info set
+         * (rare — only newly-created entries that have never seen a snapshot
+         * or a periodic accumulation event). */
+        if (is->strategy_sum) {
+            float sum = 0;
+            for (int a = 0; a < na; a++) {
+                float v = is->strategy_sum[a];
+                if (v < 0) v = 0;
+                strategy_buf[a] = v;
+                sum += v;
+            }
+            if (sum > 0) {
+                for (int a = 0; a < na; a++) strategy_buf[a] /= sum;
+            } else {
+                regret_match(is->regrets, strategy_buf, na);
+            }
+        } else {
+            regret_match(is->regrets, strategy_buf, na);
+        }
+
         for (int a = 0; a < na; a++) {
             int q = (int)(strategy_buf[a] * 255.0f + 0.5f);
             if (q < 0) q = 0;

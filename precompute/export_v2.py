@@ -13,8 +13,24 @@ NUM_PLAYERS = 6
 SMALL_BLIND = 50
 BIG_BLIND = 100
 INITIAL_STACK = 10000
-PREFLOP_BET_SIZES = [0.5, 1.0, 2.0, 3.0]
-POSTFLOP_BET_SIZES = [0.5, 1.0, 2.0]
+
+# Tier-aware preflop sizing — MUST match blueprint_worker_unified.py /
+# whatever was used at training time. The .bps consumer needs to know
+# this to interpret the action labels correctly.
+# Source of truth: precompute/blueprint_worker_unified.py PREFLOP_TIERS.
+PREFLOP_TIERS = {
+    0: [0.5, 0.7, 1.0],   # open raise: 3 sizes
+    1: [0.7, 1.0],        # 3-bet: 2 sizes
+    2: [1.0],             # 4-bet: 1 size
+    3: [8.0],             # 5-bet: shove only
+}
+PREFLOP_MAX_RAISES = 4
+
+# Legacy flat list — only used by the bp_init_unified call below for the
+# initial action template; the actual training tree is determined by
+# bp_set_preflop_tier() calls applied later.
+PREFLOP_BET_SIZES = [0.5, 0.7, 1.0]  # match tier 0
+POSTFLOP_BET_SIZES = [0.5, 1.0]
 
 
 class BPConfig(ctypes.Structure):
@@ -133,20 +149,52 @@ def main():
     timings["lzma_compress"] = time.time() - t0
     print(f"[{timings['lzma_compress']:.2f}s] Compressed: {len(compressed) / (1024**2):.1f} MB", flush=True)
 
-    # Write BPS3 file
+    # Try to derive iteration count and code SHA from the regret file path
+    # and the source repo. Best-effort — both fields are optional but useful.
+    iter_count = 0
+    chk_label = "unknown"
+    import re as _re
+    m = _re.search(r"regrets_(\d+)M\.bin", os.path.basename(regret_file))
+    if m:
+        iter_count = int(m.group(1)) * 1_000_000
+        chk_label = f"iter_{iter_count}"
+
+    code_sha = "unknown"
+    try:
+        code_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+    except Exception:
+        pass
+
+    # Write BPS3 file. Schema v2: full tier sizing + provenance.
     meta = {
         "type": "unified_blueprint",
+        "schema_version": 2,
         "num_players": NUM_PLAYERS,
         "blinds": [SMALL_BLIND, BIG_BLIND],
         "initial_stack": INITIAL_STACK,
+        # Tier-aware preflop sizing (the actual training tree shape).
+        # Keys are stringified ints for JSON compatibility.
+        "preflop_tiers": {str(k): v for k, v in PREFLOP_TIERS.items()},
+        "preflop_max_raises": PREFLOP_MAX_RAISES,
+        # Legacy flat list — kept for backwards compat with old consumers.
         "preflop_bet_sizes": PREFLOP_BET_SIZES,
         "postflop_bet_sizes": POSTFLOP_BET_SIZES,
-        "iterations": 200000000,
+        "iterations": iter_count,
+        "discount_stop_iter": int(config.discount_stop_iter),
         "num_info_sets": n_is,
         "preflop_buckets": 169,
         "postflop_buckets": 200,
-        "checkpoint": "iter_200000000",
+        "checkpoint": chk_label,
         "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "code_sha": code_sha,
+        # Bug B fix marker — readers can verify they're consuming
+        # average-strategy data, not regret-matched-current data.
+        "strategy_extraction_method": "strategy_sum_avg",
+        "training_complete": True,
     }
     meta_bytes = json.dumps(meta, separators=(",", ":")).encode("utf-8")
 
