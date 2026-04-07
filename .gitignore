@@ -15,7 +15,11 @@ __pycache__/
 *.xz
 flop_solutions/
 blueprint_unified/
+blueprint_data/
 data/
+# S3 mirror files we edit locally for upload
+src/mccfr_blueprint_s3.c
+src/mccfr_blueprint_s3.h
 .vscode/
 .idea/
 *.log
