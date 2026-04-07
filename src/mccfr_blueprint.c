@@ -31,19 +31,13 @@
 #include <omp.h>
 #endif
 
-/* ── Lookup miss counter (for diagnosing hash table saturation) ───── */
-static int64_t g_lookup_total = 0;
-static int64_t g_lookup_miss = 0;
-
+/* Lookup miss stats — stubbed out to avoid atomic contention on a single
+ * global cache line (192 threads hammering the same int64_t at 17K iter/s
+ * was creating ~300M atomic ops/sec on one cache line, saturating coherence). */
 void bp_get_miss_stats(int64_t *total, int64_t *miss) {
-    *total = __atomic_load_n(&g_lookup_total, __ATOMIC_RELAXED);
-    *miss = __atomic_load_n(&g_lookup_miss, __ATOMIC_RELAXED);
+    *total = 0; *miss = 0;
 }
-
-void bp_reset_miss_stats(void) {
-    __atomic_store_n(&g_lookup_total, 0, __ATOMIC_RELAXED);
-    __atomic_store_n(&g_lookup_miss, 0, __ATOMIC_RELAXED);
-}
+void bp_reset_miss_stats(void) { }
 
 /* ── RNG (xorshift64, thread-safe via separate states) ────────────── */
 
@@ -533,6 +527,16 @@ static int generate_actions(BPAction *out, int max_out,
 
 /* ── Traversal state ─────────────────────────────────────────────── */
 
+/* Flop bucket cache — hoisted out of TraversalState to avoid copying
+ * 5.3 KB on every action expansion (`TraversalState child = *ts;`).
+ * Allocated on the stack in the function that deals the flop, shared
+ * via pointer with all descendant traversal states. */
+typedef struct {
+    int buckets[BP_MAX_HANDS];   /* hand_idx -> flop bucket */
+    int num_buckets_actual;
+    int computed;
+} FlopBucketCache;
+
 typedef struct {
     BPSolver *solver;
     uint64_t *rng;           /* pointer to thread-local RNG */
@@ -552,12 +556,18 @@ typedef struct {
     int stacks[BP_MAX_PLAYERS];     /* remaining stack per player */
     int num_raises;
 
-    /* Per-traversal postflop bucket map (for unified solver).
-     * Computed once when flop is dealt, reused for turn/river.
-     * postflop_bucket[hand_idx] = bucket index (0..199). */
-    int postflop_bucket[BP_MAX_HANDS];
-    int postflop_num_buckets_actual;
-    int postflop_buckets_computed;   /* 1 if buckets have been computed for this flop */
+    /* Flop bucket cache — pointer to stack-allocated cache from the
+     * function that dealt the flop. NULL before flop is dealt. */
+    FlopBucketCache *flop_cache;
+
+    /* Per-iteration turn/river bucket cache. Each iteration has a fixed
+     * set of sampled hands, so (hand, board) -> bucket is invariant.
+     * Cached at deal time to avoid the 200-sample Monte Carlo EHS
+     * recompute on every info set lookup (was the dominant cost:
+     * ~12,000 eval7 calls/iteration -> now ~12 per iteration).
+     * -1 = not computed. Indexed by player. */
+    int turn_bucket[BP_MAX_PLAYERS];
+    int river_bucket[BP_MAX_PLAYERS];
 
     /* Canonical board for info set keys. Boards with the same texture
      * (suit-isomorphic pattern) map to the same canonical board, so
@@ -782,6 +792,12 @@ static float traverse(TraversalState *ts, int acting_order_idx,
         memset(next.has_acted, 0, sizeof(next.has_acted));
         next.num_raises = 0;
 
+        /* Flop bucket cache: allocated on this function's stack when the
+         * flop is dealt. Lives until this function returns (which happens
+         * AFTER all recursive children complete, since traverse is
+         * recursive and returns from deepest node first). */
+        FlopBucketCache flop_cache_local;
+
         if (ts->num_board == 0) {
             /* Preflop -> Flop: deal 3 cards */
             if (nv < 3) return 0;
@@ -868,9 +884,10 @@ static float traverse(TraversalState *ts, int acting_order_idx,
                 }
                 if (found >= 0) {
                     int *cache_row = &s->texture_bucket_cache[found * BP_MAX_HANDS];
-                    memcpy(next.postflop_bucket, cache_row, BP_MAX_HANDS * sizeof(int));
-                    next.postflop_num_buckets_actual = s->postflop_num_buckets;
-                    next.postflop_buckets_computed = 1;
+                    memcpy(flop_cache_local.buckets, cache_row, BP_MAX_HANDS * sizeof(int));
+                    flop_cache_local.num_buckets_actual = s->postflop_num_buckets;
+                    flop_cache_local.computed = 1;
+                    next.flop_cache = &flop_cache_local;
                 }
 
                 /* Store canonical flop and build suit mapping for turn/river.
@@ -925,6 +942,59 @@ static float traverse(TraversalState *ts, int acting_order_idx,
                 int canon_suit = (next.suit_map[suit] >= 0) ? next.suit_map[suit] : suit;
                 next.canon_board[next.num_canon_board++] = rank * 4 + canon_suit;
             }
+
+            /* Pre-compute turn/river bucket cache for all active players
+             * ONCE when the card is dealt. This replaces the per-info-set
+             * 200-sample Monte Carlo EHS recompute that was the dominant
+             * cost (~12,000 eval7 calls/iteration -> ~12). */
+            if (next.num_board == 4 && s->turn_centroids_k > 0) {
+                /* Turn: ca_compute_features + nearest centroid */
+                for (int p = 0; p < NP; p++) {
+                    next.turn_bucket[p] = -1;
+                    if (!next.active[p]) continue;
+                    int ph[1][2];
+                    ph[0][0] = s->hands[p][next.sampled_hands[p]][0];
+                    ph[0][1] = s->hands[p][next.sampled_hands[p]][1];
+                    float feat[1][3];
+                    ca_compute_features(next.board, 4, (const int(*)[2])ph, 1, 200, feat);
+                    next.turn_bucket[p] = ca_nearest_centroid(
+                        feat[0], (const float(*)[3])s->turn_centroids,
+                        s->turn_centroids_k);
+                }
+            } else if (next.num_board == 5) {
+                /* River: 200-sample EHS per player. This is the expensive
+                 * version of the same compute that used to run per-info-set. */
+                for (int p = 0; p < NP; p++) {
+                    next.river_bucket[p] = -1;
+                    if (!next.active[p]) continue;
+                    int ph = next.sampled_hands[p];
+                    int c0 = s->hands[p][ph][0], c1 = s->hands[p][ph][1];
+                    int blk[52] = {0};
+                    for (int b = 0; b < 5; b++) blk[next.board[b]] = 1;
+                    blk[c0] = 1; blk[c1] = 1;
+                    int av[52]; int nav = 0;
+                    for (int c = 0; c < 52; c++) if (!blk[c]) av[nav++] = c;
+                    int wins = 0, ties = 0, total = 0;
+                    uint64_t erng = (uint64_t)c0 * 1000003ULL + (uint64_t)c1 * 999983ULL;
+                    for (int b = 0; b < 5; b++)
+                        erng = erng * 6364136223846793005ULL + (uint64_t)next.board[b];
+                    for (int si = 0; si < 200 && nav >= 2; si++) {
+                        partial_shuffle(av, nav, 2, &erng);
+                        int h7[7] = {next.board[0], next.board[1], next.board[2],
+                                     next.board[3], next.board[4], c0, c1};
+                        int o7[7] = {next.board[0], next.board[1], next.board[2],
+                                     next.board[3], next.board[4], av[0], av[1]};
+                        uint32_t hs = eval7(h7), os = eval7(o7);
+                        if (hs > os) wins++; else if (hs == os) ties++;
+                        total++;
+                    }
+                    float ehs = (total > 0) ? ((float)wins + 0.5f*(float)ties) / (float)total : 0.5f;
+                    int b = (int)(ehs * (float)s->postflop_num_buckets);
+                    if (b >= s->postflop_num_buckets) b = s->postflop_num_buckets - 1;
+                    next.river_bucket[p] = b;
+                }
+            }
+
             return traverse(&next, 0, acting_order, num_in_order);
         }
     }
@@ -986,49 +1056,17 @@ static float traverse(TraversalState *ts, int acting_order_idx,
     if (street == 0) {
         /* Preflop: 169 lossless classes */
         bucket = get_bucket(s, street, ap, ts->sampled_hands[ap]);
-    } else if (street == 1 && ts->postflop_buckets_computed) {
-        /* Flop: use precomputed k-means texture buckets */
-        bucket = ts->postflop_bucket[ts->sampled_hands[ap]];
-    } else if (street == 2 && ts->num_board == 4 && s->turn_centroids_k > 0) {
-        /* Turn: compute [EHS, PPot, NPot] features for this hand, then
-         * map to nearest precomputed k-means centroid. Matches Pluribus:
-         * k-means on domain-specific features (Johanson 2013). */
-        int hand[1][2];
-        hand[0][0] = s->hands[ap][ts->sampled_hands[ap]][0];
-        hand[0][1] = s->hands[ap][ts->sampled_hands[ap]][1];
-        float feat[1][3];
-        ca_compute_features(ts->board, 4, (const int(*)[2])hand, 1, 200, feat);
-        bucket = ca_nearest_centroid(feat[0], (const float(*)[3])s->turn_centroids,
-                                      s->turn_centroids_k);
-    } else if (street >= 2 && ts->num_board >= 4) {
-        /* River (or turn fallback): EHS percentile with 200 MC samples. */
-        int h = ts->sampled_hands[ap];
-        int c0 = s->hands[ap][h][0], c1 = s->hands[ap][h][1];
-        int blk[52] = {0};
-        for (int b = 0; b < ts->num_board; b++) blk[ts->board[b]] = 1;
-        blk[c0] = 1; blk[c1] = 1;
-        int av[52]; int nav = 0;
-        for (int c = 0; c < 52; c++) if (!blk[c]) av[nav++] = c;
-        int wins = 0, ties = 0, total = 0;
-        uint64_t erng = (uint64_t)c0 * 1000003ULL + (uint64_t)c1 * 999983ULL;
-        for (int b = 0; b < ts->num_board; b++)
-            erng = erng * 6364136223846793005ULL + (uint64_t)ts->board[b];
-        int cards_needed = 2 + (5 - ts->num_board);
-        for (int si = 0; si < 200 && nav >= cards_needed; si++) {
-            partial_shuffle(av, nav, cards_needed, &erng);
-            int fb[5];
-            for (int b = 0; b < ts->num_board; b++) fb[b] = ts->board[b];
-            for (int b = ts->num_board; b < 5; b++)
-                fb[b] = av[2 + (b - ts->num_board)];
-            int h7[7] = {fb[0], fb[1], fb[2], fb[3], fb[4], c0, c1};
-            int o7[7] = {fb[0], fb[1], fb[2], fb[3], fb[4], av[0], av[1]};
-            uint32_t hs = eval7(h7), os = eval7(o7);
-            if (hs > os) wins++; else if (hs == os) ties++;
-            total++;
-        }
-        float ehs = (total > 0) ? ((float)wins + 0.5f*(float)ties) / (float)total : 0.5f;
-        bucket = (int)(ehs * (float)s->postflop_num_buckets);
-        if (bucket >= s->postflop_num_buckets) bucket = s->postflop_num_buckets - 1;
+    } else if (street == 1 && ts->flop_cache && ts->flop_cache->computed) {
+        /* Flop: use precomputed k-means texture buckets (cached in
+         * FlopBucketCache on the stack of the function that dealt the flop). */
+        bucket = ts->flop_cache->buckets[ts->sampled_hands[ap]];
+    } else if (street == 2 && ts->num_board == 4 && s->turn_centroids_k > 0 &&
+               ts->turn_bucket[ap] >= 0) {
+        /* Turn: use pre-computed bucket from deal-time cache. */
+        bucket = ts->turn_bucket[ap];
+    } else if (street >= 2 && ts->num_board == 5 && ts->river_bucket[ap] >= 0) {
+        /* River: use pre-computed bucket from deal-time cache. */
+        bucket = ts->river_bucket[ap];
     } else {
         bucket = get_bucket(s, street, ap, ts->sampled_hands[ap]);
     }
@@ -1047,9 +1085,7 @@ static float traverse(TraversalState *ts, int acting_order_idx,
     key.action_hash = compute_action_hash(ts->action_history, ts->history_len);
 
     int64_t is_slot = info_table_find_or_create(&s->info_table, key, na);
-    __atomic_fetch_add(&g_lookup_total, 1, __ATOMIC_RELAXED);
     if (is_slot < 0) {
-        __atomic_fetch_add(&g_lookup_miss, 1, __ATOMIC_RELAXED);
         return 0;
     }
     BPInfoSet *is = &s->info_table.sets[is_slot];
@@ -1845,6 +1881,15 @@ int bp_solve(BPSolver *s, int64_t max_iterations) {
             if (aligned_end <= aligned_start) continue;
             size_t aligned_len = aligned_end - aligned_start;
 
+            /* Request transparent huge pages. With 138GB working set and
+             * random hash probes, the dTLB (3072 4K entries on Zen4) misses
+             * on nearly every probe. 2MB huge pages cut the page table
+             * working set 512x, letting more translations fit in the TLB
+             * hierarchy. Huge TLB misses are also cheaper (one fewer level). */
+            #ifdef MADV_HUGEPAGE
+            madvise((void*)aligned_start, aligned_len, MADV_HUGEPAGE);
+            #endif
+
             int used_madvise = 0;
             #ifdef MADV_POPULATE_WRITE
             if (madvise((void*)aligned_start, aligned_len, MADV_POPULATE_WRITE) == 0) {
@@ -1987,12 +2032,23 @@ int bp_solve(BPSolver *s, int64_t max_iterations) {
                 if (conflict) continue;
 
                 TraversalState ts;
-                memset(&ts, 0, sizeof(ts));
+                /* Only zero the scalar state fields that need to be zero.
+                 * Arrays are written as needed. This avoids 6.3 KB of memset
+                 * per iteration (20+ GB/s of L1 bandwidth wasted across 192
+                 * threads at full speed). */
                 ts.solver = s;
                 ts.rng = my_rng;
                 ts.traverser = traverser;
                 ts.iteration = global_iter;
                 ts.use_pruning = use_pruning;
+                ts.num_raises = 0;
+                ts.num_canon_board = 0;
+                ts.history_len = 0;
+                ts.flop_cache = NULL;
+                for (int p = 0; p < BP_MAX_PLAYERS; p++) {
+                    ts.turn_bucket[p] = -1;
+                    ts.river_bucket[p] = -1;
+                }
                 memcpy(ts.sampled_hands, sampled_hands, sizeof(sampled_hands));
 
                 if (s->config.include_preflop) {
@@ -2042,6 +2098,8 @@ int bp_solve(BPSolver *s, int64_t max_iterations) {
                     for (int p = 0; p < NP; p++) {
                         ts.stacks[p] = s->effective_stack;
                         ts.invested[p] = s->starting_pot / NP;
+                        ts.bets[p] = 0;       /* Previously zeroed by removed memset */
+                        ts.has_acted[p] = 0;  /* Previously zeroed by removed memset */
                     }
                     traverse(&ts, 0, acting_order, NP);
                 }
