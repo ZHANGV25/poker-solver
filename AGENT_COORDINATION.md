@@ -196,6 +196,36 @@ first action of any new session. Append your status when finishing.
   Update AGENT_COORDINATION.md with the new convention: "single source of
   truth = git, S3 only stores checkpoints + caches + .bps outputs."
 
+- **Mitigation in place (2026-04-07 ~20:30 UTC):** Frontend-agent added
+  `precompute/check_s3_sync.sh` — a pre-launch verification that compares
+  local git working tree vs S3 mirror for the files EC2 will compile. Run it
+  manually before any `bash launch_export_*.sh`. Fails with a clear error if
+  any file differs (with `--auto-fix` to push local → S3). This catches the
+  Bug B-style sync gap WITHOUT requiring the full architectural Bug F fix.
+
+- **Newly discovered drift (2026-04-07 ~20:30 UTC):** While testing the sync
+  check, frontend-agent found that **`src/mccfr_blueprint_s3.{c,h}` exists as
+  a gitignored parallel copy of `src/mccfr_blueprint.{c,h}`**. The `_s3` files
+  are 17327 bytes for the .h vs 17032 bytes for the gitted .h. The difference:
+  the `_s3.h` declares `bp_save_turn_centroids` and `bp_load_turn_centroids`
+  function symbols that don't exist in the gitted .c. The S3 mirror's
+  `code/src/mccfr_blueprint.h` matches the `_s3.h` content, NOT the gitted
+  .h content. The compile succeeds because shared library builds tolerate
+  undefined symbols and the export pipeline doesn't call those functions.
+
+  **Question for solver-agent:** What is the intent of the dual `mccfr_blueprint`
+  / `mccfr_blueprint_s3` setup? Is the `_s3` version a scratchpad for in-progress
+  features, or is it meant to be the canonical source going forward? When
+  collapsing Bug F, which file becomes the single source of truth?
+
+- **Also found (2026-04-07 ~20:30 UTC):** S3 has duplicate top-level files at
+  `s3://.../code/mccfr_blueprint.c` (top-level) and `s3://.../code/src/mccfr_blueprint.c`
+  (under src/). They're MD5-different (CRLF vs LF endings, but possibly older
+  content too). All current launch scripts compile from `src/` so the top-level
+  copies are unused dead weight. Suggest deleting `code/{mccfr_blueprint.{c,h},
+  card_abstraction.{c,h}, hand_eval.h, test_hash_dedup.c}` from S3 — but
+  `test_hash_dedup.c` may be the only S3 copy of a Bug 11 test, so check first.
+
 ## Convention agreements
 
 ### Bucket numbering
@@ -310,6 +340,17 @@ is missing from the meta blob.
   thought** — this dual-source-tree is a real footgun and almost cost us a
   wasted re-export. Next session should prioritize collapsing to a single source
   of truth (git clone in launch scripts, delete S3 code/ prefix).
+- **2026-04-07 ~20:30 UTC (frontend-agent):** Launched `launch_export_1600M.sh`
+  on r6a.8xlarge (`i-098a2109e0da75643`) to verify the Bug B + Bug D fixes
+  end-to-end against the latest 1.6B checkpoint. Output goes to
+  `s3://.../unified_blueprint_1600M.bps` (200M and 1000M files preserved).
+  Added a sanity-check guard inside the userdata that greps the freshly-synced
+  S3 source for "Bug B fix" marker before compiling — bails out if S3 is stale.
+  Also added `precompute/check_s3_sync.sh` as a pre-launch defense and
+  `precompute/verify_export_freqs.py` for post-export sanity-checking. Found
+  during testing: `src/mccfr_blueprint.h` is divergent between gitted version
+  and S3 (S3 has the `_s3.h` content with extra function declarations) — see
+  Bug F section for details and questions for solver-agent.
 - **2026-04-07:** Tier-aware preflop sizing committed to training:
   `PREFLOP_TIERS = {0:[0.5,0.7,1.0], 1:[0.7,1.0], 2:[1.0], 3:[8.0]}`
   (reduced from earlier 8-size config per `f804aa2` "Reduce open raise sizes").
@@ -411,3 +452,10 @@ which loses ~14 hours. Frontend-agent's recommendation (live with it, ship to
   re-push.
 - **Cross-references:** When committing a fix, reference the bug ID in the commit
   message (e.g., `fix: Bug A — bucket mapping in extractor`).
+- **Before launching ANY EC2 export/training job (until Bug F is fixed):** Run
+  `bash precompute/check_s3_sync.sh` first to verify the S3 `code/` mirror
+  matches local git for the files EC2 will compile. The script exits 1 with a
+  clear diff list if anything is out of sync. Use `--auto-fix` to upload local
+  → S3. This catches the dual-source-tree footgun that bit us 2026-04-07. The
+  failure mode it prevents is "EC2 spends $1-2 + 30 min compiling stale source
+  and producing a bad .bps before anyone notices."
