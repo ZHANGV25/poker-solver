@@ -44,23 +44,38 @@ BIG_BLIND = 100      # $100
 INITIAL_STACK = 10000 # $10,000 = 100BB
 
 # Pluribus bet sizes: up to 14 for preflop, 3 for later rounds
-PREFLOP_BET_SIZES = [0.5, 1.0, 2.0, 3.0]  # 0.5x, 1x, 2x, 3x pot raises
-POSTFLOP_BET_SIZES = [0.5, 1.0, 2.0]       # Pluribus: 0.5x pot, pot, all-in (≈2x)
+# Flat preflop sizes (used as fallback if tiered not set)
+PREFLOP_BET_SIZES = [0.5, 0.7, 1.0]
+# Postflop first raise: Pluribus turn/river = {0.5x, 1x, all-in}
+# (all-in added automatically by generate_actions; subsequent raises use {1x, all-in})
+POSTFLOP_BET_SIZES = [0.5, 1.0]
+
+# Tiered preflop sizing (Pluribus-style: fewer sizes at deeper raise levels).
+# Open gets fine-grained sizes; 3-bet/4-bet/5-bet get progressively fewer.
+# Enumerated tree: 2.28M preflop nodes × 169 = 386M preflop info sets (vs 7.4B flat).
+PREFLOP_TIERS = {
+    0: [0.5, 0.7, 1.0],    # open raise: 3 sizes (1.75BB, 2.05BB, 2.5BB)
+    1: [0.7, 1.0],          # 3-bet: 2 sizes
+    2: [1.0],               # 4-bet: 1 size
+    3: [8.0],               # 5-bet: shove only
+}
+PREFLOP_MAX_RAISES = 4
 
 # ── DLL loading ───────────────────────────────────────────────────
 
 class BPConfig(ctypes.Structure):
     _fields_ = [
-        ("discount_stop_iter", ctypes.c_int),
-        ("discount_interval", ctypes.c_int),
-        ("prune_start_iter", ctypes.c_int),
-        ("snapshot_start_iter", ctypes.c_int),
-        ("snapshot_interval", ctypes.c_int),
-        ("strategy_interval", ctypes.c_int),
+        ("discount_stop_iter", ctypes.c_int64),
+        ("discount_interval", ctypes.c_int64),
+        ("prune_start_iter", ctypes.c_int64),
+        ("snapshot_start_iter", ctypes.c_int64),
+        ("snapshot_interval", ctypes.c_int64),
+        ("strategy_interval", ctypes.c_int64),
         ("num_threads", ctypes.c_int),
-        ("hash_table_size", ctypes.c_int),
+        ("hash_table_size", ctypes.c_int64),
         ("snapshot_dir", ctypes.c_char_p),
         ("include_preflop", ctypes.c_int),
+        ("postflop_num_buckets", ctypes.c_int),
     ]
 
 
@@ -74,17 +89,30 @@ def load_bp_dll(build_dir):
             bp.bp_init_unified.restype = ctypes.c_int
             bp.bp_set_buckets.restype = ctypes.c_int
             bp.bp_solve.restype = ctypes.c_int
+            bp.bp_solve.argtypes = [ctypes.c_void_p, ctypes.c_int64]
             bp.bp_get_strategy.restype = ctypes.c_int
-            bp.bp_num_info_sets.restype = ctypes.c_int
+            bp.bp_num_info_sets.restype = ctypes.c_int64
+            bp.bp_num_info_sets.argtypes = [ctypes.c_void_p]
             bp.bp_export_strategies.restype = ctypes.c_int
             bp.bp_export_strategies.argtypes = [
                 ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
                 ctypes.POINTER(ctypes.c_size_t)
             ]
+            bp.bp_set_preflop_tier.restype = ctypes.c_int
+            bp.bp_set_preflop_tier.argtypes = [
+                ctypes.c_void_p, ctypes.c_int,
+                ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+                ctypes.c_int
+            ]
+            bp.bp_get_regrets.restype = ctypes.c_int
             bp.bp_save_regrets.restype = ctypes.c_int
             bp.bp_save_regrets.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-            bp.bp_load_regrets.restype = ctypes.c_int
+            bp.bp_load_regrets.restype = ctypes.c_int64
             bp.bp_load_regrets.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            bp.bp_save_texture_cache.restype = ctypes.c_int
+            bp.bp_save_texture_cache.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            bp.bp_load_texture_cache.restype = ctypes.c_int
+            bp.bp_load_texture_cache.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
             bp.bp_free.restype = None
             return bp
     raise FileNotFoundError(f"mccfr_blueprint not found in {build_dir}")
@@ -115,7 +143,8 @@ def main():
     print(f"Players: {NUM_PLAYERS}")
     print(f"Blinds: {SMALL_BLIND}/{BIG_BLIND}")
     print(f"Stack: {INITIAL_STACK} ({INITIAL_STACK//BIG_BLIND}BB)")
-    print(f"Preflop bet sizes: {PREFLOP_BET_SIZES}")
+    print(f"Preflop tiers: {PREFLOP_TIERS}")
+    print(f"Preflop max raises: {PREFLOP_MAX_RAISES}")
     print(f"Postflop bet sizes: {POSTFLOP_BET_SIZES}")
     print(f"Threads: {args.num_threads or 'auto'}")
     print()
@@ -131,35 +160,32 @@ def main():
 
     if args.hash_size > 0:
         config.hash_table_size = args.hash_size
+    else:
+        config.hash_table_size = 3000000000  # 3B slots (~180GB meta, fits c7a.metal 376GB)
 
-    # If running by time limit, estimate iterations.
-    # The iteration estimate determines Pluribus timing thresholds (discount,
-    # pruning, snapshots) as proportions of total iterations. Getting this
-    # right is critical — overestimating causes thresholds to fire too late.
-    #
-    # Observed throughput: ~2300 iter/s on 96 threads including checkpoint
-    # overhead (~24 iter/s per thread). Burst solving speed (~290K iter/s)
-    # is much higher but checkpoint saves every 1M iters add ~10s overhead.
+    # If running by time limit, estimate iterations based on Pluribus core-hours.
+    # Pluribus: 12,400 core-hours on 64 cores. We match total core-hours.
+    # Burst throughput is ~280K iter/s (pruned) / ~140K (unpruned), average ~200K.
+    # With large checkpoint intervals, overhead is negligible.
     if args.time_limit_hours > 0 and args.iterations == 0:
         effective_threads = args.num_threads if args.num_threads > 0 else (os.cpu_count() or 1)
-        # Use observed throughput: ~24 iter/s/thread (includes checkpoint overhead)
-        est_iter_per_sec = effective_threads * 24
-        args.iterations = int(args.time_limit_hours * 3600 * est_iter_per_sec)
-        print(f"Time limit: {args.time_limit_hours}h, {effective_threads} threads, "
-              f"~{est_iter_per_sec} iter/s → estimated {args.iterations:,} iterations")
+        # Target: Pluribus's 12,400 core-hours scaled to our core count
+        target_hours = 12400 / effective_threads  # wall-clock hours of solving
+        # Use conservative average throughput (mix of pruned/unpruned phases)
+        est_iter_per_sec = 200000  # ~200K iter/s on 96 threads
+        args.iterations = int(target_hours * 3600 * est_iter_per_sec)
+        print(f"Target: {12400} core-hours / {effective_threads} cores = {target_hours:.1f}h solving")
+        print(f"Estimated throughput: ~{est_iter_per_sec:,} iter/s → {args.iterations:,} iterations")
 
     if args.iterations <= 0:
         args.iterations = 1000000  # default 1M
 
-    # Scale Pluribus timing parameters proportionally.
-    # Cap all at INT32_MAX to prevent ctypes c_int overflow — with 72 threads
-    # the iteration estimate can exceed 13B, and 13B * 0.17 > INT32_MAX.
-    INT32_MAX = 2_147_483_647
-    config.discount_stop_iter = min(max(args.iterations * 35 // 1000, 1000), INT32_MAX)
-    config.discount_interval = min(max(config.discount_stop_iter // 40, 100), INT32_MAX)
-    config.prune_start_iter = min(max(args.iterations * 17 // 1000, 500), INT32_MAX)
-    config.snapshot_start_iter = min(max(args.iterations * 7 // 100, 10000), INT32_MAX)
-    config.snapshot_interval = min(max(args.iterations * 17 // 1000, 5000), INT32_MAX)
+    # Scale Pluribus timing parameters proportionally (int64, no overflow concern).
+    config.discount_stop_iter = max(args.iterations * 35 // 1000, 1000)
+    config.discount_interval = max(config.discount_stop_iter // 40, 100)
+    config.prune_start_iter = max(args.iterations * 17 // 1000, 500)
+    config.snapshot_start_iter = max(args.iterations * 7 // 100, 10000)
+    config.snapshot_interval = max(args.iterations * 17 // 1000, 5000)
     config.strategy_interval = 10000  # Pluribus: every 10K iterations
 
     print(f"Iterations: {args.iterations:,}")
@@ -168,12 +194,39 @@ def main():
     print(f"Snapshots: after iter {config.snapshot_start_iter:,}, every {config.snapshot_interval:,}")
     print()
 
+    # Try to load cached texture buckets from S3 (saves ~65 min precompute)
+    texture_cache_local = os.path.join(args.output_dir, "texture_cache.bin")
+    texture_loaded = False
+    if args.s3_bucket:
+        os.makedirs(args.output_dir, exist_ok=True)
+        texture_s3 = f"s3://{args.s3_bucket}/texture_cache.bin"
+        ret = subprocess.run(
+            ["aws", "s3", "cp", texture_s3, texture_cache_local, "--quiet"],
+            capture_output=True
+        )
+        if ret.returncode == 0 and os.path.exists(texture_cache_local):
+            print(f"Found texture cache on S3, will load after init")
+            texture_loaded = True
+        else:
+            print("No texture cache found, will precompute")
+
     # Initialize
     buf = (ctypes.c_char * 524288)()
     solver = ctypes.cast(buf, ctypes.c_void_p)
 
     c_postflop = (ctypes.c_float * len(POSTFLOP_BET_SIZES))(*POSTFLOP_BET_SIZES)
     c_preflop = (ctypes.c_float * len(PREFLOP_BET_SIZES))(*PREFLOP_BET_SIZES)
+
+    # Load texture cache BEFORE init so bp_init_unified skips the 65-min precompute.
+    # bp_load_texture_cache allocates the cache array and sets num_cached_textures > 0.
+    # bp_init_unified checks this and skips if already loaded.
+    if texture_loaded:
+        n = bp_lib.bp_load_texture_cache(solver, texture_cache_local.encode('utf-8'))
+        if n > 0:
+            print(f"Loaded texture cache: {n} textures")
+        else:
+            print("Failed to load texture cache, will precompute")
+            texture_loaded = False
 
     ret = bp_lib.bp_init_unified(
         solver, NUM_PLAYERS,
@@ -186,6 +239,30 @@ def main():
         print(f"FATAL: bp_init_unified returned {ret}")
         sys.exit(1)
     print("Solver initialized.")
+
+    # Set tiered preflop sizing (overrides flat sizes)
+    for level, sizes in sorted(PREFLOP_TIERS.items()):
+        c_sizes = (ctypes.c_float * len(sizes))(*sizes)
+        ret = bp_lib.bp_set_preflop_tier(
+            solver, level, c_sizes, len(sizes), PREFLOP_MAX_RAISES)
+        if ret != 0:
+            print(f"FATAL: bp_set_preflop_tier level {level} returned {ret}")
+            sys.exit(1)
+    print(f"Tiered preflop: {len(PREFLOP_TIERS)} levels, max {PREFLOP_MAX_RAISES} raises")
+
+    # Save texture cache for future runs (skips 65-min precompute next time)
+    if not texture_loaded and args.s3_bucket:
+        os.makedirs(args.output_dir, exist_ok=True)
+        bp_lib.bp_save_texture_cache(solver, texture_cache_local.encode('utf-8'))
+        try:
+            subprocess.run(
+                ["aws", "s3", "cp", texture_cache_local,
+                 f"s3://{args.s3_bucket}/texture_cache.bin", "--quiet"],
+                check=True, capture_output=True
+            )
+            print("Texture cache saved to S3")
+        except subprocess.CalledProcessError:
+            print("Warning: failed to upload texture cache to S3")
     # Postflop buckets (200 EHS percentile) are precomputed inside bp_init_unified
     # for all 1,755 flop textures. During traversal, the dealt flop is canonicalized
     # and the precomputed bucket mapping is looked up in O(1755) per deal.
@@ -234,10 +311,6 @@ def main():
     # If the instance dies, we lose at most one chunk of work.
     # The C solver's hash table accumulates regrets across bp_solve calls,
     # so calling bp_solve(N) then bp_solve(M) equals bp_solve(N+M).
-    chunk_size = args.checkpoint_interval
-    if chunk_size <= 0:
-        chunk_size = args.iterations  # no checkpointing
-
     total_iters = args.iterations
     iters_done = iters_already_done
     iters_remaining = total_iters - iters_done
@@ -248,7 +321,7 @@ def main():
         return
 
     print(f"\nStarting solve: {iters_remaining:,} iterations remaining "
-          f"(of {total_iters:,}), checkpoint every {chunk_size:,}...")
+          f"(of {total_iters:,}), adaptive checkpoints...")
     # Crash debugging: flush on every print and catch signals
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
@@ -265,25 +338,87 @@ def main():
 
     t0 = time.time()
 
+    # Checkpoint schedule: dense early, then every 300M for spot safety.
+    # Target: 4B iterations. Every checkpoint uploaded to S3 so spot
+    # reclamation loses at most ~300M iterations (~5.5h at 15K iter/s).
+    checkpoint_milestones = [
+        200_000_000, 400_000_000, 600_000_000,
+        900_000_000, 1_200_000_000, 1_500_000_000, 1_800_000_000,
+        2_100_000_000, 2_400_000_000, 2_700_000_000, 3_000_000_000,
+        3_300_000_000, 3_600_000_000, 4_000_000_000,
+    ]
+    # After last explicit milestone, checkpoint every 300M
+    checkpoint_ramp_interval = 300_000_000
+    last_milestone = checkpoint_milestones[-1] if checkpoint_milestones else 0
+
+    def _next_checkpoint(current):
+        """Return the next checkpoint iteration after current."""
+        for m in checkpoint_milestones:
+            if m > current:
+                return m
+        # Past all milestones: use ramp interval
+        base = last_milestone
+        while base <= current:
+            base += checkpoint_ramp_interval
+        return base
+
+    next_checkpoint_at = _next_checkpoint(iters_done)
+
+    # bp_solve takes int32 max_iterations for the C call.
+    INT32_MAX = 2_147_483_647
+
+    # Solve in mini-chunks (50M) with lightweight strategy probes between each.
+    # Full checkpoint (regret save + S3 upload) only at adaptive milestones.
+    mini_chunk = 50_000_000  # strategy probe every 50M iterations
+
     while iters_done < total_iters:
-        this_chunk = min(chunk_size, total_iters - iters_done)
-        print(f"[Solve] Starting chunk: {this_chunk:,} iters from {iters_done:,}...",
-              flush=True)
-        ret = bp_lib.bp_solve(solver, this_chunk)
-        print(f"[Solve] bp_solve returned {ret}", flush=True)
-        iters_done += this_chunk
+        # Solve one mini-chunk
+        call_size = min(mini_chunk, total_iters - iters_done, INT32_MAX)
+        call_size_int = int(call_size)
+        print(f"[Solve] {call_size_int:,} iters from {iters_done:,}...", flush=True)
+        ret = bp_lib.bp_solve(solver, ctypes.c_int64(call_size_int))
+        if ret != 0:
+            print(f"[Solve] bp_solve returned {ret}", flush=True)
+        iters_done += call_size
 
         elapsed = time.time() - t0
         n_is = bp_lib.bp_num_info_sets(solver)
         ips = iters_done / elapsed if elapsed > 0 else 0
-        remaining_h = (total_iters - iters_done) / ips / 3600 if ips > 0 else 0
-        print(f"[Checkpoint] {iters_done:,}/{total_iters:,} iters, "
-              f"{n_is:,} IS, {elapsed/3600:.1f}h elapsed, "
-              f"~{remaining_h:.1f}h remaining, {ips:.0f} iter/s")
 
-        # Export checkpoint
-        if args.output_dir:
-            _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is)
+        # Lightweight strategy probe: extract strategies + raw regrets
+        # directly from memory via bp_get_strategy/bp_get_regrets (no disk I/O).
+        probe = _probe_preflop(bp_lib, solver)
+        if probe:
+            header = f"[Probe {iters_done:,}]"
+            for line in probe.split("\n"):
+                print(f"{header} {line}", flush=True)
+            # Upload probe file to S3
+            if args.s3_bucket and args.output_dir:
+                iter_tag = f"{iters_done // 1_000_000}M"
+                probe_path = os.path.join(args.output_dir, "probe_latest.txt")
+                with open(probe_path, 'w') as pf:
+                    pf.write(f"iteration: {iters_done}\n{probe}\n")
+                try:
+                    subprocess.run(
+                        ["aws", "s3", "cp", probe_path,
+                         f"s3://{args.s3_bucket}/probes/probe_{iter_tag}.txt",
+                         "--quiet"], capture_output=True, timeout=30)
+                    subprocess.run(
+                        ["aws", "s3", "cp", probe_path,
+                         f"s3://{args.s3_bucket}/probes/probe_latest.txt",
+                         "--quiet"], capture_output=True, timeout=30)
+                except Exception:
+                    pass
+
+        # Full checkpoint at adaptive milestones (200M, 400M, 600M, 2B, 4B, ...)
+        if iters_done >= next_checkpoint_at or iters_done >= total_iters:
+            remaining_h = (total_iters - iters_done) / ips / 3600 if ips > 0 else 0
+            print(f"[Checkpoint] {iters_done:,}/{total_iters:,} iters, "
+                  f"{n_is:,} IS, {elapsed/3600:.1f}h elapsed, "
+                  f"~{remaining_h:.1f}h remaining, {ips:.0f} iter/s")
+            if args.output_dir:
+                _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is)
+            next_checkpoint_at = _next_checkpoint(iters_done)
 
     elapsed = time.time() - t0
     n_is = bp_lib.bp_num_info_sets(solver)
@@ -299,6 +434,93 @@ def main():
 
     bp_lib.bp_free(solver)
     print("\nDone.")
+
+
+def _probe_preflop(bp_lib, solver):
+    """Extract preflop strategies and raw regrets for key hands.
+
+    Output format (multi-line):
+      UTG: AA:F0/C2/R98 KK:F0/C5/R95 ... 22:F85/C10/R5
+      BTN: AA:F0/C1/R99 KK:F0/C2/R98 ... 22:F60/C20/R20
+      REGRETS UTG TT: fold=+1234 call=+56789 best_raise=+12345 pruned=3/8
+      REGRETS UTG 99: fold=+5678 call=+45678 best_raise=-1234 pruned=5/8
+      REGRETS UTG 44: fold=+9012 call=-3456 best_raise=-78901 pruned=6/8
+
+    The REGRETS lines show raw int regrets for the 3 diagnostic hands.
+    'pruned=3/8' means 3 of 8 raise actions are below -300M threshold.
+    This directly measures whether the pruning fix is working."""
+    try:
+        PRUNE_THRESH = -300_000_000
+
+        # Pocket pairs + key broadway/suited connectors that showed
+        # convergence issues (AKo uniform stuck, A5s/K9s/87s/98s fold locked)
+        pairs = [
+            ("AA", 0), ("KK", 25), ("QQ", 48), ("JJ", 69), ("TT", 88),
+            ("99", 105), ("88", 120), ("77", 133), ("66", 144), ("55", 153),
+            ("44", 160), ("33", 165), ("22", 168),
+            ("AKo", 2), ("AQs", 3), ("A5s", 17), ("K9s", 32),
+            ("98s", 106), ("87s", 121),
+        ]
+        # Diagnostic hands: raw regrets for call trap / fold lock-in / uniform stuck
+        diag_hands = [("TT", 88), ("99", 105), ("44", 160), ("AKo", 2), ("87s", 121)]
+
+        # Positions with their "folds to me" action sequences.
+        # Preflop order: UTG(2), MP(3), CO(4), BTN(5), SB(0), BB(1).
+        # Action index 0 = fold. Each position's root = all prior players folded.
+        positions = [
+            ("UTG", 2, []),              # first to act
+            ("BTN", 5, [0, 0, 0]),       # UTG, MP, CO folded
+        ]
+
+        strat_buf = (ctypes.c_float * 16)()
+        regret_buf = (ctypes.c_int * 16)()
+        empty_board = (ctypes.c_int * 1)(0)
+
+        lines = []
+
+        # Strategy lines for each position
+        for pos_name, player, action_seq in positions:
+            if action_seq:
+                c_seq = (ctypes.c_int * len(action_seq))(*action_seq)
+                seq_len = len(action_seq)
+            else:
+                c_seq = (ctypes.c_int * 1)(0)
+                seq_len = 0
+            parts = []
+            for name, bucket in pairs:
+                na = bp_lib.bp_get_strategy(solver, player, empty_board, 0,
+                                             c_seq, seq_len, strat_buf, bucket)
+                if na >= 3:
+                    f_p = strat_buf[0] * 100
+                    c_p = strat_buf[1] * 100
+                    r_p = sum(strat_buf[a] for a in range(2, na)) * 100
+                    parts.append(f"{name}:F{f_p:.0f}/C{c_p:.0f}/R{r_p:.0f}")
+                else:
+                    parts.append(f"{name}:?")
+            lines.append(f"{pos_name}: {' '.join(parts)}")
+
+        # Raw regret lines for diagnostic hands (UTG only)
+        utg_regret_seq = (ctypes.c_int * 1)(0)
+        for name, bucket in diag_hands:
+            na = bp_lib.bp_get_regrets(solver, 2, empty_board, 0,
+                                        utg_regret_seq, 0, regret_buf, bucket)
+            if na >= 3:
+                fold_r = regret_buf[0]
+                call_r = regret_buf[1]
+                raise_regrets = [regret_buf[a] for a in range(2, na)]
+                best_raise = max(raise_regrets)
+                n_pruned = sum(1 for r in raise_regrets if r < PRUNE_THRESH)
+                n_raises = len(raise_regrets)
+                lines.append(
+                    f"REGRETS UTG {name}: fold={fold_r:+d} call={call_r:+d} "
+                    f"best_raise={best_raise:+d} pruned={n_pruned}/{n_raises}"
+                )
+            else:
+                lines.append(f"REGRETS UTG {name}: not_found")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"probe_error:{e}"
 
 
 def _s3_upload_with_retry(local_path, s3_uri, max_attempts=3, delay=5):
@@ -351,6 +573,8 @@ def _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is,
         "blinds": [SMALL_BLIND, BIG_BLIND],
         "initial_stack": INITIAL_STACK,
         "preflop_bet_sizes": PREFLOP_BET_SIZES,
+        "preflop_tiers": {str(k): v for k, v in PREFLOP_TIERS.items()},
+        "preflop_max_raises": PREFLOP_MAX_RAISES,
         "postflop_bet_sizes": POSTFLOP_BET_SIZES,
         "iterations": iters_done,
         "num_info_sets": n_is,
@@ -405,20 +629,76 @@ def _export_checkpoint(bp_lib, solver, args, iters_done, elapsed, n_is,
 
     # ── Upload to S3 (with retries) ──
     if args.s3_bucket:
+        # Always upload latest (for resume)
         uploads = [
             (regret_path, "checkpoints/regrets_latest.bin"),
             (meta_path, "checkpoint_meta.json"),
         ]
+        # Also save a timestamped copy of every checkpoint for later analysis.
+        # Use "XB" for exact billions, "XM" otherwise (avoids collisions
+        # where e.g. 1.5B and 1B both mapped to "1B" via integer division).
+        if iters_done >= 1_000_000_000 and iters_done % 1_000_000_000 == 0:
+            iter_tag = f"{iters_done // 1_000_000_000}B"
+        else:
+            iter_tag = f"{iters_done // 1_000_000}M"
+        uploads.append((regret_path, f"checkpoints/regrets_{iter_tag}.bin"))
+        uploads.append((meta_path, f"checkpoints/meta_{iter_tag}.json"))
+
         if label == "final" and os.path.exists(bps_path):
             uploads.append((bps_path, "unified_blueprint.bps"))
-        for local, s3key in uploads:
+
+        # ── Run extract_roots for convergence monitoring ──
+        extract_bin = os.path.join(args.build_dir, "extract_roots")
+        summary_path = None
+        if os.path.exists(extract_bin):
+            summary_path = os.path.join(args.output_dir, f"strategy_{iter_tag}.txt")
+            try:
+                result = subprocess.run(
+                    [extract_bin, regret_path],
+                    capture_output=True, text=True, timeout=1800
+                )
+                with open(summary_path, 'w') as sf:
+                    sf.write(result.stdout)
+                # Print a compact UTG summary to the log
+                for line in result.stdout.splitlines():
+                    if "Summary:" in line or "SANITY" in line or "CHECK:" in line or "OK:" in line:
+                        print(f"  {line.strip()}")
+            except Exception as e:
+                print(f"  [WARN] extract_roots failed: {e}")
+                summary_path = None
+
+        # Upload small files FIRST (summary + meta) so results are visible
+        # immediately, then upload the large regret file once + server-side copy.
+        small_uploads = [(meta_path, "checkpoint_meta.json"),
+                         (meta_path, f"checkpoints/meta_{iter_tag}.json")]
+        if summary_path and os.path.exists(summary_path):
+            small_uploads.append((summary_path, f"summaries/strategy_{iter_tag}.txt"))
+        if label == "final" and os.path.exists(bps_path):
+            small_uploads.append((bps_path, "unified_blueprint.bps"))
+
+        for local, s3key in small_uploads:
             if os.path.exists(local):
                 try:
                     _s3_upload_with_retry(
                         local, f"s3://{args.s3_bucket}/{s3key}")
                 except subprocess.CalledProcessError:
-                    pass  # already logged in _s3_upload_with_retry
-        print(f"  Uploaded to s3://{args.s3_bucket}/")
+                    pass
+        print(f"  Summary uploaded to s3://{args.s3_bucket}/summaries/ ({iter_tag})")
+
+        # Upload regret file ONCE as latest, then server-side copy for timestamped.
+        # Saves uploading 76GB twice (was ~15-20 min overhead per checkpoint).
+        try:
+            _s3_upload_with_retry(
+                regret_path, f"s3://{args.s3_bucket}/checkpoints/regrets_latest.bin")
+            subprocess.run(
+                ["aws", "s3", "cp",
+                 f"s3://{args.s3_bucket}/checkpoints/regrets_latest.bin",
+                 f"s3://{args.s3_bucket}/checkpoints/regrets_{iter_tag}.bin",
+                 "--quiet"],
+                check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            print(f"  [WARN] regret upload/copy failed: {e}")
+        print(f"  Regrets uploaded to s3://{args.s3_bucket}/ ({iter_tag})")
 
 
 if __name__ == "__main__":

@@ -22,10 +22,22 @@
 #include <math.h>
 #include <stdio.h>
 #include <time.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/mman.h>
+#include <sched.h>
 
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+
+/* Lookup miss stats — stubbed out to avoid atomic contention on a single
+ * global cache line (192 threads hammering the same int64_t at 17K iter/s
+ * was creating ~300M atomic ops/sec on one cache line, saturating coherence). */
+void bp_get_miss_stats(int64_t *total, int64_t *miss) {
+    *total = 0; *miss = 0;
+}
+void bp_reset_miss_stats(void) { }
 
 /* ── RNG (xorshift64, thread-safe via separate states) ────────────── */
 
@@ -60,7 +72,7 @@ static void partial_shuffle(int *arr, int n, int k, uint64_t *rng) {
  * Arena allocates in bulk 64MB chunks, returning aligned 32-byte blocks. */
 
 #define ARENA_CHUNK_SIZE (64 * 1024 * 1024)  /* 64 MB per chunk */
-#define ARENA_BLOCK_SIZE 32                    /* 32 bytes = 8 ints max */
+#define ARENA_BLOCK_SIZE 64                    /* 64 bytes = 16 ints max */
 
 typedef struct ArenaChunk {
     char *data;
@@ -80,9 +92,94 @@ static void arena_init(void) {
     /* Nothing to do — lazy allocation on first use */
 }
 
-/* Thread-safe arena_alloc using atomic fetch-add on chunk->used.
- * New chunk allocation uses a simple spinlock (rare path). */
+/* Per-thread arena slices: each thread holds a 1MB local slice and serves
+ * sub-allocations without atomics. When the slice runs out, it grabs a
+ * new slice from the global arena via ONE atomic op.
+ *
+ * Before: every arena_alloc was an atomic_fetch_add on chunk->used. With
+ * 192 threads doing 10M+ allocations during snapshot-time strategy_sum
+ * allocation, the cache line bounced 10M+ times across cores → 10+
+ * minutes of contention per snapshot.
+ *
+ * After: each thread atomically reserves a 1MB slice (~16K allocations
+ * worth of 64-byte blocks). Per-thread overhead drops 16000x.
+ *
+ * The slice is also pre-faulted (madvise POPULATE_WRITE) when it spans
+ * new pages, eliminating the page-fault storm during snapshots. */
+#define TLS_SLICE_SIZE (1024 * 1024)  /* 1MB per thread-local slice */
+
 static int g_arena_lock = 0;
+static __thread char *tls_arena_ptr = NULL;
+static __thread char *tls_arena_end = NULL;
+
+/* Reserve a fresh slice from the global arena. Allocates a new chunk
+ * if needed. Returns 0 on success, -1 on OOM. */
+static int arena_grab_slice(int min_size) {
+    int slice_size = TLS_SLICE_SIZE;
+    if (min_size > slice_size) slice_size = min_size;
+    /* Round to 64 bytes for cache-line alignment of the slice itself */
+    slice_size = (slice_size + 63) & ~63;
+
+retry_global:;
+    ArenaChunk *chunk = g_arena.head;
+    if (chunk) {
+        int old = __atomic_fetch_add(&chunk->used, slice_size, __ATOMIC_RELAXED);
+        if (old + slice_size <= chunk->capacity) {
+            tls_arena_ptr = chunk->data + old;
+            tls_arena_end = tls_arena_ptr + slice_size;
+            return 0;
+        }
+        /* Chunk full — fall through to allocate new one */
+    }
+
+    /* Need a new chunk — take the spinlock */
+    int expected = 0;
+    if (!__atomic_compare_exchange_n(&g_arena_lock, &expected, 1,
+                                     0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        for (int spins = 0; __atomic_load_n(&g_arena_lock, __ATOMIC_ACQUIRE); spins++) {
+            #ifdef __x86_64__
+            __builtin_ia32_pause();
+            #endif
+            if (spins > 10000) { sched_yield(); spins = 0; }
+        }
+        goto retry_global;
+    }
+
+    /* Double-check */
+    chunk = g_arena.head;
+    if (chunk && chunk->used + slice_size <= chunk->capacity) {
+        __atomic_store_n(&g_arena_lock, 0, __ATOMIC_RELEASE);
+        goto retry_global;
+    }
+
+    /* Allocate a new chunk */
+    ArenaChunk *c = (ArenaChunk*)malloc(sizeof(ArenaChunk));
+    if (!c) { __atomic_store_n(&g_arena_lock, 0, __ATOMIC_RELEASE); return -1; }
+    c->data = (char*)calloc(1, ARENA_CHUNK_SIZE);
+    if (!c->data) {
+        free(c);
+        __atomic_store_n(&g_arena_lock, 0, __ATOMIC_RELEASE);
+        return -1;
+    }
+    c->capacity = ARENA_CHUNK_SIZE;
+    c->used = 0;
+    c->next = g_arena.head;
+    g_arena.head = c;
+    g_arena.total_chunks++;
+
+    /* Pre-fault the new chunk's pages so future per-iteration writes
+     * don't trigger mm_lock contention via page faults. madvise is fast
+     * (~10ms for 64MB) and eliminates the per-snapshot fault storm. */
+    #ifdef MADV_POPULATE_WRITE
+    madvise(c->data, ARENA_CHUNK_SIZE, MADV_POPULATE_WRITE);
+    #endif
+    #ifdef MADV_HUGEPAGE
+    madvise(c->data, ARENA_CHUNK_SIZE, MADV_HUGEPAGE);
+    #endif
+
+    __atomic_store_n(&g_arena_lock, 0, __ATOMIC_RELEASE);
+    goto retry_global;
+}
 
 static void *arena_alloc(int num_ints) {
     int size = num_ints * (int)sizeof(int);
@@ -90,53 +187,18 @@ static void *arena_alloc(int num_ints) {
     /* Round up to 8-byte alignment */
     size = (size + 7) & ~7;
 
-retry:;
-    ArenaChunk *chunk = g_arena.head;
-    if (chunk) {
-        int old = __atomic_fetch_add(&chunk->used, size, __ATOMIC_RELAXED);
-        if (old + size <= chunk->capacity) {
-            return chunk->data + old;
-        }
-        /* Chunk full — fall through to allocate new one */
+    /* Fast path: serve from thread-local slice without any atomics. */
+    if (tls_arena_ptr && tls_arena_ptr + size <= tls_arena_end) {
+        void *ptr = tls_arena_ptr;
+        tls_arena_ptr += size;
+        return ptr;
     }
 
-    /* Rare path: allocate new chunk under spinlock */
-    int expected = 0;
-    if (!__atomic_compare_exchange_n(&g_arena_lock, &expected, 1,
-                                     0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-        /* Another thread is allocating — spin with pause then retry */
-        for (int spins = 0; __atomic_load_n(&g_arena_lock, __ATOMIC_ACQUIRE); spins++) {
-            #ifdef __x86_64__
-            __builtin_ia32_pause();
-            #endif
-            if (spins > 10000) { /* yield after ~10us of spinning */
-                #ifdef _OPENMP
-                #pragma omp taskyield
-                #endif
-                spins = 0;
-            }
-        }
-        goto retry;
-    }
-
-    /* Double-check after acquiring lock */
-    chunk = g_arena.head;
-    if (chunk && chunk->used + size <= chunk->capacity) {
-        __atomic_store_n(&g_arena_lock, 0, __ATOMIC_RELEASE);
-        goto retry;
-    }
-
-    ArenaChunk *c = (ArenaChunk*)malloc(sizeof(ArenaChunk));
-    if (!c) { __atomic_store_n(&g_arena_lock, 0, __ATOMIC_RELEASE); return NULL; }
-    c->data = (char*)calloc(1, ARENA_CHUNK_SIZE);
-    if (!c->data) { free(c); __atomic_store_n(&g_arena_lock, 0, __ATOMIC_RELEASE); return NULL; }
-    c->capacity = ARENA_CHUNK_SIZE;
-    c->used = 0;
-    c->next = g_arena.head;
-    g_arena.head = c;
-    g_arena.total_chunks++;
-    __atomic_store_n(&g_arena_lock, 0, __ATOMIC_RELEASE);
-    goto retry;
+    /* Slow path: grab a new slice (one atomic op per ~16K allocations). */
+    if (arena_grab_slice(size) != 0) return NULL;
+    void *ptr = tls_arena_ptr;
+    tls_arena_ptr += size;
+    return ptr;
 }
 
 static void arena_free_all(void) {
@@ -149,6 +211,11 @@ static void arena_free_all(void) {
     }
     g_arena.head = NULL;
     g_arena.total_chunks = 0;
+    /* Note: TLS pointers in worker threads still point into freed memory.
+     * They'll be reset on the next arena_grab_slice() call. Safe as long
+     * as no thread does arena_alloc between free_all and the next solve. */
+    tls_arena_ptr = NULL;
+    tls_arena_end = NULL;
 }
 
 /* ── Hash table ───────────────────────────────────────────────────── */
@@ -259,11 +326,11 @@ static uint64_t compute_action_hash(const int *actions, int num_actions) {
     return h;
 }
 
-static void info_table_init(BPInfoTable *t, int table_size) {
+static void info_table_init(BPInfoTable *t, int64_t table_size) {
     t->table_size = table_size;
-    t->keys = (BPInfoKey*)calloc(table_size, sizeof(BPInfoKey));
-    t->sets = (BPInfoSet*)calloc(table_size, sizeof(BPInfoSet));
-    t->occupied = (int*)calloc(table_size, sizeof(int));
+    t->keys = (BPInfoKey*)calloc((size_t)table_size, sizeof(BPInfoKey));
+    t->sets = (BPInfoSet*)calloc((size_t)table_size, sizeof(BPInfoSet));
+    t->occupied = (int*)calloc((size_t)table_size, sizeof(int));
     t->num_entries = 0;
 }
 
@@ -286,16 +353,36 @@ static inline int key_eq(const BPInfoKey *a, const BPInfoKey *b) {
            a->action_hash == b->action_hash;
 }
 
-static int info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
-                                      int num_actions) {
+/* Spin until a state=2 slot finishes initialization (becomes 1).
+ * The initializer already won its CAS, so it WILL complete — the only
+ * question is when. On 192-core machines, OS preemption can delay the
+ * initializer by milliseconds, so we use a long spin (~100ms) and then
+ * yield to avoid burning a core indefinitely. */
+static inline void spin_until_ready(const int *flag) {
+    int spins = 0;
+    while (__atomic_load_n(flag, __ATOMIC_ACQUIRE) == 2) {
+        #ifdef __x86_64__
+        __builtin_ia32_pause();
+        #elif defined(__aarch64__)
+        __asm__ volatile("yield");
+        #endif
+        if (++spins > 10000000) {   /* ~10ms, yield then retry */
+            spins = 0;
+            sched_yield();
+        }
+    }
+}
+
+static int64_t info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
+                                          int num_actions) {
     uint64_t h = hash_combine(key.board_hash, key.action_hash);
     h = hash_combine(h, (uint64_t)key.player);
     h = hash_combine(h, (uint64_t)key.street);
     h = hash_combine(h, (uint64_t)key.bucket);
-    int slot = (int)(h % (uint64_t)t->table_size);
+    int64_t slot = (int64_t)(h % (uint64_t)t->table_size);
 
     for (int probe = 0; probe < 4096; probe++) {
-        int idx = (slot + probe) % t->table_size;
+        int64_t idx = (slot + probe) % t->table_size;
         int state = __atomic_load_n(&t->occupied[idx], __ATOMIC_ACQUIRE);
 
         if (state == 1) {
@@ -317,17 +404,24 @@ static int info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
                 /* De-dup check: scan backwards from our position to the
                  * hash start. If the same key was published at an earlier
                  * slot by another thread, we are the duplicate — return
-                 * the earlier slot and undo our counter increment.
-                 * This prevents split regrets and counter inflation. */
+                 * the earlier slot.
+                 *
+                 * BUG FIX: must spin-wait on state=2 slots during the scan.
+                 * Without this, if thread A is still initializing slot S+2
+                 * (state=2) when thread B scans, B skips it, misses the
+                 * duplicate, and both copies accumulate separate regrets. */
                 for (int p2 = 0; p2 < probe; p2++) {
-                    int idx2 = (slot + p2) % t->table_size;
-                    if (__atomic_load_n(&t->occupied[idx2], __ATOMIC_ACQUIRE) == 1) {
-                        if (key_eq(&t->keys[idx2], &key)) {
-                            /* Earlier copy exists — we're the duplicate.
-                             * Slot is wasted (can't reclaim with linear
-                             * probing) but regrets go to the right place. */
-                            return idx2;
-                        }
+                    int64_t idx2 = (slot + p2) % t->table_size;
+                    int st2 = __atomic_load_n(&t->occupied[idx2], __ATOMIC_ACQUIRE);
+                    if (st2 == 2) {
+                        spin_until_ready(&t->occupied[idx2]);
+                        st2 = __atomic_load_n(&t->occupied[idx2], __ATOMIC_ACQUIRE);
+                    }
+                    if (st2 == 1 && key_eq(&t->keys[idx2], &key)) {
+                        /* Earlier copy exists — we're the duplicate.
+                         * Slot is wasted (can't reclaim with linear
+                         * probing) but regrets go to the right place. */
+                        return idx2;
                     }
                 }
                 __atomic_fetch_add(&t->num_entries, 1, __ATOMIC_RELAXED);
@@ -337,16 +431,11 @@ static int info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
         }
 
         if (state == 2) {
-            /* Another thread is initializing this slot. Spin-wait for it
-             * to finish (state 2 → 1). Use a generous spin count because
-             * the initializer only needs ~100ns (3 memory writes). */
-            int spins = 0;
-            while (__atomic_load_n(&t->occupied[idx], __ATOMIC_ACQUIRE) == 2) {
-                if (++spins > 1000000) break;  /* ~1ms safety limit */
-                #ifdef __x86_64__
-                __builtin_ia32_pause();  /* reduce contention on HT cores */
-                #endif
-            }
+            /* Another thread is initializing this slot. We MUST wait for it
+             * to finish — skipping past could cause us to create a duplicate
+             * at a later slot. spin_until_ready handles OS preemption with
+             * yield fallback. */
+            spin_until_ready(&t->occupied[idx]);
             if (__atomic_load_n(&t->occupied[idx], __ATOMIC_ACQUIRE) == 1) {
                 if (key_eq(&t->keys[idx], &key)) return idx;
             }
@@ -356,25 +445,27 @@ static int info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
     return -1;
 }
 
-/* Allocate strategy_sum for an info set (lazy, for round 1 only) */
+/* Allocate strategy_sum for an info set (lazy, for round 1 only).
+ * Uses arena allocator (same as regrets) to avoid billions of small
+ * heap callocs that cause fragmentation and interact poorly with
+ * glibc's thread-local arenas under high concurrency. Arena memory
+ * is zeroed (calloc'd chunks), so float 0.0f is correct (IEEE 754). */
 static void ensure_strategy_sum(BPInfoSet *is) {
     if (__atomic_load_n((void**)&is->strategy_sum, __ATOMIC_ACQUIRE) == NULL) {
-        float *buf = (float*)calloc(is->num_actions, sizeof(float));
+        float *buf = (float*)arena_alloc(is->num_actions);
+        if (!buf) return;
         float *expected = NULL;
         if (!__atomic_compare_exchange_n(&is->strategy_sum, &expected, buf,
                                           0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-            free(buf);
+            /* CAS lost — buf is wasted arena space (can't free individually).
+             * This is rare (only on concurrent first access) and each waste
+             * is ≤32 bytes. Acceptable trade-off vs heap corruption risk. */
         }
     }
 }
 
 static void info_table_free(BPInfoTable *t) {
-    /* strategy_sum uses individual malloc (lazy, preflop only) */
-    for (int i = 0; i < t->table_size; i++) {
-        if (t->occupied[i] && t->sets[i].strategy_sum)
-            free(t->sets[i].strategy_sum);
-    }
-    /* regrets are arena-allocated — freed in bulk */
+    /* Both regrets and strategy_sum are arena-allocated — freed in bulk */
     arena_free_all();
     free(t->keys);
     free(t->sets);
@@ -491,11 +582,21 @@ static int generate_actions(BPAction *out, int max_out,
 
 /* ── Traversal state ─────────────────────────────────────────────── */
 
+/* Flop bucket cache — hoisted out of TraversalState to avoid copying
+ * 5.3 KB on every action expansion (`TraversalState child = *ts;`).
+ * Allocated on the stack in the function that deals the flop, shared
+ * via pointer with all descendant traversal states. */
+typedef struct {
+    int buckets[BP_MAX_HANDS];   /* hand_idx -> flop bucket */
+    int num_buckets_actual;
+    int computed;
+} FlopBucketCache;
+
 typedef struct {
     BPSolver *solver;
     uint64_t *rng;           /* pointer to thread-local RNG */
     int traverser;
-    int iteration;
+    int64_t iteration;
     int use_pruning;         /* 1 if this iteration uses pruning */
     int sampled_hands[BP_MAX_PLAYERS];
 
@@ -510,12 +611,18 @@ typedef struct {
     int stacks[BP_MAX_PLAYERS];     /* remaining stack per player */
     int num_raises;
 
-    /* Per-traversal postflop bucket map (for unified solver).
-     * Computed once when flop is dealt, reused for turn/river.
-     * postflop_bucket[hand_idx] = bucket index (0..199). */
-    int postflop_bucket[BP_MAX_HANDS];
-    int postflop_num_buckets_actual;
-    int postflop_buckets_computed;   /* 1 if buckets have been computed for this flop */
+    /* Flop bucket cache — pointer to stack-allocated cache from the
+     * function that dealt the flop. NULL before flop is dealt. */
+    FlopBucketCache *flop_cache;
+
+    /* Per-iteration turn/river bucket cache. Each iteration has a fixed
+     * set of sampled hands, so (hand, board) -> bucket is invariant.
+     * Cached at deal time to avoid the 200-sample Monte Carlo EHS
+     * recompute on every info set lookup (was the dominant cost:
+     * ~12,000 eval7 calls/iteration -> now ~12 per iteration).
+     * -1 = not computed. Indexed by player. */
+    int turn_bucket[BP_MAX_PLAYERS];
+    int river_bucket[BP_MAX_PLAYERS];
 
     /* Canonical board for info set keys. Boards with the same texture
      * (suit-isomorphic pattern) map to the same canonical board, so
@@ -569,6 +676,12 @@ static float eval_showdown_n(BPSolver *s, const int *board,
                               int traverser, const int *active,
                               const int *sampled_hands, int pot,
                               const int *invested) {
+    int NP = s->num_players;
+
+    /* If the traverser folded, they can't win anything at showdown. */
+    if (!active[traverser])
+        return -(float)invested[traverser];
+
     int th = sampled_hands[traverser];
     int tc0 = s->hands[traverser][th][0];
     int tc1 = s->hands[traverser][th][1];
@@ -576,34 +689,113 @@ static float eval_showdown_n(BPSolver *s, const int *board,
     if (card_in_set(tc0, board, 5) || card_in_set(tc1, board, 5))
         return 0;
 
-    int cards_t[7] = {board[0], board[1], board[2], board[3], board[4], tc0, tc1};
-    uint32_t trav_str = eval7(cards_t);
+    /* Evaluate all active players' hands */
+    uint32_t strength[BP_MAX_PLAYERS];
+    int valid[BP_MAX_PLAYERS];  /* 1 if hand is valid (no card conflicts) */
+    int cards[7];
+    cards[0] = board[0]; cards[1] = board[1]; cards[2] = board[2];
+    cards[3] = board[3]; cards[4] = board[4];
 
-    int n_tied = 1;
-    int trav_wins = 1;
-
-    for (int p = 0; p < s->num_players; p++) {
-        if (p == traverser || !active[p]) continue;
+    for (int p = 0; p < NP; p++) {
+        valid[p] = 0;
+        if (!active[p]) continue;
         int oh = sampled_hands[p];
         int oc0 = s->hands[p][oh][0], oc1 = s->hands[p][oh][1];
-
-        if (cards_conflict(tc0, tc1, oc0, oc1) ||
-            card_in_set(oc0, board, 5) || card_in_set(oc1, board, 5))
+        if (p != traverser && (cards_conflict(tc0, tc1, oc0, oc1) ||
+            card_in_set(oc0, board, 5) || card_in_set(oc1, board, 5)))
             continue;
+        cards[5] = oc0; cards[6] = oc1;
+        strength[p] = eval7(cards);
+        valid[p] = 1;
+    }
+    /* Traverser is active (checked above), evaluate their hand */
+    cards[5] = tc0; cards[6] = tc1;
+    strength[traverser] = eval7(cards);
+    valid[traverser] = 1;
 
-        int cards_o[7] = {board[0], board[1], board[2], board[3], board[4], oc0, oc1};
-        uint32_t opp_str = eval7(cards_o);
-
-        if (opp_str > trav_str) { trav_wins = 0; break; }
-        else if (opp_str == trav_str) n_tied++;
+    /* Side pot calculation: sort unique investment levels, compute each
+     * pot layer, award to the best hand among eligible players.
+     * Eligible = active AND invested >= this layer's threshold. */
+    int levels[BP_MAX_PLAYERS];
+    int n_levels = 0;
+    for (int p = 0; p < NP; p++) {
+        if (!active[p] || !valid[p]) continue;
+        /* Insert invested[p] into sorted unique levels */
+        int inv = invested[p];
+        int found = 0;
+        for (int i = 0; i < n_levels; i++)
+            if (levels[i] == inv) { found = 1; break; }
+        if (!found) {
+            int pos = n_levels;
+            for (int i = 0; i < n_levels; i++)
+                if (inv < levels[i]) { pos = i; break; }
+            for (int i = n_levels; i > pos; i--) levels[i] = levels[i-1];
+            levels[pos] = inv;
+            n_levels++;
+        }
     }
 
-    /* Payoff: profit relative to TOTAL investment across all streets */
-    if (!trav_wins) {
-        return -(float)invested[traverser];
-    } else {
+    /* If all players invested equally (common case), skip side pot logic */
+    if (n_levels <= 1) {
+        int n_tied = 0;
+        int trav_wins = 1;
+        for (int p = 0; p < NP; p++) {
+            if (!active[p] || !valid[p]) continue;
+            if (strength[p] > strength[traverser]) { trav_wins = 0; }
+            if (strength[p] == strength[traverser]) n_tied++;
+        }
+        if (!trav_wins)
+            return -(float)invested[traverser];
         return (float)pot / (float)n_tied - (float)invested[traverser];
     }
+
+    /* Side pots: for each investment level, compute the pot layer and
+     * award it to the best hand among players who invested at least that much */
+    float trav_winnings = 0;
+    int prev_level = 0;
+    for (int li = 0; li < n_levels; li++) {
+        int level = levels[li];
+        int layer_per_player = level - prev_level;
+        if (layer_per_player <= 0) continue;
+
+        /* Count contributors and find winner(s) for this layer */
+        int layer_pot = 0;
+        uint32_t best = 0;
+        int n_eligible = 0;
+        for (int p = 0; p < NP; p++) {
+            /* All active players who invested >= level contribute */
+            if (invested[p] >= level) {
+                layer_pot += layer_per_player;
+            }
+            /* Only valid active players are eligible to win */
+            if (active[p] && valid[p] && invested[p] >= level) {
+                if (strength[p] > best) best = strength[p];
+                n_eligible++;
+            }
+        }
+        /* Also count folded players' contributions to this layer */
+        for (int p = 0; p < NP; p++) {
+            if (!active[p] && invested[p] > prev_level) {
+                int contrib = invested[p] - prev_level;
+                if (contrib > layer_per_player) contrib = layer_per_player;
+                layer_pot += contrib;
+            }
+        }
+
+        /* Award to winner(s) */
+        if (n_eligible > 0 && strength[traverser] == best &&
+            active[traverser] && valid[traverser] && invested[traverser] >= level) {
+            int n_winners = 0;
+            for (int p = 0; p < NP; p++)
+                if (active[p] && valid[p] && invested[p] >= level && strength[p] == best)
+                    n_winners++;
+            trav_winnings += (float)layer_pot / (float)n_winners;
+        }
+
+        prev_level = level;
+    }
+
+    return trav_winnings - (float)invested[traverser];
 }
 
 /* ── Main traversal ──────────────────────────────────────────────── */
@@ -654,6 +846,12 @@ static float traverse(TraversalState *ts, int acting_order_idx,
         memset(next.bets, 0, sizeof(next.bets));
         memset(next.has_acted, 0, sizeof(next.has_acted));
         next.num_raises = 0;
+
+        /* Flop bucket cache: allocated on this function's stack when the
+         * flop is dealt. Lives until this function returns (which happens
+         * AFTER all recursive children complete, since traverse is
+         * recursive and returns from deepest node first). */
+        FlopBucketCache flop_cache_local;
 
         if (ts->num_board == 0) {
             /* Preflop -> Flop: deal 3 cards */
@@ -741,9 +939,10 @@ static float traverse(TraversalState *ts, int acting_order_idx,
                 }
                 if (found >= 0) {
                     int *cache_row = &s->texture_bucket_cache[found * BP_MAX_HANDS];
-                    memcpy(next.postflop_bucket, cache_row, BP_MAX_HANDS * sizeof(int));
-                    next.postflop_num_buckets_actual = s->postflop_num_buckets;
-                    next.postflop_buckets_computed = 1;
+                    memcpy(flop_cache_local.buckets, cache_row, BP_MAX_HANDS * sizeof(int));
+                    flop_cache_local.num_buckets_actual = s->postflop_num_buckets;
+                    flop_cache_local.computed = 1;
+                    next.flop_cache = &flop_cache_local;
                 }
 
                 /* Store canonical flop and build suit mapping for turn/river.
@@ -798,6 +997,59 @@ static float traverse(TraversalState *ts, int acting_order_idx,
                 int canon_suit = (next.suit_map[suit] >= 0) ? next.suit_map[suit] : suit;
                 next.canon_board[next.num_canon_board++] = rank * 4 + canon_suit;
             }
+
+            /* Pre-compute turn/river bucket cache for all active players
+             * ONCE when the card is dealt. This replaces the per-info-set
+             * 200-sample Monte Carlo EHS recompute that was the dominant
+             * cost (~12,000 eval7 calls/iteration -> ~12). */
+            if (next.num_board == 4 && s->turn_centroids_k > 0) {
+                /* Turn: ca_compute_features + nearest centroid */
+                for (int p = 0; p < NP; p++) {
+                    next.turn_bucket[p] = -1;
+                    if (!next.active[p]) continue;
+                    int ph[1][2];
+                    ph[0][0] = s->hands[p][next.sampled_hands[p]][0];
+                    ph[0][1] = s->hands[p][next.sampled_hands[p]][1];
+                    float feat[1][3];
+                    ca_compute_features(next.board, 4, (const int(*)[2])ph, 1, 200, feat);
+                    next.turn_bucket[p] = ca_nearest_centroid(
+                        feat[0], (const float(*)[3])s->turn_centroids,
+                        s->turn_centroids_k);
+                }
+            } else if (next.num_board == 5) {
+                /* River: 200-sample EHS per player. This is the expensive
+                 * version of the same compute that used to run per-info-set. */
+                for (int p = 0; p < NP; p++) {
+                    next.river_bucket[p] = -1;
+                    if (!next.active[p]) continue;
+                    int ph = next.sampled_hands[p];
+                    int c0 = s->hands[p][ph][0], c1 = s->hands[p][ph][1];
+                    int blk[52] = {0};
+                    for (int b = 0; b < 5; b++) blk[next.board[b]] = 1;
+                    blk[c0] = 1; blk[c1] = 1;
+                    int av[52]; int nav = 0;
+                    for (int c = 0; c < 52; c++) if (!blk[c]) av[nav++] = c;
+                    int wins = 0, ties = 0, total = 0;
+                    uint64_t erng = (uint64_t)c0 * 1000003ULL + (uint64_t)c1 * 999983ULL;
+                    for (int b = 0; b < 5; b++)
+                        erng = erng * 6364136223846793005ULL + (uint64_t)next.board[b];
+                    for (int si = 0; si < 200 && nav >= 2; si++) {
+                        partial_shuffle(av, nav, 2, &erng);
+                        int h7[7] = {next.board[0], next.board[1], next.board[2],
+                                     next.board[3], next.board[4], c0, c1};
+                        int o7[7] = {next.board[0], next.board[1], next.board[2],
+                                     next.board[3], next.board[4], av[0], av[1]};
+                        uint32_t hs = eval7(h7), os = eval7(o7);
+                        if (hs > os) wins++; else if (hs == os) ties++;
+                        total++;
+                    }
+                    float ehs = (total > 0) ? ((float)wins + 0.5f*(float)ties) / (float)total : 0.5f;
+                    int b = (int)(ehs * (float)s->postflop_num_buckets);
+                    if (b >= s->postflop_num_buckets) b = s->postflop_num_buckets - 1;
+                    next.river_bucket[p] = b;
+                }
+            }
+
             return traverse(&next, 0, acting_order, num_in_order);
         }
     }
@@ -826,10 +1078,24 @@ static float traverse(TraversalState *ts, int acting_order_idx,
     int cur_num_bet_sizes;
     int max_raises = 3;
     if (ts->num_board == 0 && s->num_preflop_bet_sizes > 0) {
-        cur_bet_sizes = s->preflop_bet_sizes;
-        cur_num_bet_sizes = s->num_preflop_bet_sizes;
-        max_raises = 4;  /* preflop: open, 3bet, 4bet, 5bet(=allin usually) */
+        /* Tiered preflop: different sizes per raise level (Pluribus-style).
+         * Level 0 = open, 1 = 3-bet, 2 = 4-bet, 3 = 5-bet. */
+        if (s->num_preflop_tiers > 0) {
+            int level = ts->num_raises;
+            if (level >= s->num_preflop_tiers) level = s->num_preflop_tiers - 1;
+            cur_bet_sizes = s->preflop_tiered_sizes[level];
+            cur_num_bet_sizes = s->num_preflop_tiered_sizes[level];
+        } else {
+            cur_bet_sizes = s->preflop_bet_sizes;
+            cur_num_bet_sizes = s->num_preflop_bet_sizes;
+        }
+        max_raises = (s->preflop_max_raises > 0) ? s->preflop_max_raises : 4;
+    } else if (ts->num_raises > 0 && s->num_subsequent_bet_sizes > 0) {
+        /* Postflop subsequent raise: fewer sizes (Pluribus: {1x pot, all-in}) */
+        cur_bet_sizes = s->subsequent_bet_sizes;
+        cur_num_bet_sizes = s->num_subsequent_bet_sizes;
     } else {
+        /* Postflop first raise: full sizes (Pluribus: {0.5x, 1x, all-in}) */
         cur_bet_sizes = s->bet_sizes;
         cur_num_bet_sizes = s->num_bet_sizes;
     }
@@ -845,43 +1111,17 @@ static float traverse(TraversalState *ts, int acting_order_idx,
     if (street == 0) {
         /* Preflop: 169 lossless classes */
         bucket = get_bucket(s, street, ap, ts->sampled_hands[ap]);
-    } else if (street == 1 && ts->postflop_buckets_computed) {
-        /* Flop: use precomputed k-means texture buckets */
-        bucket = ts->postflop_bucket[ts->sampled_hands[ap]];
-    } else if (street >= 2 && ts->num_board >= 4) {
-        /* Turn/River: compute EHS for this specific hand on the current board,
-         * then map to bucket via floor(ehs * num_buckets). This gives a
-         * deterministic per-street bucket that depends on the actual board. */
-        int h = ts->sampled_hands[ap];
-        int c0 = s->hands[ap][h][0], c1 = s->hands[ap][h][1];
-        int blk[52] = {0};
-        for (int b = 0; b < ts->num_board; b++) blk[ts->board[b]] = 1;
-        blk[c0] = 1; blk[c1] = 1;
-        int av[52]; int nav = 0;
-        for (int c = 0; c < 52; c++) if (!blk[c]) av[nav++] = c;
-        int wins = 0, ties = 0, total = 0;
-        /* Deterministic RNG seeded by board+hand for consistent bucketing */
-        uint64_t erng = (uint64_t)c0 * 1000003ULL + (uint64_t)c1 * 999983ULL;
-        for (int b = 0; b < ts->num_board; b++)
-            erng = erng * 6364136223846793005ULL + (uint64_t)ts->board[b];
-        int cards_needed = 2 + (5 - ts->num_board); /* opp hand + remaining board */
-        /* 30 samples is sufficient for turn/river bucketing (200 buckets = 0.5% width).
-         * River needs only 2 opp cards (no board completion), so it's very fast. */
-        for (int si = 0; si < 30 && nav >= cards_needed; si++) {
-            partial_shuffle(av, nav, cards_needed, &erng);
-            int fb[5];
-            for (int b = 0; b < ts->num_board; b++) fb[b] = ts->board[b];
-            for (int b = ts->num_board; b < 5; b++)
-                fb[b] = av[2 + (b - ts->num_board)];
-            int h7[7] = {fb[0], fb[1], fb[2], fb[3], fb[4], c0, c1};
-            int o7[7] = {fb[0], fb[1], fb[2], fb[3], fb[4], av[0], av[1]};
-            uint32_t hs = eval7(h7), os = eval7(o7);
-            if (hs > os) wins++; else if (hs == os) ties++;
-            total++;
-        }
-        float ehs = (total > 0) ? ((float)wins + 0.5f*(float)ties) / (float)total : 0.5f;
-        bucket = (int)(ehs * (float)s->postflop_num_buckets);
-        if (bucket >= s->postflop_num_buckets) bucket = s->postflop_num_buckets - 1;
+    } else if (street == 1 && ts->flop_cache && ts->flop_cache->computed) {
+        /* Flop: use precomputed k-means texture buckets (cached in
+         * FlopBucketCache on the stack of the function that dealt the flop). */
+        bucket = ts->flop_cache->buckets[ts->sampled_hands[ap]];
+    } else if (street == 2 && ts->num_board == 4 && s->turn_centroids_k > 0 &&
+               ts->turn_bucket[ap] >= 0) {
+        /* Turn: use pre-computed bucket from deal-time cache. */
+        bucket = ts->turn_bucket[ap];
+    } else if (street >= 2 && ts->num_board == 5 && ts->river_bucket[ap] >= 0) {
+        /* River: use pre-computed bucket from deal-time cache. */
+        bucket = ts->river_bucket[ap];
     } else {
         bucket = get_bucket(s, street, ap, ts->sampled_hands[ap]);
     }
@@ -890,20 +1130,26 @@ static float traverse(TraversalState *ts, int acting_order_idx,
     key.player = ap;
     key.street = street;
     key.bucket = bucket;
-    /* Use canonical board hash so suit-isomorphic boards share info sets.
-     * Recompute canonicalization here (not from state) for correctness. */
-    if (ts->num_board >= 3) {
-        int cb[5];
-        canonicalize_board(ts->board, ts->num_board, cb);
-        key.board_hash = compute_board_hash(cb, ts->num_board);
-    } else {
-        key.board_hash = compute_board_hash(ts->board, ts->num_board);
-    }
+    /* Board is NOT in the key — the bucket already abstracts the board's
+     * strategic impact. Including board_hash would create separate info sets
+     * for every canonical board, defeating the purpose of bucketing and
+     * inflating the tree from ~665M (Pluribus) to billions.
+     * Preflop: board_hash is constant (no board). Postflop: bucket captures
+     * the hand+board situation via EHS/k-means clustering. */
+    key.board_hash = 0;
     key.action_hash = compute_action_hash(ts->action_history, ts->history_len);
 
-    int is_slot = info_table_find_or_create(&s->info_table, key, na);
-    if (is_slot < 0) return 0;
+    int64_t is_slot = info_table_find_or_create(&s->info_table, key, na);
+    if (is_slot < 0) {
+        return 0;
+    }
     BPInfoSet *is = &s->info_table.sets[is_slot];
+
+    /* Guard: if hash collision causes action count mismatch, use stored count
+     * to prevent buffer overflow on regrets (arena) and strategy_sum (heap). */
+    if (na != is->num_actions) {
+        na = is->num_actions;
+    }
 
     /* Regret matching */
     float strategy[BP_MAX_ACTIONS];
@@ -913,11 +1159,15 @@ static float traverse(TraversalState *ts, int acting_order_idx,
     if (next_order < 0) next_order = acting_order_idx;
 
     if (ap == ts->traverser) {
-        /* Traverser: explore all actions (with optional pruning) */
+        /* Traverser: explore all actions (with optional pruning).
+         * Pluribus Algorithm 1 (TRAVERSE-MCCFR-P): only explored actions
+         * get regret updates. Pruned actions are left unchanged. */
         float action_values[BP_MAX_ACTIONS];
+        int explored[BP_MAX_ACTIONS];
         float node_value = 0;
 
         for (int a = 0; a < na; a++) {
+            explored[a] = 0;
             /* Pruning: skip actions with very negative regret.
              * Pluribus exceptions: never prune on river (num_board >= 5),
              * never prune fold (leads to terminal node). */
@@ -928,6 +1178,7 @@ static float traverse(TraversalState *ts, int acting_order_idx,
                 }
             }
 
+            explored[a] = 1;
             TraversalState child = *ts;
             child.action_history[child.history_len++] = a;
 
@@ -962,18 +1213,32 @@ static float traverse(TraversalState *ts, int acting_order_idx,
             node_value += strategy[a] * action_values[a];
         }
 
-        /* Update integer regrets (Hogwild: no lock needed).
-         * With bucket-in-key, regrets is flat [num_actions]. */
+        /* Update integer regrets for EXPLORED actions only (Hogwild: no lock).
+         * Pluribus Algorithm 1: pruned actions' regrets are left unchanged.
+         * Previously we updated all actions, giving pruned actions
+         * delta = -node_value, pushing them deeper negative and preventing
+         * recovery (the root cause of the call trap at early positions). */
         for (int a = 0; a < na; a++) {
-            int delta = (int)((action_values[a] - node_value) * 10.0f);
-            is->regrets[a] += delta;
-            if (is->regrets[a] < BP_REGRET_FLOOR)
-                is->regrets[a] = BP_REGRET_FLOOR;
+            if (!explored[a]) continue;
+            float raw_delta = action_values[a] - node_value;
+            int delta;
+            if (raw_delta > 2e9f) delta = (int)2e9;
+            else if (raw_delta < -2e9f) delta = (int)-2e9;
+            else delta = (int)raw_delta;
+            int64_t tmp = (int64_t)is->regrets[a] + (int64_t)delta;
+            if (tmp < BP_REGRET_FLOOR) is->regrets[a] = BP_REGRET_FLOOR;
+            else if (tmp > BP_REGRET_CEILING) is->regrets[a] = BP_REGRET_CEILING;
+            else is->regrets[a] = (int)tmp;
         }
 
-        /* Strategy sum: only for preflop (street == 0) in unified mode,
-         * every strategy_interval iterations. Matches Pluribus: only round 1. */
-        if (street == 0 && (ts->iteration % s->config.strategy_interval) == 0) {
+        /* Strategy sum: accumulate for preflop (street 0) every 10007
+         * iterations. Matches Pluribus: UPDATE-STRATEGY called every
+         * Strategy Interval (10K) for first betting round only.
+         * Using 10007 (prime) instead of 10000 to avoid aliasing with
+         * traverser cycling: gcd(6, 10000)=2 caused only players 1,3,5
+         * to accumulate, permanently excluding SB(0), UTG(2), CO(4).
+         * gcd(6, 10007)=1, so all 6 players get equal accumulation. */
+        if (street == 0 && (ts->iteration % 10007) == 0) {
             ensure_strategy_sum(is);
             for (int a = 0; a < na; a++)
                 is->strategy_sum[a] += strategy[a];
@@ -982,7 +1247,8 @@ static float traverse(TraversalState *ts, int acting_order_idx,
         return node_value;
 
     } else {
-        /* Non-traverser: sample one action */
+        /* Non-traverser: sample one action from current strategy.
+         * Matches Pluribus Algorithm 1: opponents play according to σ(I). */
         int sampled = sample_action(strategy, na, ts->rng);
 
         TraversalState child = *ts;
@@ -1027,32 +1293,33 @@ static float traverse(TraversalState *ts, int acting_order_idx,
  * we're past the snapshot_start_iter threshold. This accumulates the
  * snapshot average directly in memory rather than saving to disk. */
 
+/* Called from within an existing outer parallel region. Uses omp for to
+ * distribute work across the team's threads. Does NOT use a new parallel
+ * region (avoids nested parallelism issues). */
 static void accumulate_snapshot(BPInfoTable *t) {
     float strat_buf[BP_MAX_ACTIONS];
-    for (int i = 0; i < t->table_size; i++) {
+    #pragma omp for schedule(static, 65536) nowait
+    for (int64_t i = 0; i < t->table_size; i++) {
         if (t->occupied[i] != 1) continue;
         BPInfoSet *is = &t->sets[i];
         int na = is->num_actions;
 
-        if (!is->strategy_sum) {
-            float *buf = (float*)calloc(na, sizeof(float));
-            float *expected = NULL;
-            if (!__atomic_compare_exchange_n(&is->strategy_sum, &expected, buf,
-                                              0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-                free(buf);
-            }
-        }
+        ensure_strategy_sum(is);
+        float *ss = __atomic_load_n((float**)&is->strategy_sum, __ATOMIC_ACQUIRE);
+        if (!ss) continue;
 
         regret_match(is->regrets, strat_buf, na);
         for (int a = 0; a < na; a++)
-            is->strategy_sum[a] += strat_buf[a];
+            ss[a] += strat_buf[a];
     }
 }
 
 /* ── Linear CFR discount ─────────────────────────────────────────── */
 
+/* Called from within an existing outer parallel region. */
 static void apply_discount(BPInfoTable *t, float discount) {
-    for (int i = 0; i < t->table_size; i++) {
+    #pragma omp for schedule(static, 65536) nowait
+    for (int64_t i = 0; i < t->table_size; i++) {
         if (!t->occupied[i]) continue;
         BPInfoSet *is = &t->sets[i];
         int na = is->num_actions;
@@ -1139,9 +1406,9 @@ int bp_init_ex(BPSolver *s, int num_players,
         }
 
     /* Hash table */
-    int ht_size = config->hash_table_size;
+    int64_t ht_size = config->hash_table_size;
     if (ht_size <= 0)
-        ht_size = (num_players > 2) ? BP_HASH_SIZE_MEDIUM : BP_HASH_SIZE_SMALL;
+        ht_size = (num_players > 2) ? (int64_t)BP_HASH_SIZE_MEDIUM : (int64_t)BP_HASH_SIZE_SMALL;
     info_table_init(&s->info_table, ht_size);
 
     /* RNG states — one per thread */
@@ -1211,9 +1478,17 @@ int bp_init_unified(BPSolver *s, int num_players,
     for (int i = 0; i < num_postflop_bet_sizes && i < BP_MAX_ACTIONS; i++)
         s->bet_sizes[i] = postflop_bet_sizes[i];
 
+    /* Postflop subsequent raises: {1x pot, all-in} per Pluribus */
+    s->num_subsequent_bet_sizes = 1;
+    s->subsequent_bet_sizes[0] = 1.0f; /* 1x pot; all-in is added automatically */
+
     s->num_preflop_bet_sizes = num_preflop_bet_sizes;
     for (int i = 0; i < num_preflop_bet_sizes && i < BP_MAX_ACTIONS; i++)
         s->preflop_bet_sizes[i] = preflop_bet_sizes[i];
+
+    /* Tiered preflop: not set via bp_init_unified args, use bp_set_preflop_tiers() */
+    s->num_preflop_tiers = 0;
+    s->preflop_max_raises = 0;
 
     /* Default: 169 lossless preflop buckets (identity for postflop until set) */
     s->use_buckets = 1;
@@ -1259,10 +1534,10 @@ int bp_init_unified(BPSolver *s, int num_players,
                 s->bucket_map[st][p][h] = h;
         }
 
-    /* Hash table — use LARGE for unified solve (Pluribus: 665M action sequences) */
-    int ht_size = config->hash_table_size;
+    /* Hash table — 3B default for tiered preflop (Pluribus: 665M action sequences) */
+    int64_t ht_size = config->hash_table_size;
     if (ht_size <= 0)
-        ht_size = BP_HASH_SIZE_LARGE;
+        ht_size = (int64_t)BP_HASH_SIZE_LARGE;
     info_table_init(&s->info_table, ht_size);
 
     /* RNG states */
@@ -1285,7 +1560,7 @@ int bp_init_unified(BPSolver *s, int num_players,
     /* Postflop bucketing: precompute 200-bucket EHS mapping for all 1,755 textures.
      * Pluribus precomputes card abstraction (bucket assignments) for all flop textures
      * once before training starts. We do the same here. */
-    s->postflop_num_buckets = 200;
+    s->postflop_num_buckets = (config->postflop_num_buckets > 0) ? config->postflop_num_buckets : 200;
     s->postflop_ehs_samples = 500;  /* MC samples for precompute (Pluribus: ~500) */
     s->num_cached_textures = 0;
     s->texture_bucket_cache = (int*)calloc(BP_MAX_TEXTURES * (size_t)BP_MAX_HANDS, sizeof(int));
@@ -1296,6 +1571,18 @@ int bp_init_unified(BPSolver *s, int num_players,
            num_players, small_blind, big_blind, initial_stack,
            num_preflop_bet_sizes, num_postflop_bet_sizes, nh,
            n_classes, s->postflop_num_buckets);
+    /* Try loading precomputed texture cache from well-known paths */
+    if (s->num_cached_textures == 0) {
+        const char *cache_paths[] = {"/tmp/texture_cache.bin", "texture_cache.bin",
+                                      "/opt/blueprint_unified/texture_cache.bin", NULL};
+        for (int ci = 0; cache_paths[ci]; ci++) {
+            if (bp_load_texture_cache(s, cache_paths[ci]) > 0) break;
+        }
+    }
+    if (s->num_cached_textures > 0) {
+        printf("[BP] Texture cache loaded (%d textures), skipping precompute\n",
+               s->num_cached_textures);
+    } else {
     printf("[BP] Precomputing postflop buckets for all flop textures...\n");
     fflush(stdout);
 
@@ -1409,6 +1696,194 @@ int bp_init_unified(BPSolver *s, int num_players,
         double pc_elapsed = (double)(clock() - pc_start) / CLOCKS_PER_SEC;
         printf("[BP] Precomputed %d textures in %.1fs\n", tex_count, pc_elapsed);
     }
+    } /* end else (skip if cache loaded) */
+
+    /* Precompute turn k-means centroids.
+     * Sample random turn boards, compute [EHS, PPot, NPot] features for all
+     * valid hands, then run k-means to get 200 centroids. During traversal,
+     * each hand's features are computed inline and mapped to nearest centroid.
+     * This replaces floor(ehs * 200) percentile bucketing on the turn.
+     *
+     * Skip the precompute if a cached centroids file is found. The file is
+     * tiny (~2.4 KB for 200 centroids × 3 floats × 4 bytes) and saves
+     * 6 minutes of single-threaded compute on resume. */
+    {
+        const char *centroid_paths[] = {
+            "/tmp/turn_centroids.bin",
+            "/dev/shm/turn_centroids.bin",
+            "turn_centroids.bin",
+        };
+        int loaded_centroids = 0;
+        for (int i = 0; i < 3 && !loaded_centroids; i++) {
+            FILE *f = fopen(centroid_paths[i], "rb");
+            if (!f) continue;
+            char magic[4];
+            int saved_k;
+            if (fread(magic, 1, 4, f) == 4 && memcmp(magic, "TCN1", 4) == 0 &&
+                fread(&saved_k, sizeof(int), 1, f) == 1 &&
+                saved_k > 0 && saved_k <= 200) {
+                if (fread(s->turn_centroids, sizeof(float), saved_k * 3, f)
+                    == (size_t)(saved_k * 3)) {
+                    s->turn_centroids_k = saved_k;
+                    loaded_centroids = 1;
+                    printf("[BP] Loaded %d turn centroids from %s\n",
+                           saved_k, centroid_paths[i]);
+                }
+            }
+            fclose(f);
+        }
+        if (!loaded_centroids) {
+        printf("[BP] Precomputing turn k-means centroids...\n");
+        clock_t tc_start = clock();
+
+        int k = s->postflop_num_buckets;
+        if (k > 200) k = 200;
+        int n_turn_boards = 2000;
+        int feat_samples = 200;
+
+        /* Collect feature vectors from sampled turn boards */
+        int max_feat = n_turn_boards * 1200;
+        float (*all_feat)[3] = (float(*)[3])malloc((size_t)max_feat * 3 * sizeof(float));
+        int n_feat = 0;
+
+        uint64_t trng = 0xABCDEF0123456789ULL;
+        for (int ti = 0; ti < n_turn_boards && n_feat < max_feat - 1200; ti++) {
+            /* Sample random 4-card turn board */
+            int deck[52];
+            for (int c = 0; c < 52; c++) deck[c] = c;
+            for (int i = 0; i < 4; i++) {
+                int j = i + (int)(rng_next(&trng) % (uint64_t)(52 - i));
+                int tmp = deck[i]; deck[i] = deck[j]; deck[j] = tmp;
+            }
+            int board[4] = {deck[0], deck[1], deck[2], deck[3]};
+
+            /* Generate valid hands */
+            int bblk[52] = {0};
+            for (int b = 0; b < 4; b++) bblk[board[b]] = 1;
+            int hands[BP_MAX_HANDS][2];
+            int nh = 0;
+            for (int c0 = 0; c0 < 52; c0++) {
+                if (bblk[c0]) continue;
+                for (int c1 = c0 + 1; c1 < 52; c1++) {
+                    if (bblk[c1]) continue;
+                    if (nh >= BP_MAX_HANDS) goto turn_hands_done;
+                    hands[nh][0] = c0;
+                    hands[nh][1] = c1;
+                    nh++;
+                }
+            }
+            turn_hands_done:;
+
+            /* Compute [EHS, PPot, NPot] for all hands on this board */
+            int batch = (nh > 300) ? 300 : nh;  /* subsample for speed */
+            float feats[BP_MAX_HANDS][3];
+            ca_compute_features(board, 4, (const int(*)[2])hands, batch,
+                                feat_samples, feats);
+
+            for (int h = 0; h < batch && n_feat < max_feat; h++) {
+                all_feat[n_feat][0] = feats[h][0];
+                all_feat[n_feat][1] = feats[h][1];
+                all_feat[n_feat][2] = feats[h][2];
+                n_feat++;
+            }
+        }
+
+        /* Run k-means on all collected features.
+         * Sort by EHS for percentile-seeded centroid initialization
+         * (same method as ca_assign_buckets_kmeans). Without sorting,
+         * seeds are effectively random → many empty clusters. */
+        int *sorted_idx = (int*)malloc(n_feat * sizeof(int));
+        for (int f = 0; f < n_feat; f++) sorted_idx[f] = f;
+        /* Simple insertion sort on EHS (feature[0]) — n_feat is ~600K,
+         * too large for insertion sort. Use qsort with a static array ref. */
+        /* Store EHS + index pairs for sorting */
+        typedef struct { float ehs; int idx; } EhsIdx;
+        EhsIdx *sort_buf = (EhsIdx*)malloc(n_feat * sizeof(EhsIdx));
+        for (int f = 0; f < n_feat; f++) {
+            sort_buf[f].ehs = all_feat[f][0];
+            sort_buf[f].idx = f;
+        }
+        /* qsort comparator defined as nested function (GCC extension) or
+         * use a simple shell sort for portability */
+        for (int gap = n_feat / 2; gap > 0; gap /= 2)
+            for (int i = gap; i < n_feat; i++) {
+                EhsIdx tmp = sort_buf[i];
+                int j = i;
+                while (j >= gap && sort_buf[j - gap].ehs > tmp.ehs) {
+                    sort_buf[j] = sort_buf[j - gap];
+                    j -= gap;
+                }
+                sort_buf[j] = tmp;
+            }
+
+        float (*centroids)[3] = (float(*)[3])malloc((size_t)k * 3 * sizeof(float));
+        for (int c = 0; c < k; c++) {
+            int si = (int)((float)c / k * n_feat);
+            if (si >= n_feat) si = n_feat - 1;
+            int fi = sort_buf[si].idx;
+            centroids[c][0] = all_feat[fi][0];
+            centroids[c][1] = all_feat[fi][1];
+            centroids[c][2] = all_feat[fi][2];
+        }
+        free(sort_buf);
+        free(sorted_idx);
+
+        int *counts = (int*)calloc(k, sizeof(int));
+        float (*sums)[3] = (float(*)[3])calloc((size_t)k * 3, sizeof(float));
+        for (int iter = 0; iter < 20; iter++) {
+            memset(counts, 0, k * sizeof(int));
+            memset(sums, 0, (size_t)k * 3 * sizeof(float));
+            for (int f = 0; f < n_feat; f++) {
+                int best_c = 0;
+                float best_d = 1e30f;
+                for (int c = 0; c < k; c++) {
+                    float d0 = all_feat[f][0] - centroids[c][0];
+                    float d1 = all_feat[f][1] - centroids[c][1];
+                    float d2 = all_feat[f][2] - centroids[c][2];
+                    float d = d0*d0 + d1*d1 + d2*d2;
+                    if (d < best_d) { best_d = d; best_c = c; }
+                }
+                counts[best_c]++;
+                sums[best_c][0] += all_feat[f][0];
+                sums[best_c][1] += all_feat[f][1];
+                sums[best_c][2] += all_feat[f][2];
+            }
+            for (int c = 0; c < k; c++) {
+                if (counts[c] > 0) {
+                    centroids[c][0] = sums[c][0] / counts[c];
+                    centroids[c][1] = sums[c][1] / counts[c];
+                    centroids[c][2] = sums[c][2] / counts[c];
+                }
+            }
+        }
+
+        int actual_k = 0;
+        for (int c = 0; c < k; c++) {
+            if (counts[c] > 0 && actual_k < 200) {
+                s->turn_centroids[actual_k][0] = centroids[c][0];
+                s->turn_centroids[actual_k][1] = centroids[c][1];
+                s->turn_centroids[actual_k][2] = centroids[c][2];
+                actual_k++;
+            }
+        }
+        s->turn_centroids_k = actual_k;
+
+        free(all_feat); free(centroids); free(counts); free(sums);
+        double tc_elapsed = (double)(clock() - tc_start) / CLOCKS_PER_SEC;
+        printf("[BP] Turn centroids: %d clusters from %d samples in %.1fs\n",
+               actual_k, n_feat, tc_elapsed);
+
+        /* Save the freshly-computed centroids for future runs. */
+        FILE *fc = fopen("/tmp/turn_centroids.bin", "wb");
+        if (fc) {
+            fwrite("TCN1", 1, 4, fc);
+            fwrite(&actual_k, sizeof(int), 1, fc);
+            fwrite(s->turn_centroids, sizeof(float), actual_k * 3, fc);
+            fclose(fc);
+            printf("[BP] Saved turn centroids to /tmp/turn_centroids.bin\n");
+        }
+        } /* end if (!loaded_centroids) */
+    }
 
     return 0;
 }
@@ -1426,7 +1901,29 @@ int bp_set_buckets(BPSolver *s, int street,
     return 0;
 }
 
-int bp_solve(BPSolver *s, int max_iterations) {
+/* Set tiered preflop bet sizes (Pluribus-style: fewer sizes at higher raise levels).
+ * level 0 = open raise, 1 = 3-bet, 2 = 4-bet, 3 = 5-bet.
+ * Call once per level after bp_init_unified, before bp_solve. */
+int bp_set_preflop_tier(BPSolver *s, int level,
+                         const float *sizes, int num_sizes,
+                         int max_raises) {
+    if (level < 0 || level >= 4) return -1;
+    if (num_sizes > BP_MAX_ACTIONS) num_sizes = BP_MAX_ACTIONS;
+    for (int i = 0; i < num_sizes; i++)
+        s->preflop_tiered_sizes[level][i] = sizes[i];
+    s->num_preflop_tiered_sizes[level] = num_sizes;
+    if (level + 1 > s->num_preflop_tiers)
+        s->num_preflop_tiers = level + 1;
+    if (max_raises > 0)
+        s->preflop_max_raises = max_raises;
+    printf("[BP] Preflop tier %d: %d sizes [", level, num_sizes);
+    for (int i = 0; i < num_sizes; i++)
+        printf("%s%.2f", i ? ", " : "", sizes[i]);
+    printf("], max_raises=%d\n", s->preflop_max_raises);
+    return 0;
+}
+
+int bp_solve(BPSolver *s, int64_t max_iterations) {
     int NP = s->num_players;
     int acting_order[BP_MAX_PLAYERS];
     for (int i = 0; i < NP; i++) acting_order[i] = i;
@@ -1435,17 +1932,90 @@ int bp_solve(BPSolver *s, int max_iterations) {
     #ifdef _OPENMP
     if (nt > 1) {
         omp_set_num_threads(nt);
-        /* NOTE: traverse() is deeply recursive (~50+ levels, ~400-byte frames).
-         * Requires OMP_STACKSIZE=16m or GOMP_STACKSIZE=16384 env var.
-         * Set this BEFORE running the program, e.g.:
-         *   export OMP_STACKSIZE=16m */
     }
     #endif
 
-    printf("[BP] Starting %d-player MCCFR: %d iterations, %d threads, "
-           "hash=%d, buckets=%s\n",
-           NP, max_iterations, nt, s->info_table.table_size,
+    printf("[BP] Starting %d-player MCCFR: %lld iterations, %d threads, "
+           "hash=%lld, buckets=%s\n",
+           NP, (long long)max_iterations, nt, (long long)s->info_table.table_size,
            s->use_buckets ? "yes" : "no");
+
+    /* Pre-fault all hash table pages to avoid kernel mm_lock contention
+     * during the first few minutes of solving. With lazy allocation, the
+     * first random access to each empty slot triggers a page fault that
+     * holds a kernel lock. With 192 threads doing random probes, this
+     * serializes through mm_lock and tanks throughput to ~5K iter/s.
+     *
+     * Strategy: madvise(MADV_POPULATE_WRITE) on the page-aligned interior
+     * of each array. madvise requires page-aligned addresses, but calloc
+     * doesn't guarantee that. We round the start up and the length down
+     * to page boundaries — the few KB of un-aligned head/tail will get
+     * lazily faulted, which is fine since it's microscopic. */
+    {
+        BPInfoTable *t = &s->info_table;
+        printf("[BP] Pre-faulting hash table pages...\n");
+        fflush(stdout);
+        #ifdef _OPENMP
+        double prefault_start = omp_get_wtime();
+        #endif
+
+        long pagesize = sysconf(_SC_PAGESIZE);
+        if (pagesize <= 0) pagesize = 4096;
+
+        struct { void *addr; size_t len; const char *name; } regions[] = {
+            { t->occupied, (size_t)t->table_size * sizeof(int), "occupied" },
+            { t->keys,     (size_t)t->table_size * sizeof(BPInfoKey), "keys" },
+            { t->sets,     (size_t)t->table_size * sizeof(BPInfoSet), "sets" },
+        };
+
+        for (size_t r = 0; r < 3; r++) {
+            uintptr_t start = (uintptr_t)regions[r].addr;
+            uintptr_t end = start + regions[r].len;
+            uintptr_t aligned_start = (start + pagesize - 1) & ~((uintptr_t)pagesize - 1);
+            uintptr_t aligned_end = end & ~((uintptr_t)pagesize - 1);
+            if (aligned_end <= aligned_start) continue;
+            size_t aligned_len = aligned_end - aligned_start;
+
+            /* Request transparent huge pages. With 138GB working set and
+             * random hash probes, the dTLB (3072 4K entries on Zen4) misses
+             * on nearly every probe. 2MB huge pages cut the page table
+             * working set 512x, letting more translations fit in the TLB
+             * hierarchy. Huge TLB misses are also cheaper (one fewer level). */
+            #ifdef MADV_HUGEPAGE
+            madvise((void*)aligned_start, aligned_len, MADV_HUGEPAGE);
+            #endif
+
+            int used_madvise = 0;
+            #ifdef MADV_POPULATE_WRITE
+            if (madvise((void*)aligned_start, aligned_len, MADV_POPULATE_WRITE) == 0) {
+                used_madvise = 1;
+            } else {
+                fprintf(stderr, "[BP] madvise(%s) failed: %s — falling back to write loop\n",
+                        regions[r].name, strerror(errno));
+            }
+            #endif
+
+            if (!used_madvise) {
+                /* Explicit page-stride writes. Volatile prevents the compiler
+                 * from optimizing the read-write pair away. Each write to a
+                 * virgin page triggers CoW, allocating a real physical page. */
+                volatile char *p = (volatile char*)aligned_start;
+                #pragma omp parallel for schedule(static)
+                for (size_t i = 0; i < aligned_len; i += (size_t)pagesize) {
+                    char v = p[i];
+                    p[i] = v;
+                }
+            }
+        }
+
+        #ifdef _OPENMP
+        printf("[BP] Pre-fault complete in %.1fs\n",
+               omp_get_wtime() - prefault_start);
+        #else
+        printf("[BP] Pre-fault complete\n");
+        #endif
+        fflush(stdout);
+    }
 
     #ifdef _OPENMP
     double t_start = omp_get_wtime();
@@ -1465,18 +2035,45 @@ int bp_solve(BPSolver *s, int max_iterations) {
     /* Resume support: offset all iteration counters by previously completed iters.
      * After bp_load_regrets, iterations_run = saved_iters, so global_iter tracks
      * the cumulative total across checkpoint/resume cycles. */
-    int iter_offset = s->iterations_run;
+    int64_t iter_offset = s->iterations_run;
 
-    int discount_count = 0;
-    int next_discount_at = s->config.discount_interval;
+    int64_t discount_count = 0;
+    int64_t next_discount_at = s->config.discount_interval;
     /* Fast-forward discount_count to match resumed state */
     if (iter_offset > 0 && s->config.discount_interval > 0) {
         discount_count = iter_offset / s->config.discount_interval;
         next_discount_at = (discount_count + 1) * s->config.discount_interval;
     }
-    int batch_size = s->config.discount_interval;
-    if (batch_size <= 0) batch_size = max_iterations;
-    int num_batches = (max_iterations + batch_size - 1) / batch_size;
+
+    /* Batch size for the OpenMP parallel-for loop. This is INDEPENDENT
+     * of discount_interval — they used to be the same variable, which
+     * tanked parallelism: with discount_interval=10000 and chunk_size=64,
+     * a batch had only 156 chunks for 192 threads → 36+ idle threads at
+     * every barrier.
+     *
+     * Rules:
+     *   - During discount phase: batch_size MUST be <= discount_interval
+     *     so we don't miss discount triggers (one discount per batch).
+     *   - After discount phase: use a much larger batch (10M) so 192
+     *     threads with chunk 64 have ~150K chunks of work — full parallelism.
+     *   - Snapshots fire when (global_batch_end % snapshot_interval) < batch_size,
+     *     which works for both small and large batch sizes.
+     */
+    int64_t batch_size;
+    int64_t global_start_iter = iter_offset + 1;
+    if (global_start_iter <= s->config.discount_stop_iter) {
+        batch_size = s->config.discount_interval;
+        if (batch_size <= 0) batch_size = max_iterations;
+    } else {
+        /* Past discount phase — use 10M batch for parallelism. */
+        batch_size = 10000000;
+    }
+    if (batch_size > max_iterations) batch_size = max_iterations;
+    int64_t num_batches = (max_iterations + batch_size - 1) / batch_size;
+    printf("[BP] batch_size=%lld (%lld batches), discount_phase=%s\n",
+           (long long)batch_size, (long long)num_batches,
+           (global_start_iter <= s->config.discount_stop_iter) ? "yes" : "no");
+    fflush(stdout);
 
     #ifdef _OPENMP
     #pragma omp parallel if(nt > 1)
@@ -1489,18 +2086,18 @@ int bp_solve(BPSolver *s, int max_iterations) {
         #endif
         uint64_t *my_rng = &s->rng_states[tid * 8];
 
-        for (int batch = 0; batch < num_batches; batch++) {
-            int batch_start = batch * batch_size + 1;
-            int batch_end = batch_start + batch_size - 1;
+        for (int64_t batch = 0; batch < num_batches; batch++) {
+            int64_t batch_start = batch * batch_size + 1;
+            int64_t batch_end = batch_start + batch_size - 1;
             if (batch_end > max_iterations) batch_end = max_iterations;
 
             /* All threads work on this batch's iterations */
             #ifdef _OPENMP
             #pragma omp for schedule(dynamic, 64)
             #endif
-            for (int iter = batch_start; iter <= batch_end; iter++) {
-                int global_iter = iter + iter_offset;
-                int traverser = (global_iter - 1) % NP;
+            for (int64_t iter = batch_start; iter <= batch_end; iter++) {
+                int64_t global_iter = iter + iter_offset;
+                int traverser = (int)((global_iter - 1) % NP);
 
                 int use_pruning = 0;
                 if (global_iter > s->config.prune_start_iter) {
@@ -1530,12 +2127,23 @@ int bp_solve(BPSolver *s, int max_iterations) {
                 if (conflict) continue;
 
                 TraversalState ts;
-                memset(&ts, 0, sizeof(ts));
+                /* Only zero the scalar state fields that need to be zero.
+                 * Arrays are written as needed. This avoids 6.3 KB of memset
+                 * per iteration (20+ GB/s of L1 bandwidth wasted across 192
+                 * threads at full speed). */
                 ts.solver = s;
                 ts.rng = my_rng;
                 ts.traverser = traverser;
                 ts.iteration = global_iter;
                 ts.use_pruning = use_pruning;
+                ts.num_raises = 0;
+                ts.num_canon_board = 0;
+                ts.history_len = 0;
+                ts.flop_cache = NULL;
+                for (int p = 0; p < BP_MAX_PLAYERS; p++) {
+                    ts.turn_bucket[p] = -1;
+                    ts.river_bucket[p] = -1;
+                }
                 memcpy(ts.sampled_hands, sampled_hands, sizeof(sampled_hands));
 
                 if (s->config.include_preflop) {
@@ -1585,56 +2193,86 @@ int bp_solve(BPSolver *s, int max_iterations) {
                     for (int p = 0; p < NP; p++) {
                         ts.stacks[p] = s->effective_stack;
                         ts.invested[p] = s->starting_pot / NP;
+                        ts.bets[p] = 0;       /* Previously zeroed by removed memset */
+                        ts.has_acted[p] = 0;  /* Previously zeroed by removed memset */
                     }
                     traverse(&ts, 0, acting_order, NP);
                 }
 
                 if (tid == 0) {
                     s->iterations_run = global_iter;
-                    if (iter % 10000 == 0 || iter == 1 || iter == max_iterations) {
-                        #ifdef _OPENMP
-                        double elapsed = omp_get_wtime() - t_start;
-                        #else
-                        double elapsed = (double)(clock() - t_start) / CLOCKS_PER_SEC;
-                        #endif
-                        printf("[BP] iter %d/%d (global %d), info sets: %d, %.1fs\n",
-                               iter, max_iterations, global_iter, s->info_table.num_entries, elapsed);
-                        fflush(stdout);
-                    }
                 }
             }
             /* implicit barrier after omp for */
 
-            /* Thread 0 applies discount and snapshots between batches.
-             * Other threads wait at the barrier below. */
+            /* Decide whether to discount/snapshot in omp single, then run
+             * the parallel work OUTSIDE the single block using the existing
+             * team. This avoids nested parallelism which was silently
+             * serializing accumulate_snapshot/apply_discount.
+             *
+             * The variables below are thread-private. We use `copyprivate`
+             * on the omp single to broadcast the values to all threads. */
+            int do_discount = 0;
+            int do_snapshot = 0;
+            float discount_value = 0.0f;
+            int64_t global_batch_end = (int64_t)batch_end + iter_offset;
+
             #ifdef _OPENMP
-            #pragma omp single
+            #pragma omp single copyprivate(do_discount, do_snapshot, discount_value)
             #endif
             {
-                /* Linear CFR discount: d = T/(T+1) every interval */
-                int global_batch_end = batch_end + iter_offset;
+                /* Per-batch progress print */
+                #ifdef _OPENMP
+                double elapsed = omp_get_wtime() - t_start;
+                #else
+                double elapsed = (double)(clock() - t_start) / CLOCKS_PER_SEC;
+                #endif
+                double rate = (batch_end > 0 && elapsed > 0) ? (double)batch_end / elapsed : 0.0;
+                printf("[BP] batch %lld/%lld done at iter %lld (global %lld), "
+                       "%.1fs, %.0f iter/s, info sets: %lld\n",
+                       (long long)(batch + 1), (long long)num_batches,
+                       (long long)batch_end, (long long)global_batch_end,
+                       elapsed, rate, (long long)s->info_table.num_entries);
+                fflush(stdout);
+
+                /* Decide whether to discount this batch */
                 if (global_batch_end <= s->config.discount_stop_iter &&
                     global_batch_end >= next_discount_at) {
                     discount_count++;
                     float t_val = (float)discount_count;
-                    float discount = t_val / (t_val + 1.0f);
-                    apply_discount(&s->info_table, discount);
+                    discount_value = t_val / (t_val + 1.0f);
                     next_discount_at = (discount_count + 1) * s->config.discount_interval;
-                    printf("[BP] Applied Linear CFR discount #%d: d=%.4f at iter %d\n",
-                           discount_count, discount, global_batch_end);
+                    do_discount = 1;
+                    printf("[BP] Applying Linear CFR discount #%lld: d=%.4f at iter %lld\n",
+                           (long long)discount_count, discount_value, (long long)global_batch_end);
                 }
 
-                /* Strategy snapshots for rounds 2-4 */
+                /* Decide whether to snapshot */
                 if (global_batch_end >= s->config.snapshot_start_iter &&
                     s->config.snapshot_interval > 0 &&
                     (global_batch_end % s->config.snapshot_interval) < batch_size) {
-                    accumulate_snapshot(&s->info_table);
+                    do_snapshot = 1;
                     s->snapshots_saved++;
-                    printf("[BP] Accumulated strategy snapshot #%d at iter %d\n",
-                           s->snapshots_saved, global_batch_end);
+                    printf("[BP] Accumulating strategy snapshot #%lld at iter %lld\n",
+                           (long long)s->snapshots_saved, (long long)global_batch_end);
+                    fflush(stdout);
                 }
             }
-            /* implicit barrier after omp single */
+            /* After copyprivate: all threads have do_discount/do_snapshot/
+             * discount_value set to the same values. */
+
+            /* Run the discount/snapshot in parallel using the existing
+             * thread team. These functions use `#pragma omp for nowait`. */
+            if (do_discount) {
+                apply_discount(&s->info_table, discount_value);
+            }
+            if (do_snapshot) {
+                accumulate_snapshot(&s->info_table);
+            }
+            /* Explicit barrier: ensure all threads finish before next batch. */
+            #ifdef _OPENMP
+            #pragma omp barrier
+            #endif
         }
     } /* end parallel */
 
@@ -1643,9 +2281,9 @@ int bp_solve(BPSolver *s, int max_iterations) {
     #else
     double total_time = (double)(clock() - t_start) / CLOCKS_PER_SEC;
     #endif
-    printf("[BP] Done: %d iterations, %d info sets, %.1fs (%.0f iter/s)\n",
-           max_iterations, s->info_table.num_entries, total_time,
-           max_iterations / total_time);
+    printf("[BP] Done: %lld iterations, %lld info sets, %.1fs (%.0f iter/s)\n",
+           (long long)max_iterations, (long long)s->info_table.num_entries, total_time,
+           (double)max_iterations / total_time);
 
     return 0;
 }
@@ -1658,24 +2296,17 @@ int bp_get_strategy(const BPSolver *s, int player,
     key.player = player;
     key.street = board_to_street(num_board);
     key.bucket = bucket;
-    /* Canonicalize board for lookup (must match traversal's canonical keys) */
-    if (num_board >= 3) {
-        int canon[5];
-        canonicalize_board(board, num_board, canon);
-        key.board_hash = compute_board_hash(canon, num_board);
-    } else {
-        key.board_hash = compute_board_hash(board, num_board);
-    }
+    key.board_hash = 0;  /* Board abstracted by bucket, not in key */
     key.action_hash = compute_action_hash(action_seq, seq_len);
 
     uint64_t h = hash_combine(key.board_hash, key.action_hash);
     h = hash_combine(h, (uint64_t)key.player);
     h = hash_combine(h, (uint64_t)key.street);
     h = hash_combine(h, (uint64_t)key.bucket);
-    int slot = (int)(h % (uint64_t)s->info_table.table_size);
+    int64_t slot = (int64_t)(h % (uint64_t)s->info_table.table_size);
 
     for (int probe = 0; probe < 1024; probe++) {
-        int idx = (slot + probe) % s->info_table.table_size;
+        int64_t idx = (slot + probe) % s->info_table.table_size;
         if (!s->info_table.occupied[idx]) return 0;
         if (key_eq(&s->info_table.keys[idx], &key)) {
             BPInfoSet *is = &s->info_table.sets[idx];
@@ -1703,7 +2334,38 @@ int bp_get_strategy(const BPSolver *s, int player,
     return 0;
 }
 
-int bp_num_info_sets(const BPSolver *s) {
+int bp_get_regrets(const BPSolver *s, int player,
+                    const int *board, int num_board,
+                    const int *action_seq, int seq_len,
+                    int *regrets_out, int bucket) {
+    BPInfoKey key;
+    key.player = player;
+    key.street = board_to_street(num_board);
+    key.bucket = bucket;
+    key.board_hash = 0;
+    key.action_hash = compute_action_hash(action_seq, seq_len);
+
+    uint64_t h = hash_combine(key.board_hash, key.action_hash);
+    h = hash_combine(h, (uint64_t)key.player);
+    h = hash_combine(h, (uint64_t)key.street);
+    h = hash_combine(h, (uint64_t)key.bucket);
+    int64_t slot = (int64_t)(h % (uint64_t)s->info_table.table_size);
+
+    for (int probe = 0; probe < 1024; probe++) {
+        int64_t idx = (slot + probe) % s->info_table.table_size;
+        if (!s->info_table.occupied[idx]) return 0;
+        if (key_eq(&s->info_table.keys[idx], &key)) {
+            BPInfoSet *is = &s->info_table.sets[idx];
+            int na = is->num_actions;
+            for (int a = 0; a < na; a++)
+                regrets_out[a] = is->regrets[a];
+            return na;
+        }
+    }
+    return 0;
+}
+
+int64_t bp_num_info_sets(const BPSolver *s) {
     return s->info_table.num_entries;
 }
 
@@ -1713,15 +2375,16 @@ int bp_save_regrets(const BPSolver *s, const char *path) {
 
     const BPInfoTable *t = &s->info_table;
 
-    /* Header: "BPR2" = bucket-in-key format v2 */
-    fwrite("BPR2", 1, 4, f);
-    fwrite(&t->table_size, sizeof(int), 1, f);
-    fwrite(&t->num_entries, sizeof(int), 1, f);
-    fwrite(&s->iterations_run, sizeof(int), 1, f);
+    /* Header: "BPR4" = bucket-in-key format v4 (int64 table_size, int64 iterations) */
+    fwrite("BPR4", 1, 4, f);
+    fwrite(&t->table_size, sizeof(int64_t), 1, f);
+    fwrite(&t->num_entries, sizeof(int64_t), 1, f);
+    int64_t iters64 = s->iterations_run;
+    fwrite(&iters64, sizeof(int64_t), 1, f);
 
     /* Entries — each info set has bucket in key, regrets[num_actions] only */
-    int written = 0;
-    for (int i = 0; i < t->table_size; i++) {
+    int64_t written = 0;
+    for (int64_t i = 0; i < t->table_size; i++) {
         if (t->occupied[i] != 1) continue;
         BPInfoKey *key = &t->keys[i];
         BPInfoSet *is = &t->sets[i];
@@ -1744,35 +2407,57 @@ int bp_save_regrets(const BPSolver *s, const char *path) {
     }
 
     fclose(f);
-    printf("[BP] Saved %d info sets to %s\n", written, path);
+    printf("[BP] Saved %lld info sets to %s\n", (long long)written, path);
     return 0;
 }
 
-int bp_load_regrets(BPSolver *s, const char *path) {
+int64_t bp_load_regrets(BPSolver *s, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
 
     /* Header */
     char magic[4];
     fread(magic, 1, 4, f);
-    if (memcmp(magic, "BPR2", 4) != 0) {
-        printf("[BP] ERROR: expected BPR2 format, got %.4s\n", magic);
+    int is_v4 = (memcmp(magic, "BPR4", 4) == 0);
+    int is_v3 = (memcmp(magic, "BPR3", 4) == 0);
+    int is_v2 = (memcmp(magic, "BPR2", 4) == 0);
+    if (!is_v4 && !is_v3 && !is_v2) {
+        printf("[BP] ERROR: expected BPR2/BPR3/BPR4 format, got %.4s\n", magic);
         fclose(f);
         return -1;
     }
 
-    int saved_table_size, saved_entries, saved_iters;
-    fread(&saved_table_size, sizeof(int), 1, f);
-    fread(&saved_entries, sizeof(int), 1, f);
-    fread(&saved_iters, sizeof(int), 1, f);
+    int64_t saved_entries;
+    int64_t saved_iters;
+    if (is_v4) {
+        int64_t saved_table_size64;
+        fread(&saved_table_size64, sizeof(int64_t), 1, f);
+        fread(&saved_entries, sizeof(int64_t), 1, f);
+        fread(&saved_iters, sizeof(int64_t), 1, f);
+    } else {
+        int saved_table_size32, saved_entries32;
+        fread(&saved_table_size32, sizeof(int), 1, f);
+        fread(&saved_entries32, sizeof(int), 1, f);
+        saved_entries = (int64_t)saved_entries32;
+        if (is_v3) {
+            fread(&saved_iters, sizeof(int64_t), 1, f);
+        } else {
+            int iters32; fread(&iters32, sizeof(int), 1, f);
+            saved_iters = (int64_t)iters32;
+        }
+    }
 
-    printf("[BP] Loading checkpoint: %d info sets, %d iterations\n",
-           saved_entries, saved_iters);
+    printf("[BP] Loading checkpoint: %lld info sets, %lld iterations\n",
+           (long long)saved_entries, (long long)saved_iters);
 
     BPInfoTable *t = &s->info_table;
-    int loaded = 0;
+    int64_t loaded = 0;
+    int64_t merged = 0;
 
-    for (int e = 0; e < saved_entries; e++) {
+    int tmp_regrets[BP_MAX_ACTIONS];
+    float tmp_ss[BP_MAX_ACTIONS];
+
+    for (int64_t e = 0; e < saved_entries; e++) {
         BPInfoKey key;
         int na;
 
@@ -1782,8 +2467,9 @@ int bp_load_regrets(BPSolver *s, const char *path) {
         if (fread(&key.board_hash, sizeof(uint64_t), 1, f) != 1) break;
         if (fread(&key.action_hash, sizeof(uint64_t), 1, f) != 1) break;
         if (fread(&na, sizeof(int), 1, f) != 1) break;
+        if (na > BP_MAX_ACTIONS) na = BP_MAX_ACTIONS;
 
-        int slot = info_table_find_or_create(t, key, na);
+        int64_t slot = info_table_find_or_create(t, key, na);
         if (slot < 0) {
             fseek(f, na * sizeof(int), SEEK_CUR);
             int has_ss;
@@ -1793,25 +2479,95 @@ int bp_load_regrets(BPSolver *s, const char *path) {
         }
 
         BPInfoSet *is = &t->sets[slot];
-        fread(is->regrets, sizeof(int), na, f);
+
+        /* Read regrets into temp buffer, then ADD to slot.
+         * For fresh slots (arena zeroed): 0 + new = new (normal load).
+         * For duplicate keys (Hogwild race bug): existing + new = merged.
+         * This recovers split regrets from the duplicate-key bug where
+         * two hash table entries accumulated partial regrets separately. */
+        fread(tmp_regrets, sizeof(int), na, f);
+        int is_dup = 0;
+        for (int a = 0; a < na; a++) {
+            if (is->regrets[a] != 0) { is_dup = 1; break; }
+        }
+        for (int a = 0; a < na; a++) {
+            is->regrets[a] += tmp_regrets[a];
+        }
 
         int has_ss;
         fread(&has_ss, sizeof(int), 1, f);
         if (has_ss) {
             if (!is->strategy_sum) {
-                is->strategy_sum = (float*)calloc(na, sizeof(float));
+                is->strategy_sum = (float*)arena_alloc(na);
             }
-            fread(is->strategy_sum, sizeof(float), na, f);
+            if (is->strategy_sum) {
+                fread(tmp_ss, sizeof(float), na, f);
+                for (int a = 0; a < na; a++)
+                    is->strategy_sum[a] += tmp_ss[a];
+            } else {
+                fseek(f, na * sizeof(float), SEEK_CUR);
+            }
         }
 
+        if (is_dup) {
+            merged++;
+            if (merged <= 50) {
+                printf("[BP] Merged duplicate: player=%d street=%d bucket=%d "
+                       "ah=%016llx\n", key.player, key.street, key.bucket,
+                       (unsigned long long)key.action_hash);
+            }
+        }
         loaded++;
     }
 
     s->iterations_run = saved_iters;
     fclose(f);
-    printf("[BP] Loaded %d/%d info sets (table %d/%d)\n",
-           loaded, saved_entries, t->num_entries, t->table_size);
+    if (merged > 0) {
+        printf("[BP] WARNING: merged %lld duplicate entries (Hogwild race bug). "
+               "Split regrets have been recovered.\n", (long long)merged);
+    }
+    printf("[BP] Loaded %lld/%lld info sets (%lld merged), table %lld/%lld\n",
+           (long long)loaded, (long long)saved_entries, (long long)merged,
+           (long long)t->num_entries, (long long)t->table_size);
     return loaded;
+}
+
+int bp_save_texture_cache(const BPSolver *s, const char *path) {
+    if (!s->texture_bucket_cache || s->num_cached_textures == 0) return -1;
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    fwrite("TXC1", 1, 4, f);
+    fwrite(&s->num_cached_textures, sizeof(int), 1, f);
+    fwrite(&s->postflop_num_buckets, sizeof(int), 1, f);
+    fwrite(s->texture_hash_keys, sizeof(uint64_t), s->num_cached_textures, f);
+    fwrite(s->texture_bucket_cache, sizeof(int),
+           (size_t)s->num_cached_textures * BP_MAX_HANDS, f);
+    fclose(f);
+    printf("[BP] Saved texture cache: %d textures to %s\n",
+           s->num_cached_textures, path);
+    return 0;
+}
+
+int bp_load_texture_cache(BPSolver *s, const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    char magic[4];
+    fread(magic, 1, 4, f);
+    if (memcmp(magic, "TXC1", 4) != 0) { fclose(f); return -1; }
+    int num_tex, num_buckets;
+    fread(&num_tex, sizeof(int), 1, f);
+    fread(&num_buckets, sizeof(int), 1, f);
+    if (num_tex > BP_MAX_TEXTURES || num_buckets != s->postflop_num_buckets) {
+        fclose(f); return -1;
+    }
+    if (!s->texture_bucket_cache)
+        s->texture_bucket_cache = (int*)calloc(BP_MAX_TEXTURES * (size_t)BP_MAX_HANDS, sizeof(int));
+    fread(s->texture_hash_keys, sizeof(uint64_t), num_tex, f);
+    fread(s->texture_bucket_cache, sizeof(int), (size_t)num_tex * BP_MAX_HANDS, f);
+    s->num_cached_textures = num_tex;
+    fclose(f);
+    printf("[BP] Loaded texture cache: %d textures from %s\n", num_tex, path);
+    return num_tex;
 }
 
 void bp_free(BPSolver *s) {
@@ -1833,7 +2589,7 @@ int bp_export_strategies(const BPSolver *s,
     int count = 0;
     /* Header: 4 bytes magic + 4 bytes num_entries + 4 bytes num_players */
     total += 12;
-    for (int i = 0; i < t->table_size; i++) {
+    for (int64_t i = 0; i < t->table_size; i++) {
         if (t->occupied[i] != 1) continue;
         BPInfoSet *is = &t->sets[i];
         /* Key: player(1) + street(1) + bucket(2) + board_hash(8) + action_hash(8) = 20 bytes */
@@ -1855,7 +2611,7 @@ int bp_export_strategies(const BPSolver *s,
     memcpy(p, &np, 4); p += 4;
 
     float strategy_buf[BP_MAX_ACTIONS];
-    for (int i = 0; i < t->table_size; i++) {
+    for (int64_t i = 0; i < t->table_size; i++) {
         if (t->occupied[i] != 1) continue;
         BPInfoKey *key = &t->keys[i];
         BPInfoSet *is = &t->sets[i];

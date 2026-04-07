@@ -1,8 +1,8 @@
 # Poker Solver — Full Context for Next Session
 
-**Last updated**: 2026-03-26
-**Project**: `C:/Users/Victor/Documents/Projects/poker-solver/`
-**GitHub**: https://github.com/ZHANGV25/poker-solver.git
+**Last updated**: 2026-04-05
+**Project**: `/Users/victor/Documents/Dev/poker-solver/`
+**GitHub**: https://github.com/ZHANGV25/poker-solver-dev (private)
 **Mission**: Build an exact Pluribus replica — 6-player unified preflop-through-river MCCFR blueprint + GPU real-time subgame search at runtime.
 
 ---
@@ -30,7 +30,8 @@ An exact copy of Pluribus (Brown & Sandholm, Science 2019):
 - Linear CFR discount applied incrementally every `discount_interval` iterations (single parallel region with `#pragma omp single` between batches)
 - Strategy snapshots for rounds 2-4 via `accumulate_snapshot()`
 - Regret-based pruning (95% of iters after warmup, threshold -300M)
-- Int32 regrets with -310M floor
+- Int32 regrets with -310M floor, 2B ceiling (Pluribus has no explicit ceiling)
+- **`bp_get_regrets()`** — extract raw integer regrets for diagnostics
 - Lock-free CAS hash table (OpenMP Hogwild)
 - **`bp_save_regrets()` / `bp_load_regrets()`** — serialize/deserialize full hash table for checkpoint/resume
 - Backward compatible: `bp_init_ex()` still works for postflop-only solves
@@ -85,15 +86,14 @@ An exact copy of Pluribus (Brown & Sandholm, Science 2019):
 
 **`blueprint_worker_unified.py`** — Unified 6-player blueprint worker
 - Wraps `bp_init_unified` with Pluribus-matched parameters
-- Solves in chunks with periodic checkpoints (strategy .bps + regret table .bin)
+- Adaptive checkpoint schedule: 200M, 400M, 600M, 2B, 4B, 6B, 8B, 10B, then every 10B
+- Lightweight probes every 50M: F/C/R splits for 19 hands (pairs + key broadways/SCs), raw regrets for 5 diagnostic hands, UTG + BTN positions
 - `--resume` flag: downloads latest regret checkpoint from S3 and continues
-- Uploads both `unified_blueprint.bps` and `checkpoints/regrets_latest.bin` to S3
-- `--time-limit-hours 192` for 8-day run
-- `--checkpoint-interval 1000000` (saves every ~1M iterations)
+- `--time-limit-hours 192` for 8-day run (iteration count auto-computed)
 
 **`launch_blueprint_unified.sh`** — EC2 launcher for unified solve
-- Targets c5.metal (96 vCPU, 192GB) or c5.18xlarge (72 vCPU, 144GB)
-- Compiles with `-O3 -march=native` for maximum throughput
+- Targets c7a.metal-48xl (192 vCPU, 376GB) with 3B hash table
+- Compiles with `-O2 -march=native -fopenmp`
 - Sets `OMP_STACKSIZE=64m`
 - `--status`, `--download`, `--dry-run`
 
@@ -120,37 +120,50 @@ An exact copy of Pluribus (Brown & Sandholm, Science 2019):
 
 ---
 
-## WHERE WE ARE RIGHT NOW (2026-03-26)
+## WHERE WE ARE RIGHT NOW (2026-04-05)
 
 ### COMPUTE IS RUNNING:
-- **Solver:** `i-005296cd4dac967d5` (c5.18xlarge spot, 72 cores, us-east-1a)
-- **Watchdog:** `i-050adbd722d07e654` (t3.micro on-demand, auto-relaunches solver on spot reclaim)
-- **S3 bucket:** `poker-blueprint-unified` — checkpoints every 1M iterations
-- **Expected completion:** ~April 3, 2026 (192h from launch)
-- **Cost estimate:** ~$191 total
+- **Solver:** `i-09ab6b2e26d0f9007` (c7a.metal-48xl, 192 cores, us-east-1)
+- **S3 bucket:** `poker-blueprint-unified` — probes every 50M, adaptive checkpoints
+- **Target:** Time-limited (192h = 8 days), ~138B iterations at ~200K iter/s
+- **Cost estimate:** ~$998 on-demand
+- **Checkpoint schedule:** 200M, 400M, 600M, 2B, 4B, 6B, 8B, 10B, 20B, 30B, 40B
 
-### Full audit completed (2026-03-26):
-All show-stoppers, abstraction quality issues, runtime bugs, and infrastructure problems fixed.
+### Blueprint convergence debugging (April 4-5, 2026)
 
-**Blueprint engine fixes:**
-1. S1: Bucket-in-key info set refactor (memory 1.3TB → 35GB)
-2. S2: --num-threads 0 iteration estimation bug fixed
-3. S3: River pruning logic fixed (never prune river/fold per Pluribus)
-4. G1: K-means bucketing wired (EHS + positive/negative potential)
-5. G2: Per-street bucket recomputation for turn/river
-6. Hash table increased to 1B slots (300M IS in 8M iters was overflowing 536M)
-7. Checkpoint crash fixed (deferred .bps export, BPS3 uint64 format)
+After 10 bugs found and fixed, the solver runs correctly but **early positions
+(UTG, MP) don't converge** while late positions (BTN, SB) do. TT/99 from UTG
+converge to 100% call instead of raise. Deep research into the Pluribus
+supplementary materials, Noam Brown's thesis, and open-source implementations
+found two remaining algorithmic deviations (Bugs 9-10):
 
-**Runtime fixes (GPU + Python):**
-8. R1: N-player showdown — exact enumeration in GPU
-9. R2: N-player leaf values — 4^N continuation combos
-10. R3: A3 strategy freezing in GPU CFR (frozen_action kernel)
-11. R4: V2 blueprint range narrowing (bucket→hand mapping)
-12. R5: Texture key suits, action index, frozen-action tree walk
+**Bug 9 (CRITICAL): Pruned actions' regrets updated instead of left unchanged.**
+Pluribus Algorithm 1 only updates regrets for explored actions. Our code updated
+ALL actions, giving pruned actions delta = -node_value, pushing them deeper negative
+on 95% of iterations. This is the root cause of the call trap at UTG.
 
-**Infrastructure:**
-13. Spot pricing, S3 retries, atomic writes, --resume on initial launch
-14. Watchdog with @reboot cron, IAM EC2FullAccess for describe/launch
+**Bug 10: Regret ceiling too low (310M vs ~2B).** Pluribus has no explicit ceiling.
+Our 310M ceiling caused dominant actions to saturate 7x too early, losing ordering
+information when multiple raise sizes competed.
+
+Both fixed. Current run has the fixes + expanded probes + adaptive checkpoints.
+
+### All bugs found and fixed (10 total):
+
+| # | Bug | Impact | Phase |
+|---|-----|--------|-------|
+| 1 | board_hash in info set key | Tree inflated to billions, 27% miss rate | Phase 2 |
+| 2 | int32 regret overflow | Nonsensical strategies at 9.87B iters | Phase 2 |
+| 3 | Heap corruption from billions of callocs | Crash at ~575M iters | Phase 2 |
+| 4 | Hash table fills (flat 8 preflop sizes) | Tree 19x larger than Pluribus | Phase 3 |
+| 5 | int32 overflow in iteration counters | Can't run >2.1B iterations | Phase 3 |
+| 6 | strategy_sum aliasing (gcd(6,10000)=2) | UTG/SB/CO never accumulate avg strategy | Phase 5 |
+| 7 | Call/fold trap feedback loop | Diagnosed but not root-caused until Bug 9 | Phase 6 |
+| 8 | 10x regret scaling factor | Regrets hit ceiling/floor 10x too fast | Phase 7 |
+| 9 | **Pruned regrets updated (should be unchanged)** | **Root cause of call trap** | Phase 10 |
+| 10 | Regret ceiling 310M (should be ~2B) | Dominant actions saturate too early | Phase 10 |
+
+See `docs/BLUEPRINT_BUGS.md` for full details, `docs/BLUEPRINT_CHRONICLE.md` for narrative.
 
 ### Compilation (CHANGED — requires both .c files):
 ```bash
@@ -235,86 +248,105 @@ gcc -O2 -shared -fopenmp -static -o build/mccfr_blueprint.dll src/mccfr_blueprin
 
 From `pluribus_technical_details.md` in this repo:
 
-| Parameter | Pluribus | Our Value |
-|-----------|----------|-----------|
-| Players | 6 | 6 |
-| Algorithm | External-sampling MCCFR | Same |
-| Training time | 8 days, 64 cores | 8 days, 72-96 cores |
-| Training cost | ~$144 spot | ~$235 spot |
-| Memory | <512GB | ~30GB estimated |
-| Preflop buckets | 169 lossless | 169 lossless |
-| Postflop buckets | 200 per street | 200 per street |
-| Discount | d=T/(T+1) every 10 min, first 400 min | Same (proportional) |
-| Pruning | -300M threshold, 95%, after 200 min | Same |
-| Regret floor | -310M | -310M |
-| Regret storage | int32 | int32 |
-| Strategy sum | Round 1 only, every 10K iter | Same + snapshots for rounds 2-4 |
-| Search (runtime) | Linear CFR, 4 cont strategies, 5x bias | Same (GPU, 67ms river) |
-| Play strategy | Final iteration | Same |
-| Narrowing strategy | Weighted average | Same |
-| Strategy freezing | A3: freeze at passed nodes for hero's hand | Implemented |
-| Off-tree bets | Pseudoharmonic | Same |
-| Beliefs | Start uniform 1/1326 | Supported (uniform_beliefs=True) |
+| Parameter | Pluribus | Our Value | Status |
+|-----------|----------|-----------|--------|
+| Players | 6 | 6 | ✓ |
+| Algorithm | External-sampling MCCFR | Same | ✓ |
+| Training time | 8 days, 64 cores | 8 days, 192 cores | ✓ |
+| Training cost | ~$144 spot | ~$998 on-demand | ✓ |
+| Memory | <512GB | ~210GB (3B hash table) | ✓ |
+| Preflop buckets | 169 lossless | 169 lossless | ✓ |
+| Postflop buckets | 200 k-means [EHS,PPot,NPot] | 200 k-means [EHS,PPot,NPot] | ✓ |
+| Discount | d=T/(T+1), 40 rounds, first 3.5% | Same (proportional) | ✓ |
+| Pruning | -300M threshold, 95%, explored-only updates | Same (Bug 9 fixed) | ✓ |
+| Regret floor | -310M | -310M | ✓ |
+| Regret ceiling | None (implicit int32 max ~2.1B) | 2B (Bug 10 fixed) | ✓ |
+| Regret storage | int32 | int32 (int64 intermediates) | ✓ |
+| Strategy sum | Round 1 only, every 10K iter | Every 10007 iter (coprime w/ 6) | ✓ |
+| Preflop sizes | 1-14 per decision (hand-tuned) | Tiered 8/3/2/1 | ~close |
+| Postflop sizes | 0.5x, 1x, all-in first; 1x, all-in subsequent | Same | ✓ |
+| Search (runtime) | Linear CFR, 4 cont strategies, 5x bias | Same (GPU, 67ms river) | ✓ |
+| Play strategy | Final iteration | Same | ✓ |
+| Strategy freezing | A3: freeze at passed nodes for hero's hand | Implemented | ✓ |
+| Off-tree bets | Pseudoharmonic | Same | ✓ |
 
 ---
 
 ## AWS RESOURCES
 
-- **S3 bucket (unified)**: `poker-blueprint-unified` — code, checkpoints, final blueprint
+- **S3 bucket (unified)**: `poker-blueprint-unified` — code, checkpoints, probes, final blueprint
 - **S3 bucket (v1)**: `poker-blueprint-2026` (110 GB, old per-texture blueprint)
-- **Solver instance**: `i-07b2dee8eaa7c94d9` (c5.18xlarge on-demand, 72 vCPU, 137 GB)
-- **Watchdog instance**: `i-050adbd722d07e654` (t3.micro, 18.205.60.222)
-- **Key pair**: `poker-solver-key` (PEM at `C:/Users/Victor/poker-solver-key.pem`)
-- **Security group**: `poker-solver-sg` (sg-07960382eb9d00a95)
+- **Current solver**: `i-09ab6b2e26d0f9007` (c7a.metal-48xl, 192 vCPU, 376 GB)
+- **Key pair**: `poker-solver-key` (PEM at `~/poker-solver-key.pem`)
+- **Security group**: `poker-solver-sg`
 - **IAM profile**: `poker-solver-profile` (role: `poker-solver-ec2-role`, has S3 + EC2FullAccess)
 - **Region**: us-east-1
 
+### Monitoring
+```bash
+# Quick probe (strategy + raw regrets):
+aws s3 cp s3://poker-blueprint-unified/probes/probe_latest.txt -
+
+# List checkpoints:
+aws s3 ls s3://poker-blueprint-unified/checkpoints/
+
+# Instance status:
+bash precompute/launch_blueprint_unified.sh --status
+
+# SSH logs:
+ssh -i ~/poker-solver-key.pem ec2-user@$(aws ec2 describe-instances \
+    --instance-ids i-09ab6b2e26d0f9007 \
+    --query 'Reservations[0].Instances[0].PublicIpAddress' --output text) \
+    'tail -30 /var/log/blueprint-unified.log'
+```
+
 ---
 
-## BUGS FOUND AND FIXED DURING COMPUTE
+## BUGS FOUND AND FIXED (BLUEPRINT ENGINE — 10 total)
 
-| Bug | Impact | Fix |
-|-----|--------|-----|
-| Bucket-in-key missing → 1.3TB memory | OOM | BPInfoKey includes bucket, regrets[num_actions] per slot |
-| `--num-threads 0` → 207M iter estimate | Solver stops in 3h | Use `os.cpu_count()` fallback |
-| River actions pruned | Wrong strategies | Never prune river or fold per Pluribus |
-| Percentile bucketing, not k-means | Low abstraction quality | Wire `ca_assign_buckets_kmeans` |
-| Flop buckets reused for turn/river | Stale buckets | Per-street EHS recomputation |
-| `.bps` export > 4GB | uint32 overflow crash | BPS3 format + deferred to final only |
-| `snapshot_interval` > INT32_MAX | Negative modulo → UB → silent crash | Cap all config at INT32_MAX |
-| malloc overhead on 777M tiny arrays | OOM at 87 GB RSS | Arena allocator (zero overhead) |
-| Watchdog only checks instance state | Doesn't detect process crash | Staleness detection + SSH restart |
-| `frozen_action` not in ctypes `_fields_` | A3 freezing silently broken | Added to SSTreeData struct |
+See `docs/BLUEPRINT_BUGS.md` for full details.
+
+| # | Bug | Root cause | Fix |
+|---|-----|-----------|-----|
+| 1 | board_hash in info set key | Tree inflated from ~665M to billions | Set board_hash=0, bucket abstracts board |
+| 2 | int32 regret overflow | UB at 9.87B iters | int64 intermediates + BP_REGRET_CEILING |
+| 3 | Heap corruption | Billions of tiny callocs | Arena allocator |
+| 4 | Flat preflop sizing | 7.4B preflop IS (19x Pluribus) | Tiered 8/3/2/1 per raise level |
+| 5 | int32 iteration counters | Can't run >2.1B iters | Widened to int64 throughout |
+| 6 | strategy_sum aliasing | gcd(6,10000)=2, 3 players excluded | Use 10007 (coprime with 6) |
+| 7 | Call/fold trap (diagnosed) | Dominant action freezes regret | See Bug 9 for root cause |
+| 8 | 10x regret scaling | Regrets hit ceiling/floor 10x early | Removed scaling factor |
+| 9 | **Pruned regrets updated** | 95% of iters push pruned actions negative | Only update explored actions |
+| 10 | Regret ceiling 310M | 7x lower than Pluribus implicit max | Raised to 2B |
 
 ---
 
 ## PROMPT FOR NEXT AGENT
 
-You are continuing development of a Pluribus-exact 6-max NLHE poker solver. The project is at `C:/Users/Victor/Documents/Projects/poker-solver/`. Read `CONTEXT_NEXT_SESSION.md` for full context.
+You are continuing development of a Pluribus-exact 6-max NLHE poker solver. The project is at `/Users/victor/Documents/Dev/poker-solver/`. Read `CONTEXT_NEXT_SESSION.md` for full context and `docs/BLUEPRINT_CHRONICLE.md` for the full debugging narrative.
 
-**The 8-day blueprint compute is running on EC2.** First, check its status:
+**Blueprint compute with Bug 9+10 fixes is running on EC2.** Check status:
 
 ```bash
-# Check instances
-aws ec2 describe-instances --region us-east-1 \
-    --filters "Name=tag:Project,Values=poker-solver-unified" "Name=instance-state-name,Values=running" \
-    --query 'Reservations[].Instances[].{Id:InstanceId,IP:PublicIpAddress,Type:InstanceType}' --output table
+# Quick convergence check (F/C/R splits + raw regrets):
+aws s3 cp s3://poker-blueprint-unified/probes/probe_latest.txt -
 
-# Check S3 checkpoint progress
-aws s3 ls s3://poker-blueprint-unified/checkpoints/ --recursive
+# List all checkpoints:
+aws s3 ls s3://poker-blueprint-unified/checkpoints/
 
-# SSH into solver (get IP from above)
-ssh -i /path/to/poker-solver-key.pem ec2-user@<IP> "tail -20 /var/log/blueprint-unified.log"
-
-# Check watchdog
-ssh -i /path/to/poker-solver-key.pem ec2-user@18.205.60.222 "tail -20 /var/log/watchdog4.log"
+# Instance status:
+bash precompute/launch_blueprint_unified.sh --status
 ```
 
-**If compute is still running:** Monitor and wait. ETA is ~April 4, 2026.
+**What to look for in probes:**
+- `pruned=N/8` for TT/99/44 should DECREASE over time (raises un-pruning)
+- `best_raise` should climb toward positive for TT/99
+- BTN should show healthy raise rates (sanity check)
+- If TT shows R>50% from UTG by 400M, the fix is working
 
 **If compute is complete** (S3 has `checkpoint_meta.json` with `"checkpoint": "final"`):
 1. Download blueprint: `aws s3 sync s3://poker-blueprint-unified/ blueprint_unified/`
-2. Terminate both EC2 instances
+2. Terminate EC2 instance
 3. Wire unified blueprint into runtime:
    - Update `python/blueprint_v2.py` to load the unified `.bps` file
    - The blueprint covers all streets (preflop through river) in one file

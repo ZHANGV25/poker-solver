@@ -21,14 +21,14 @@
 set -euo pipefail
 
 REGION="${AWS_REGION:-us-east-1}"
-INSTANCE_TYPE="${INSTANCE_TYPE:-c5.metal}"  # 96 vCPU, 192 GB, $4.08/hr
+INSTANCE_TYPE="${INSTANCE_TYPE:-c7a.metal-48xl}"  # 192 vCPU, 384 GB
 KEY_NAME="${KEY_NAME:-poker-solver-key}"
 SECURITY_GROUP="${SECURITY_GROUP:-poker-solver-sg}"
 S3_BUCKET="${S3_BUCKET:-poker-blueprint-unified}"
 PROFILE_NAME="poker-solver-profile"
 
 HOURS=192           # 8 days (Pluribus)
-HASH_SIZE=1342177280 # 1.25B slots (~80GB metadata) — hash table hit 100% at 1B with old size
+HASH_SIZE=3000000000 # 3B slots (~180GB metadata) — tiered preflop (8/3/2/1)
 DRY_RUN=0
 STATUS_ONLY=0
 DOWNLOAD_ONLY=0
@@ -91,8 +91,10 @@ echo ""
 case "$INSTANCE_TYPE" in
     c5.18xlarge) OD_PRICE="3.06";;
     c5.metal)    OD_PRICE="4.08";;
+    c6a.metal)   OD_PRICE="4.90";;
+    c7a.metal-48xl) OD_PRICE="5.20";;
     r5.24xlarge) OD_PRICE="6.05";;
-    *)           OD_PRICE="3.00";;
+    *)           OD_PRICE="5.00";;
 esac
 COST=$(echo "$OD_PRICE * $HOURS" | bc 2>/dev/null || echo "???")
 echo "Estimated cost: ~\$$COST (on-demand)"
@@ -120,6 +122,8 @@ aws s3 sync "$PROJECT_DIR/src" "s3://$S3_BUCKET/code/src/" \
 aws s3 sync "$PROJECT_DIR/precompute" "s3://$S3_BUCKET/code/precompute/" --quiet
 aws s3 sync "$PROJECT_DIR/python" "s3://$S3_BUCKET/code/python/" \
     --quiet --exclude "__pycache__/*" --exclude "*.pyc"
+aws s3 sync "$PROJECT_DIR/tests" "s3://$S3_BUCKET/code/tests/" \
+    --quiet --exclude "*.o" --exclude "__pycache__/*"
 echo "Code uploaded."
 
 USERDATA=$(cat <<USERDATA
@@ -135,23 +139,29 @@ WORKDIR=/opt/poker-solver
 mkdir -p \$WORKDIR/build /opt/blueprint_unified && cd \$WORKDIR
 aws s3 sync s3://$S3_BUCKET/code/ \$WORKDIR/ --quiet
 
-echo "Compiling with -O3 -march=native for maximum throughput..."
-gcc -O3 -march=native -fPIC -shared -fopenmp -o build/mccfr_blueprint.so src/mccfr_blueprint.c src/card_abstraction.c -I src -lm -lpthread
+echo "Compiling with -O2 -march=native..."
+gcc -O2 -march=native -fno-strict-aliasing -fPIC -shared -fopenmp -o build/mccfr_blueprint.so src/mccfr_blueprint.c src/card_abstraction.c -I src -lm -lpthread
+gcc -O2 -march=native -o build/extract_roots tests/extract_roots.c -lm
+gcc -O2 -march=native -o build/dump_raw_regrets tests/dump_raw_regrets.c -lm
 echo "Compilation complete."
+
+# Download precomputed texture cache (saves ~40 min precomputation)
+aws s3 cp s3://$S3_BUCKET/texture_cache.bin /tmp/texture_cache.bin --quiet 2>/dev/null || true
+echo "Texture cache: \$(ls -lh /tmp/texture_cache.bin 2>/dev/null || echo 'not found, will precompute')"
 
 export OMP_STACKSIZE=64m
 export OMP_NUM_THREADS=\$(nproc)
 
 echo "Starting unified solve: \$(nproc) threads, ${HOURS}h..."
-python3 precompute/blueprint_worker_unified.py \
+python3 -u precompute/blueprint_worker_unified.py \
+    --iterations 0 \
     --time-limit-hours $HOURS \
     --num-threads \$(nproc) \
     --hash-size $HASH_SIZE \
     --output-dir /opt/blueprint_unified \
     --s3-bucket $S3_BUCKET \
-    --checkpoint-interval 1000000 \
-    --build-dir build \
-    --resume
+    --resume \
+    --build-dir build
 
 echo "=== Complete at \$(date) ==="
 aws s3 cp /var/log/blueprint-unified.log s3://$S3_BUCKET/logs/unified.log --quiet
@@ -170,7 +180,6 @@ INSTANCE_ID=$(aws ec2 run-instances \
     --security-groups "$SECURITY_GROUP" \
     --iam-instance-profile "Name=$PROFILE_NAME" \
     --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":200,"VolumeType":"gp3"}}]' \
-    --instance-market-options '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"persistent","InstanceInterruptionBehavior":"stop"}}' \
     --user-data "$USERDATA_B64" \
     --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=bp-unified},{Key=Project,Value=poker-solver-unified}]" \
     --query "Instances[0].InstanceId" \

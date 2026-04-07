@@ -29,7 +29,7 @@
 
 #define BP_MAX_PLAYERS    6
 #define BP_MAX_HANDS      1326   /* max hands per player (all possible 2-card combos) */
-#define BP_MAX_ACTIONS    8
+#define BP_MAX_ACTIONS    16
 #define BP_MAX_BOARD      5
 
 /* Hash table sizing.
@@ -37,12 +37,18 @@
  * BP_HASH_SIZE_MEDIUM (64M slots) fits ~45M info sets at 70% load.
  * Memory: 64M * (key=20 + set=16 + occupied=4) = ~2.5GB metadata.
  * For small test runs, use BP_HASH_SIZE_SMALL. */
+#define BP_HASH_SIZE_3B     ((int64_t)3000000000) /* 3B slots (~180GB metadata) — full unified solve */
 #define BP_HASH_SIZE_LARGE  (1 << 30)   /* 1.07B slots (~44GB metadata) — bucket-in-key needs more */
 #define BP_HASH_SIZE_MEDIUM (1 << 26)   /* 64M slots (~2.5GB metadata) — per-texture */
 #define BP_HASH_SIZE_SMALL  (1 << 22)   /* 4M slots (~160MB metadata) — testing only */
 
 /* Pluribus-matched constants */
 #define BP_REGRET_FLOOR      (-310000000)   /* minimum regret per action */
+#define BP_REGRET_CEILING     2000000000    /* ~int32 max. Pluribus has no explicit ceiling (only
+                                            * the implicit int32 max). The old 310M ceiling caused
+                                            * dominant actions to saturate 7x too early, losing
+                                            * ordering information when multiple actions competed.
+                                            * int64 intermediate arithmetic prevents overflow. */
 #define BP_PRUNE_THRESHOLD   (-300000000)   /* skip actions below this */
 #define BP_PRUNE_PROB        0.95f          /* fraction of iters that prune */
 
@@ -75,8 +81,8 @@ typedef struct {
     BPInfoKey *keys;
     BPInfoSet *sets;
     int *occupied;
-    int num_entries;
-    int table_size;        /* actual hash table size (configurable) */
+    int64_t num_entries;
+    int64_t table_size;    /* actual hash table size (supports up to 4B+) */
 } BPInfoTable;
 
 /* Blueprint solver configuration */
@@ -84,17 +90,19 @@ typedef struct {
     /* Timing-based thresholds (converted to iteration counts).
      * Pluribus used wall-clock minutes; we convert to iterations
      * based on estimated iterations/minute on the target hardware.
-     * Default: ~1000 iter/min on 64 cores -> 400 min = 400K iters. */
-    int discount_stop_iter;     /* stop Linear CFR discount after this (Pluribus: 400 min) */
-    int discount_interval;      /* apply discount every N iterations (Pluribus: ~10 min) */
-    int prune_start_iter;       /* start pruning after this (Pluribus: 200 min) */
-    int snapshot_start_iter;    /* start saving snapshots after this (Pluribus: 800 min) */
-    int snapshot_interval;      /* save snapshot every N iterations (Pluribus: ~200 min) */
-    int strategy_interval;      /* update round-1 avg strategy every N iters (Pluribus: 10K) */
+     * Uses int64 because full Pluribus-equivalent compute on fast hardware
+     * requires ~100B+ iterations, exceeding INT32_MAX. */
+    int64_t discount_stop_iter;     /* stop Linear CFR discount after this (Pluribus: 400 min) */
+    int64_t discount_interval;      /* apply discount every N iterations (Pluribus: ~10 min) */
+    int64_t prune_start_iter;       /* start pruning after this (Pluribus: 200 min) */
+    int64_t snapshot_start_iter;    /* start saving snapshots after this (Pluribus: 800 min) */
+    int64_t snapshot_interval;      /* save snapshot every N iterations (Pluribus: ~200 min) */
+    int64_t strategy_interval;      /* update round-1 avg strategy every N iters (Pluribus: 10K) */
     int num_threads;            /* OpenMP threads (0 = auto) */
-    int hash_table_size;        /* 0 = auto (BP_HASH_SIZE_SMALL or _LARGE based on players) */
+    int64_t hash_table_size;    /* 0 = auto. Supports >2B (e.g. 3B for 376GB instance) */
     const char *snapshot_dir;   /* directory for strategy snapshots (NULL = no snapshots) */
     int include_preflop;        /* 1 = start from preflop (unified Pluribus-style), 0 = start from flop */
+    int postflop_num_buckets;   /* 0 = default (200). Reduce to shrink game tree. */
 } BPConfig;
 
 /* Blueprint solver state */
@@ -116,13 +124,25 @@ typedef struct {
     /* Board */
     int flop[3];
 
-    /* Bet sizing (postflop) */
+    /* Bet sizing (postflop first raise: Pluribus turn/river = 0.5x, 1x, all-in) */
     float bet_sizes[BP_MAX_ACTIONS];
     int num_bet_sizes;
+
+    /* Postflop subsequent raises (Pluribus turn/river = 1x, all-in) */
+    float subsequent_bet_sizes[BP_MAX_ACTIONS];
+    int num_subsequent_bet_sizes;
 
     /* Preflop bet sizing (Pluribus: 1-14 sizes per decision point) */
     float preflop_bet_sizes[BP_MAX_ACTIONS];
     int num_preflop_bet_sizes;
+
+    /* Tiered preflop sizing: per-raise-level arrays (Pluribus-style).
+     * Level 0 = open raise, 1 = 3-bet, 2 = 4-bet, 3 = 5-bet.
+     * If num_preflop_tiers > 0, these override preflop_bet_sizes. */
+    float preflop_tiered_sizes[4][BP_MAX_ACTIONS];
+    int num_preflop_tiered_sizes[4];  /* sizes per level */
+    int num_preflop_tiers;            /* 0 = use flat preflop_bet_sizes */
+    int preflop_max_raises;           /* 0 = default (4) */
 
     /* Pot, stacks, and blinds */
     int starting_pot;       /* pot at start of postflop (when include_preflop=0) */
@@ -157,9 +177,16 @@ typedef struct {
     uint64_t texture_hash_keys[BP_MAX_TEXTURES];  /* hash key per texture */
     int num_cached_textures;
 
+    /* Precomputed turn k-means centroids for bucketing.
+     * 200 centroids in [EHS, PPot, NPot] feature space.
+     * During traversal, each hand's features are computed inline and
+     * mapped to nearest centroid. Matches Pluribus bucketing approach. */
+    float turn_centroids[200][3];
+    int turn_centroids_k;
+
     /* Stats */
-    int iterations_run;
-    int snapshots_saved;
+    int64_t iterations_run;
+    int64_t snapshots_saved;
 } BPSolver;
 
 /* ── Public API ──────────────────────────────────────────────────────── */
@@ -215,10 +242,20 @@ BP_EXPORT int bp_set_buckets(BPSolver *s, int street,
                               const int *num_buckets);
 
 /**
+ * Set tiered preflop bet sizes (Pluribus-style: fewer sizes at higher raise levels).
+ * level: 0 = open raise, 1 = 3-bet, 2 = 4-bet, 3 = 5-bet.
+ * Call once per level after bp_init_unified, before bp_solve.
+ * max_raises: total preflop raise cap (set on first call, e.g. 4).
+ */
+BP_EXPORT int bp_set_preflop_tier(BPSolver *s, int level,
+                                   const float *sizes, int num_sizes,
+                                   int max_raises);
+
+/**
  * Run external-sampling MCCFR with Pluribus optimizations.
  * Supports OpenMP parallelism, pruning, Linear CFR discount.
  */
-BP_EXPORT int bp_solve(BPSolver *s, int max_iterations);
+BP_EXPORT int bp_solve(BPSolver *s, int64_t max_iterations);
 
 /**
  * Extract weighted-average strategy at a specific info set.
@@ -228,8 +265,26 @@ BP_EXPORT int bp_get_strategy(const BPSolver *s, int player,
                                const int *action_seq, int seq_len,
                                float *strategy_out, int bucket);
 
-BP_EXPORT int bp_num_info_sets(const BPSolver *s);
+/**
+ * Extract raw integer regrets at a specific info set.
+ * regrets_out must have space for at least BP_MAX_ACTIONS ints.
+ * Returns num_actions, or 0 if info set not found.
+ */
+BP_EXPORT int bp_get_regrets(const BPSolver *s, int player,
+                              const int *board, int num_board,
+                              const int *action_seq, int seq_len,
+                              int *regrets_out, int bucket);
+
+BP_EXPORT int64_t bp_num_info_sets(const BPSolver *s);
 BP_EXPORT void bp_free(BPSolver *s);
+
+/**
+ * Save/load precomputed texture bucket cache to skip the 65-90 min
+ * precompute on subsequent launches. Format: TXC1 header + hash keys
+ * + bucket mappings. ~9.3 MB file for 1755 textures × 1326 hands.
+ */
+BP_EXPORT int bp_save_texture_cache(const BPSolver *s, const char *path);
+BP_EXPORT int bp_load_texture_cache(BPSolver *s, const char *path);
 
 /**
  * Initialize a unified preflop-through-river solver (Pluribus-style).
@@ -311,7 +366,7 @@ BP_EXPORT int bp_save_regrets(const BPSolver *s, const char *path);
  *
  * Returns number of entries loaded, or -1 on error.
  */
-BP_EXPORT int bp_load_regrets(BPSolver *s, const char *path);
+BP_EXPORT int64_t bp_load_regrets(BPSolver *s, const char *path);
 
 /**
  * Export EHS values and bucket assignments for all hands.

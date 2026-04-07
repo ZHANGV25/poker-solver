@@ -151,7 +151,7 @@ int ca_assign_buckets(
  * Features: [EHS, pos_potential, neg_potential] per hand.
  * Positive potential: fraction of samples where hand is behind now but wins
  * Negative potential: fraction of samples where hand is ahead now but loses */
-static void compute_features(
+void ca_compute_features(
     const int *board, int num_board,
     const int hands[][2], int num_hands,
     int n_samples,
@@ -196,44 +196,48 @@ static void compute_features(
             for (int b = num_board; b < 5; b++)
                 full_board[b] = avail[2 + (b - num_board)];
 
-            /* Evaluate at current board (for potential computation) */
-            int current_board_len = num_board;
-            int hero7_cur[7], opp7_cur[7];
-            /* For potential: compare at current board vs full board */
+            /* Evaluate at full board (5 cards) for EHS */
+            int hero7_full[7] = {full_board[0], full_board[1], full_board[2],
+                                  full_board[3], full_board[4], c0, c1};
+            int opp7_full[7] = {full_board[0], full_board[1], full_board[2],
+                                 full_board[3], full_board[4], oc0, oc1};
+            uint32_t hero_full = eval7(hero7_full);
+            uint32_t opp_full = eval7(opp7_full);
+
+            if (hero_full > opp_full) wins++;
+            else if (hero_full == opp_full) ties++;
+            total++;
+
+            /* Hand potential: compare "current" vs "final" strength.
+             * Current = strength using only the board cards dealt so far.
+             * Final = strength using the complete 5-card board.
+             * For eval7, we need 7 cards. With < 5 board cards, pad the
+             * current board with INDEPENDENT random cards (not the actual
+             * future cards used in full_board). This ensures "current" and
+             * "final" evaluations can differ, enabling PPot/NPot > 0.
+             * Use cards from the END of the avail array (after the ones
+             * used for opp hand + board completion). */
             if (num_board < 5) {
-                /* Current board strength (partial — use what we have) */
-                int hero7_full[7] = {full_board[0], full_board[1], full_board[2],
-                                      full_board[3], full_board[4], c0, c1};
-                int opp7_full[7] = {full_board[0], full_board[1], full_board[2],
-                                     full_board[3], full_board[4], oc0, oc1};
-                uint32_t hero_full = eval7(hero7_full);
-                uint32_t opp_full = eval7(opp7_full);
-
-                /* Current board strength (only what's dealt so far) */
-                /* For flop (3 cards): use 5-card eval with hero's 2 + board 3 */
-                /* For simplicity, evaluate at the current street using
-                 * 5 cards = board + hero's 2 hand cards (pad board if <5) */
-                int hero_cur_cards[7], opp_cur_cards[7];
+                int hero_cur[7], opp_cur[7];
                 for (int i = 0; i < num_board; i++) {
-                    hero_cur_cards[i] = board[i];
-                    opp_cur_cards[i] = board[i];
+                    hero_cur[i] = board[i];
+                    opp_cur[i] = board[i];
                 }
-                /* Pad with 2 random remaining cards for 5-card minimum */
-                int pad_idx = 2; /* after opp cards */
+                /* Pad with cards from the tail of avail (independent of
+                 * the future board cards at avail[2..cards_needed-1]) */
+                int pad_src = cards_needed; /* start after used cards */
                 for (int i = num_board; i < 5; i++) {
-                    hero_cur_cards[i] = avail[pad_idx];
-                    opp_cur_cards[i] = avail[pad_idx];
-                    pad_idx++;
+                    int pad_card = (pad_src < n_avail) ? avail[pad_src++] : avail[0];
+                    hero_cur[i] = pad_card;
+                    opp_cur[i] = pad_card;
                 }
-                hero_cur_cards[5] = c0; hero_cur_cards[6] = c1;
-                opp_cur_cards[5] = oc0; opp_cur_cards[6] = oc1;
-                uint32_t hero_cur = eval7(hero_cur_cards);
-                uint32_t opp_cur = eval7(opp_cur_cards);
+                hero_cur[5] = c0; hero_cur[6] = c1;
+                opp_cur[5] = oc0; opp_cur[6] = oc1;
+                uint32_t hc = eval7(hero_cur);
+                uint32_t oc = eval7(opp_cur);
 
-                /* Current: hero ahead or behind? */
-                int cur_ahead = (hero_cur > opp_cur);
-                int cur_behind = (hero_cur < opp_cur);
-                /* Final: hero wins or loses? */
+                int cur_ahead = (hc > oc);
+                int cur_behind = (hc < oc);
                 int final_win = (hero_full > opp_full);
                 int final_lose = (hero_full < opp_full);
 
@@ -245,21 +249,6 @@ static void compute_features(
                     ahead_now_total++;
                     if (final_lose) ahead_now_lose_later++;
                 }
-
-                if (hero_full > opp_full) wins++;
-                else if (hero_full == opp_full) ties++;
-                total++;
-            } else {
-                /* River: no potential, just EHS */
-                int hero7[7] = {full_board[0], full_board[1], full_board[2],
-                                 full_board[3], full_board[4], c0, c1};
-                int opp7[7] = {full_board[0], full_board[1], full_board[2],
-                                full_board[3], full_board[4], oc0, oc1};
-                uint32_t hs = eval7(hero7);
-                uint32_t os = eval7(opp7);
-                if (hs > os) wins++;
-                else if (hs == os) ties++;
-                total++;
             }
         }
 
@@ -281,7 +270,7 @@ int ca_assign_buckets_kmeans(
 
     /* Step 1: Compute 3D features */
     float (*features)[3] = (float(*)[3])malloc(num_hands * 3 * sizeof(float));
-    compute_features(board, num_board, hands, num_hands, n_samples, features);
+    ca_compute_features(board, num_board, hands, num_hands, n_samples, features);
 
     /* Step 2: Initialize centroids via percentile seeding on EHS (feature[0]).
      * Sort by EHS and pick k evenly-spaced points. */
