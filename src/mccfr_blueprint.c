@@ -22,9 +22,10 @@
 #include <math.h>
 #include <stdio.h>
 #include <time.h>
-#ifdef _POSIX_VERSION
+#include <unistd.h>
+#include <errno.h>
+#include <sys/mman.h>
 #include <sched.h>
-#endif
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -318,9 +319,7 @@ static inline void spin_until_ready(const int *flag) {
         #endif
         if (++spins > 10000000) {   /* ~10ms, yield then retry */
             spins = 0;
-            #ifdef _POSIX_VERSION
             sched_yield();
-            #endif
         }
     }
 }
@@ -1203,29 +1202,32 @@ static float traverse(TraversalState *ts, int acting_order_idx,
  * we're past the snapshot_start_iter threshold. This accumulates the
  * snapshot average directly in memory rather than saving to disk. */
 
+/* Called from within an existing outer parallel region. Uses omp for to
+ * distribute work across the team's threads. Does NOT use a new parallel
+ * region (avoids nested parallelism issues). */
 static void accumulate_snapshot(BPInfoTable *t) {
     float strat_buf[BP_MAX_ACTIONS];
+    #pragma omp for schedule(static, 65536) nowait
     for (int64_t i = 0; i < t->table_size; i++) {
         if (t->occupied[i] != 1) continue;
         BPInfoSet *is = &t->sets[i];
         int na = is->num_actions;
 
-        if (!is->strategy_sum) {
-            float *buf = (float*)arena_alloc(na);
-            if (buf) {
-                is->strategy_sum = buf;  /* Single-threaded (omp single), no CAS needed */
-            }
-        }
+        ensure_strategy_sum(is);
+        float *ss = __atomic_load_n((float**)&is->strategy_sum, __ATOMIC_ACQUIRE);
+        if (!ss) continue;
 
         regret_match(is->regrets, strat_buf, na);
         for (int a = 0; a < na; a++)
-            is->strategy_sum[a] += strat_buf[a];
+            ss[a] += strat_buf[a];
     }
 }
 
 /* ── Linear CFR discount ─────────────────────────────────────────── */
 
+/* Called from within an existing outer parallel region. */
 static void apply_discount(BPInfoTable *t, float discount) {
+    #pragma omp for schedule(static, 65536) nowait
     for (int64_t i = 0; i < t->table_size; i++) {
         if (!t->occupied[i]) continue;
         BPInfoSet *is = &t->sets[i];
@@ -1807,6 +1809,74 @@ int bp_solve(BPSolver *s, int64_t max_iterations) {
            NP, (long long)max_iterations, nt, (long long)s->info_table.table_size,
            s->use_buckets ? "yes" : "no");
 
+    /* Pre-fault all hash table pages to avoid kernel mm_lock contention
+     * during the first few minutes of solving. With lazy allocation, the
+     * first random access to each empty slot triggers a page fault that
+     * holds a kernel lock. With 192 threads doing random probes, this
+     * serializes through mm_lock and tanks throughput to ~5K iter/s.
+     *
+     * Strategy: madvise(MADV_POPULATE_WRITE) on the page-aligned interior
+     * of each array. madvise requires page-aligned addresses, but calloc
+     * doesn't guarantee that. We round the start up and the length down
+     * to page boundaries — the few KB of un-aligned head/tail will get
+     * lazily faulted, which is fine since it's microscopic. */
+    {
+        BPInfoTable *t = &s->info_table;
+        printf("[BP] Pre-faulting hash table pages...\n");
+        fflush(stdout);
+        #ifdef _OPENMP
+        double prefault_start = omp_get_wtime();
+        #endif
+
+        long pagesize = sysconf(_SC_PAGESIZE);
+        if (pagesize <= 0) pagesize = 4096;
+
+        struct { void *addr; size_t len; const char *name; } regions[] = {
+            { t->occupied, (size_t)t->table_size * sizeof(int), "occupied" },
+            { t->keys,     (size_t)t->table_size * sizeof(BPInfoKey), "keys" },
+            { t->sets,     (size_t)t->table_size * sizeof(BPInfoSet), "sets" },
+        };
+
+        for (size_t r = 0; r < 3; r++) {
+            uintptr_t start = (uintptr_t)regions[r].addr;
+            uintptr_t end = start + regions[r].len;
+            uintptr_t aligned_start = (start + pagesize - 1) & ~((uintptr_t)pagesize - 1);
+            uintptr_t aligned_end = end & ~((uintptr_t)pagesize - 1);
+            if (aligned_end <= aligned_start) continue;
+            size_t aligned_len = aligned_end - aligned_start;
+
+            int used_madvise = 0;
+            #ifdef MADV_POPULATE_WRITE
+            if (madvise((void*)aligned_start, aligned_len, MADV_POPULATE_WRITE) == 0) {
+                used_madvise = 1;
+            } else {
+                fprintf(stderr, "[BP] madvise(%s) failed: %s — falling back to write loop\n",
+                        regions[r].name, strerror(errno));
+            }
+            #endif
+
+            if (!used_madvise) {
+                /* Explicit page-stride writes. Volatile prevents the compiler
+                 * from optimizing the read-write pair away. Each write to a
+                 * virgin page triggers CoW, allocating a real physical page. */
+                volatile char *p = (volatile char*)aligned_start;
+                #pragma omp parallel for schedule(static)
+                for (size_t i = 0; i < aligned_len; i += (size_t)pagesize) {
+                    char v = p[i];
+                    p[i] = v;
+                }
+            }
+        }
+
+        #ifdef _OPENMP
+        printf("[BP] Pre-fault complete in %.1fs\n",
+               omp_get_wtime() - prefault_start);
+        #else
+        printf("[BP] Pre-fault complete\n");
+        #endif
+        fflush(stdout);
+    }
+
     #ifdef _OPENMP
     double t_start = omp_get_wtime();
     #else
@@ -1834,9 +1904,36 @@ int bp_solve(BPSolver *s, int64_t max_iterations) {
         discount_count = iter_offset / s->config.discount_interval;
         next_discount_at = (discount_count + 1) * s->config.discount_interval;
     }
-    int64_t batch_size = s->config.discount_interval;
-    if (batch_size <= 0 || batch_size > max_iterations) batch_size = max_iterations;
+
+    /* Batch size for the OpenMP parallel-for loop. This is INDEPENDENT
+     * of discount_interval — they used to be the same variable, which
+     * tanked parallelism: with discount_interval=10000 and chunk_size=64,
+     * a batch had only 156 chunks for 192 threads → 36+ idle threads at
+     * every barrier.
+     *
+     * Rules:
+     *   - During discount phase: batch_size MUST be <= discount_interval
+     *     so we don't miss discount triggers (one discount per batch).
+     *   - After discount phase: use a much larger batch (10M) so 192
+     *     threads with chunk 64 have ~150K chunks of work — full parallelism.
+     *   - Snapshots fire when (global_batch_end % snapshot_interval) < batch_size,
+     *     which works for both small and large batch sizes.
+     */
+    int64_t batch_size;
+    int64_t global_start_iter = iter_offset + 1;
+    if (global_start_iter <= s->config.discount_stop_iter) {
+        batch_size = s->config.discount_interval;
+        if (batch_size <= 0) batch_size = max_iterations;
+    } else {
+        /* Past discount phase — use 10M batch for parallelism. */
+        batch_size = 10000000;
+    }
+    if (batch_size > max_iterations) batch_size = max_iterations;
     int64_t num_batches = (max_iterations + batch_size - 1) / batch_size;
+    printf("[BP] batch_size=%lld (%lld batches), discount_phase=%s\n",
+           (long long)batch_size, (long long)num_batches,
+           (global_start_iter <= s->config.discount_stop_iter) ? "yes" : "no");
+    fflush(stdout);
 
     #ifdef _OPENMP
     #pragma omp parallel if(nt > 1)
@@ -1951,50 +2048,78 @@ int bp_solve(BPSolver *s, int64_t max_iterations) {
 
                 if (tid == 0) {
                     s->iterations_run = global_iter;
-                    if (iter % 10000 == 0 || iter == 1 || iter == max_iterations) {
-                        #ifdef _OPENMP
-                        double elapsed = omp_get_wtime() - t_start;
-                        #else
-                        double elapsed = (double)(clock() - t_start) / CLOCKS_PER_SEC;
-                        #endif
-                        printf("[BP] iter %lld/%lld (global %lld), info sets: %lld, %.1fs\n",
-                               (long long)iter, (long long)max_iterations, (long long)global_iter, (long long)s->info_table.num_entries, elapsed);
-                        fflush(stdout);
-                    }
                 }
             }
             /* implicit barrier after omp for */
 
-            /* Thread 0 applies discount and snapshots between batches.
-             * Other threads wait at the barrier below. */
+            /* Decide whether to discount/snapshot in omp single, then run
+             * the parallel work OUTSIDE the single block using the existing
+             * team. This avoids nested parallelism which was silently
+             * serializing accumulate_snapshot/apply_discount.
+             *
+             * The variables below are thread-private. We use `copyprivate`
+             * on the omp single to broadcast the values to all threads. */
+            int do_discount = 0;
+            int do_snapshot = 0;
+            float discount_value = 0.0f;
+            int64_t global_batch_end = (int64_t)batch_end + iter_offset;
+
             #ifdef _OPENMP
-            #pragma omp single
+            #pragma omp single copyprivate(do_discount, do_snapshot, discount_value)
             #endif
             {
-                /* Linear CFR discount: d = T/(T+1) every interval */
-                int64_t global_batch_end = (int64_t)batch_end + iter_offset;
+                /* Per-batch progress print */
+                #ifdef _OPENMP
+                double elapsed = omp_get_wtime() - t_start;
+                #else
+                double elapsed = (double)(clock() - t_start) / CLOCKS_PER_SEC;
+                #endif
+                double rate = (batch_end > 0 && elapsed > 0) ? (double)batch_end / elapsed : 0.0;
+                printf("[BP] batch %lld/%lld done at iter %lld (global %lld), "
+                       "%.1fs, %.0f iter/s, info sets: %lld\n",
+                       (long long)(batch + 1), (long long)num_batches,
+                       (long long)batch_end, (long long)global_batch_end,
+                       elapsed, rate, (long long)s->info_table.num_entries);
+                fflush(stdout);
+
+                /* Decide whether to discount this batch */
                 if (global_batch_end <= s->config.discount_stop_iter &&
                     global_batch_end >= next_discount_at) {
                     discount_count++;
                     float t_val = (float)discount_count;
-                    float discount = t_val / (t_val + 1.0f);
-                    apply_discount(&s->info_table, discount);
+                    discount_value = t_val / (t_val + 1.0f);
                     next_discount_at = (discount_count + 1) * s->config.discount_interval;
-                    printf("[BP] Applied Linear CFR discount #%lld: d=%.4f at iter %lld\n",
-                           (long long)discount_count, discount, (long long)global_batch_end);
+                    do_discount = 1;
+                    printf("[BP] Applying Linear CFR discount #%lld: d=%.4f at iter %lld\n",
+                           (long long)discount_count, discount_value, (long long)global_batch_end);
                 }
 
-                /* Strategy snapshots for rounds 2-4 */
+                /* Decide whether to snapshot */
                 if (global_batch_end >= s->config.snapshot_start_iter &&
                     s->config.snapshot_interval > 0 &&
                     (global_batch_end % s->config.snapshot_interval) < batch_size) {
-                    accumulate_snapshot(&s->info_table);
+                    do_snapshot = 1;
                     s->snapshots_saved++;
-                    printf("[BP] Accumulated strategy snapshot #%lld at iter %lld\n",
+                    printf("[BP] Accumulating strategy snapshot #%lld at iter %lld\n",
                            (long long)s->snapshots_saved, (long long)global_batch_end);
+                    fflush(stdout);
                 }
             }
-            /* implicit barrier after omp single */
+            /* After copyprivate: all threads have do_discount/do_snapshot/
+             * discount_value set to the same values. */
+
+            /* Run the discount/snapshot in parallel using the existing
+             * thread team. These functions use `#pragma omp for nowait`. */
+            if (do_discount) {
+                apply_discount(&s->info_table, discount_value);
+            }
+            if (do_snapshot) {
+                accumulate_snapshot(&s->info_table);
+            }
+            /* Explicit barrier: ensure all threads finish before next batch. */
+            #ifdef _OPENMP
+            #pragma omp barrier
+            #endif
         }
     } /* end parallel */
 
