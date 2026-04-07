@@ -85,19 +85,62 @@ def generate_hand_grid():
     return hands
 
 
+def _build_c_bucket_map():
+    """Build the same hand-class → bucket index mapping that the C training code
+    constructs in mccfr_blueprint.c init_unified() (lines ~1383-1394).
+
+    The C code iterates rank pairs from high to low (Ace = rank 12 down to deuce = rank 0):
+
+        for r0 in 12..0:
+            for r1 in r0..0:
+                if r0 == r1:        pair → 1 class
+                else:               suited then offsuit → 2 classes
+
+    So the bucket order is:
+        AA(0), AKs(1), AKo(2), AQs(3), AQo(4), AJs(5), AJo(6), ..., A2s(23), A2o(24),
+        KK(25), KQs(26), KQo(27), ..., K2s(47), K2o(48),
+        QQ(49), ...
+        ...
+        22(168)
+
+    The C uses rank values where 0=2 and 12=A (from card_int / 4). Our Python uses
+    RANKS = "AKQJT98765432" where A is at string index 0, so we have to invert:
+    rank_value = 12 - RANKS.index(char).
+
+    Returns a dict mapping hand string ('AA', 'AKs', 'AKo', ...) → C bucket index.
+    """
+    bucket_map = {}
+    n = 0
+    for r0_val in range(12, -1, -1):
+        for r1_val in range(r0_val, -1, -1):
+            r0_char = RANKS[12 - r0_val]
+            r1_char = RANKS[12 - r1_val]
+            if r0_val == r1_val:
+                bucket_map[r0_char + r1_char] = n
+                n += 1
+            else:
+                # Suited first, then offsuit (per C class_map)
+                bucket_map[r0_char + r1_char + "s"] = n
+                n += 1
+                bucket_map[r0_char + r1_char + "o"] = n
+                n += 1
+    assert n == 169, f"Expected 169 classes, got {n}"
+    return bucket_map
+
+
+_C_BUCKET_MAP = _build_c_bucket_map()
+
+
 def hand_class_to_bucket(hand):
-    """Map a hand string like 'AA', 'AKs', 'AKo' to its bucket index (0-168)."""
-    if len(hand) == 2:
-        return RANKS.index(hand[0])
-    r0, r1 = RANKS.index(hand[0]), RANKS.index(hand[1])
-    is_suited = hand.endswith("s")
-    offset = 13 if is_suited else 91
-    for i in range(13):
-        for j in range(i + 1, 13):
-            if i == r0 and j == r1:
-                return offset
-            offset += 1
-    return 0
+    """Map a hand string like 'AA', 'AKs', 'AKo' to its C bucket index (0-168).
+
+    MUST match the bucket numbering in mccfr_blueprint.c init_unified() exactly,
+    because the .bps stores strategies indexed by this convention. Using a
+    different convention silently scrambles the per-hand strategy mapping
+    (every cell in the range grid shows a different hand's strategy than its
+    label) — see docs/EXTRACTOR_BUGS.md Bug A.
+    """
+    return _C_BUCKET_MAP[hand]
 
 
 def enumerate_actions_chips(to_call_c, pot_c, stack_c, current_committed_c, num_raises, max_raises):
@@ -345,6 +388,96 @@ def get_or_build_cached_table(bps_path):
     return table
 
 
+def verify_utg_root_sanity(out_nodes, hand_grid):
+    """Sanity-check the extracted UTG root strategies against known-good frequencies.
+
+    Catches bucket-mapping bugs (Bug A in EXTRACTOR_BUGS.md), data corruption, and
+    upstream training collapse. Refuses to write the JSON if too many sentinels fail.
+
+    The thresholds are deliberately loose because the .bps currently contains
+    regret-matched per-iteration strategies (not the converged strategy_sum average,
+    see EXTRACTOR_BUGS Bug B). After Bug B is fixed upstream, we can tighten these.
+
+    Sentinels (UTG = first to act in 6-max, the tightest position):
+        Premium hands must NOT fold:
+            AA, KK, AKs, AKo  -> fold <= 0.15
+        Trash hands MUST fold:
+            72o, 32o          -> fold >= 0.95
+        Small pairs and weak suited fold UTG 6-max:
+            22, 52s           -> fold >= 0.85
+
+    Raises ValueError if 2 or more sentinels fail (1 is noise, 2 is structural).
+    """
+    import base64
+    import numpy as np
+
+    root = out_nodes.get(ROOT_HASH_HEX)
+    if root is None:
+        raise ValueError(
+            f"UTG root node ({ROOT_HASH_HEX}) missing from extraction. "
+            "Either the tree walker failed to enumerate it or the .bps doesn't contain it."
+        )
+
+    labels = root["l"]
+    na = len(labels)
+    buf = np.frombuffer(base64.b64decode(root["s"]), dtype=np.uint8).reshape(169, na)
+
+    if "fold" not in labels:
+        raise ValueError(f"UTG root has no 'fold' label: {labels}")
+    fold_idx = labels.index("fold")
+
+    sentinels = [
+        # (hand, max_fold_freq or None, min_fold_freq or None, description)
+        ("AA",  0.15, None, "premium pair never folds"),
+        ("KK",  0.15, None, "premium pair never folds"),
+        ("AKs", 0.15, None, "AKs never folds UTG"),
+        ("AKo", 0.20, None, "AKo never folds UTG"),
+        ("72o", None, 0.95, "trash always folds UTG"),
+        ("32o", None, 0.95, "trash always folds UTG"),
+        ("22",  None, 0.85, "small pair folds UTG 6-max"),
+        ("52s", None, 0.85, "weak suited folds UTG 6-max"),
+    ]
+
+    failures = []
+    print(f"  {'hand':6s} {'fold':>8s}  {'expected':12s}  status")
+    print(f"  {'-'*6} {'-'*8}  {'-'*12}  {'-'*30}")
+    for hand, max_fold, min_fold, desc in sentinels:
+        if hand not in hand_grid:
+            failures.append(f"{hand}: not in hand_grid")
+            continue
+        idx = hand_grid.index(hand)
+        fold_freq = float(buf[idx, fold_idx]) / 255.0
+
+        if max_fold is not None:
+            ok = fold_freq <= max_fold
+            expected = f"<= {max_fold:.2f}"
+        else:
+            ok = fold_freq >= min_fold
+            expected = f">= {min_fold:.2f}"
+
+        status = "OK" if ok else "FAIL"
+        print(f"  {hand:6s} {fold_freq:8.3f}  {expected:12s}  {status}  ({desc})")
+        if not ok:
+            failures.append(f"{hand}: fold={fold_freq:.3f}, expected {expected}")
+
+    if len(failures) >= 2:
+        msg = (
+            f"\n  EXTRACTION FAILED VERIFICATION ({len(failures)}/{len(sentinels)} sentinels failed):\n"
+            + "\n".join(f"    - {f}" for f in failures)
+            + "\n  This usually means the bucket mapping in hand_class_to_bucket() is wrong."
+            + "\n  See poker-solver/docs/EXTRACTOR_BUGS.md Bug A for details."
+            + "\n  Refusing to write preflop-nodes.json — fix the bug first."
+        )
+        raise ValueError(msg)
+
+    if failures:
+        print(f"  WARNING: 1 sentinel failed (allowed as noise tolerance):", flush=True)
+        for f in failures:
+            print(f"    - {f}", flush=True)
+    else:
+        print(f"  All {len(sentinels)} sentinels passed.", flush=True)
+
+
 def compute_nodes_by_tree_walk(max_depth=8):
     """Enumerate reachable preflop tree nodes up to max_depth actions deep.
 
@@ -552,6 +685,9 @@ def main():
     print(f"  Missing from .bps: {missing:,} (unreachable / pruned during training)",
           flush=True)
     print(f"  Label mismatches: {label_mismatch:,}", flush=True)
+
+    print(f"\nStep 3.5: Sanity-checking UTG root strategies...", flush=True)
+    verify_utg_root_sanity(out_nodes, hand_grid)
 
     result = {
         "meta": {
