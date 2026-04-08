@@ -20,16 +20,16 @@
 
 set -euo pipefail
 
-REGION="${AWS_REGION:-us-east-1}"
+REGION="${AWS_REGION:-us-east-2}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-c7a.metal-48xl}"  # 192 vCPU, 384 GB
 KEY_NAME="${KEY_NAME:-poker-solver-key}"
 SECURITY_GROUP="${SECURITY_GROUP:-poker-solver-sg}"
-S3_BUCKET="${S3_BUCKET:-poker-blueprint-unified-v2}"  # v2: isolated from v1
+S3_BUCKET="${S3_BUCKET:-poker-blueprint-unified-v3}"  # v3: isolated from v2, new region us-east-2
 PROFILE_NAME="poker-solver-profile"
 
 HOURS=192           # 8 days (Pluribus)
-ITER_TARGET=8000000000  # 8B iters (~74h on 192 threads at 30K iter/s, ~Pluribus core-hour eq + buffer)
-HASH_SIZE=2000000000    # 2B slots (~52% load at 1.05B entries — safe linear-probing regime)
+ITER_TARGET=8000000000  # 8B iters (~66-74h on 192 threads at 30-35K iter/s, ~Pluribus core-hour eq + buffer)
+HASH_SIZE=3500000000    # 3.5B slots (~51% load at projected 1.8B entries — v2 was 2B slots, hit 90% projected load and failed)
 USE_SPOT=1              # 1 = spot one-time terminate-on-interruption, 0 = on-demand
 DRY_RUN=0
 STATUS_ONLY=0
@@ -82,7 +82,7 @@ fi
 MEM_GB=$(echo "$HASH_SIZE * 40 / 1073741824" | bc 2>/dev/null || echo "20")
 
 echo "============================================"
-echo "  Unified Pluribus Blueprint"
+echo "  Unified Pluribus Blueprint v3"
 echo "============================================"
 echo "Instance:    $INSTANCE_TYPE"
 echo "Runtime:     ${HOURS}h ($(echo "$HOURS / 24" | bc 2>/dev/null || echo '?') days)"
@@ -128,6 +128,17 @@ aws s3 sync "$PROJECT_DIR/python" "s3://$S3_BUCKET/code/python/" \
     --quiet --exclude "__pycache__/*" --exclude "*.pyc"
 aws s3 sync "$PROJECT_DIR/tests" "s3://$S3_BUCKET/code/tests/" \
     --quiet --exclude "*.o" --exclude "__pycache__/*"
+
+# Upload the dashboard monitor script (lives in /tmp, not in the repo).
+# The user-data script fetches this from S3 at boot and runs it in the
+# background alongside the solver. See /tmp/hashprobe/monitor_v3.py.
+if [ -f "/tmp/hashprobe/monitor_v3.py" ]; then
+    aws s3 cp /tmp/hashprobe/monitor_v3.py "s3://$S3_BUCKET/code/monitor_v3.py" --quiet
+    echo "Monitor script uploaded."
+else
+    echo "WARNING: /tmp/hashprobe/monitor_v3.py not found — dashboard monitor will not start"
+fi
+
 echo "Code uploaded."
 
 USERDATA=$(cat <<USERDATA
@@ -135,7 +146,7 @@ USERDATA=$(cat <<USERDATA
 set -euxo pipefail
 exec > /var/log/blueprint-unified.log 2>&1
 
-echo "=== Unified Blueprint v2 starting at \$(date) ==="
+echo "=== Unified Blueprint v3 starting at \$(date) ==="
 
 # Bug α fix: install numactl for NUMA interleave (required by --interleave=all
 # wrapper below). Without this the python solver runs on a single NUMA node and
@@ -166,6 +177,19 @@ echo "Texture cache: \$(ls -lh /tmp/texture_cache.bin 2>/dev/null || echo 'not f
 
 # Show NUMA topology for diagnosis
 numactl --hardware >> /var/log/blueprint-unified.log 2>&1 || true
+
+# Start the dashboard status monitor in the background. It polls
+# /var/log/blueprint-unified.log every 60s and writes status.json to the
+# public poker-solver-dashboard S3 bucket. Monitor logs go to
+# /var/log/monitor.log. Dies with the instance.
+aws s3 cp s3://$S3_BUCKET/code/monitor_v3.py /opt/monitor_v3.py --quiet 2>/dev/null || true
+if [ -f /opt/monitor_v3.py ]; then
+    chmod +x /opt/monitor_v3.py
+    nohup python3 /opt/monitor_v3.py > /var/log/monitor.log 2>&1 &
+    echo "Dashboard monitor started (PID \$!)"
+else
+    echo "WARNING: monitor_v3.py not found on S3, dashboard will not update"
+fi
 
 # Bug α fix: pin threads to specific cores via OMP_PROC_BIND=spread +
 # OMP_PLACES=cores. Without this, the OS bounces threads between cores at
@@ -218,7 +242,7 @@ INSTANCE_ID=$(aws ec2 run-instances \
     --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":200,"VolumeType":"gp3"}}]' \
     $SPOT_ARGS \
     --user-data "$USERDATA_B64" \
-    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=bp-unified-v2},{Key=Project,Value=poker-solver-unified-v2}]" \
+    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=bp-unified-v3},{Key=Project,Value=poker-solver-unified-v3}]" \
     --query "Instances[0].InstanceId" \
     --output text)
 
