@@ -76,6 +76,16 @@ def main():
     bp.bp_load_regrets.restype = ctypes.c_int
     bp.bp_load_regrets.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
     bp.bp_free.restype = None
+
+    # Phase 1.3: action EV computation + export bindings
+    bp.bp_compute_action_evs.restype = ctypes.c_int
+    bp.bp_compute_action_evs.argtypes = [ctypes.c_void_p, ctypes.c_int64]
+    bp.bp_export_action_evs.restype = ctypes.c_int
+    bp.bp_export_action_evs.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_size_t)
+    ]
+
     timings["dll_load"] = time.time() - t0
     print(f"[{timings['dll_load']:.2f}s] DLL loaded", flush=True)
 
@@ -137,17 +147,62 @@ def main():
     strat_data = bytes(strat_buf[:written.value])
     timings["export_strategies"] = time.time() - t0
     print(f"[{timings['export_strategies']:.2f}s] Exported {written.value / (1024**2):.1f} MB", flush=True)
+    del strat_buf
+
+    # ── Phase 1.3: σ̄-sampled per-action EV walk ────────────────────
+    # Compute per-action EVs under the average strategy, so that
+    # leaf_values.py's get_turn_action_evs() can return real values
+    # instead of None (which currently forces the equity fallback).
+    #
+    # Iteration count is controlled via EV_WALK_ITERS env var; default 50M.
+    # At 50M iterations on an 8-thread box this should complete in 2-5 min.
+    # See docs/PHASE_1_3_DESIGN.md for the algorithm.
+    ev_walk_iters = int(os.environ.get("EV_WALK_ITERS", "50000000"))
+    action_evs_data = b""
+    if ev_walk_iters > 0:
+        t0 = time.time()
+        print(f"Phase 1.3: computing action EVs ({ev_walk_iters:,} iters)...", flush=True)
+        ret = bp.bp_compute_action_evs(solver, ctypes.c_int64(ev_walk_iters))
+        timings["compute_action_evs"] = time.time() - t0
+        if ret != 0:
+            print(f"WARNING: bp_compute_action_evs returned {ret}, skipping EV export", flush=True)
+        else:
+            print(f"[{timings['compute_action_evs']:.2f}s] Action EV walk complete", flush=True)
+            # Query size
+            t0 = time.time()
+            ev_needed = ctypes.c_size_t(0)
+            bp.bp_export_action_evs(solver, None, 0, ctypes.byref(ev_needed))
+            ev_size = ev_needed.value
+            print(f"Action EV buffer: {ev_size / (1024**2):.1f} MB", flush=True)
+            if ev_size > 0:
+                ev_buf = (ctypes.c_char * ev_size)()
+                ev_written = ctypes.c_size_t(0)
+                bp.bp_export_action_evs(solver, ev_buf, ev_size, ctypes.byref(ev_written))
+                action_evs_data = bytes(ev_buf[:ev_written.value])
+                del ev_buf
+                timings["export_action_evs"] = time.time() - t0
+                print(f"[{timings['export_action_evs']:.2f}s] Exported {ev_written.value / (1024**2):.1f} MB of action EVs", flush=True)
+    else:
+        print("Phase 1.3: skipped (EV_WALK_ITERS=0)", flush=True)
 
     # Free solver before compress (reclaim ~60 GB)
     bp.bp_free(solver)
-    del buf, strat_buf
+    del buf
     print("Solver freed, starting compression...", flush=True)
 
-    # LZMA compress
+    # LZMA compress strategies
     t0 = time.time()
     compressed = lzma.compress(strat_data, preset=1)
     timings["lzma_compress"] = time.time() - t0
-    print(f"[{timings['lzma_compress']:.2f}s] Compressed: {len(compressed) / (1024**2):.1f} MB", flush=True)
+    print(f"[{timings['lzma_compress']:.2f}s] Compressed strategies: {len(compressed) / (1024**2):.1f} MB", flush=True)
+
+    # Phase 1.3: LZMA compress action EVs separately (skipped if empty)
+    compressed_evs = b""
+    if action_evs_data:
+        t0 = time.time()
+        compressed_evs = lzma.compress(action_evs_data, preset=1)
+        timings["lzma_compress_evs"] = time.time() - t0
+        print(f"[{timings['lzma_compress_evs']:.2f}s] Compressed action EVs: {len(compressed_evs) / (1024**2):.1f} MB", flush=True)
 
     # Try to derive iteration count and code SHA from the regret file path
     # and the source repo. Best-effort — both fields are optional but useful.
@@ -169,10 +224,13 @@ def main():
     except Exception:
         pass
 
-    # Write BPS3 file. Schema v2: full tier sizing + provenance.
+    # Write BPS3 file. Schema v3 adds per-action EVs as a trailing section
+    # after the metadata; backward-compatible with v2 readers (they stop at
+    # meta_bytes and ignore the trailing data).
+    has_action_evs = len(compressed_evs) > 0
     meta = {
         "type": "unified_blueprint",
-        "schema_version": 2,
+        "schema_version": 3 if has_action_evs else 2,
         "num_players": NUM_PLAYERS,
         "blinds": [SMALL_BLIND, BIG_BLIND],
         "initial_stack": INITIAL_STACK,
@@ -195,16 +253,30 @@ def main():
         # average-strategy data, not regret-matched-current data.
         "strategy_extraction_method": "strategy_sum_avg",
         "training_complete": True,
+        # Phase 1.3: per-action EVs under the average strategy, computed
+        # post-hoc via σ̄-sampled MCCFR walk. See docs/PHASE_1_3_DESIGN.md.
+        "has_action_evs": has_action_evs,
+        "action_evs_compute_method": "posthoc_sigma_bar_walk" if has_action_evs else None,
+        "action_evs_walk_iterations": ev_walk_iters if has_action_evs else 0,
     }
     meta_bytes = json.dumps(meta, separators=(",", ":")).encode("utf-8")
 
     os.makedirs(output_dir, exist_ok=True)
     bps_path = os.path.join(output_dir, "unified_blueprint.bps")
     with open(bps_path, "wb") as f:
+        # BPS3 outer wrapper (unchanged from v2)
         f.write(b"BPS3")
         f.write(struct.pack("<QI", len(compressed), len(meta_bytes)))
         f.write(compressed)
         f.write(meta_bytes)
+
+        # Phase 1.3: optional trailing action-EV section.
+        # Format: magic "BPR3" (4B) + u64 compressed_size + compressed_payload
+        # Old readers that stop after meta_bytes are unaffected.
+        if has_action_evs:
+            f.write(b"BPR3")
+            f.write(struct.pack("<Q", len(compressed_evs)))
+            f.write(compressed_evs)
 
     bps_mb = os.path.getsize(bps_path) / (1024 * 1024)
     print(f"Wrote {bps_path} ({bps_mb:.1f} MB)", flush=True)

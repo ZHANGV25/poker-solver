@@ -85,6 +85,14 @@ typedef struct {
     int num_actions;
     int *regrets;          /* [num_actions], int32 */
     float *strategy_sum;   /* [num_actions] or NULL (lazy) */
+    float *action_evs;     /* [num_actions] or NULL (populated by bp_compute_action_evs).
+                            * Phase 1.3: sum of per-action expected values observed during
+                            * the σ̄-sampled EV walk. Average EV = action_evs[a] / ev_visit_count.
+                            * See docs/PHASE_1_3_DESIGN.md. Arena-allocated lazily on first
+                            * traverser visit during the EV walk. NULL until then. */
+    int ev_visit_count;    /* Phase 1.3: number of traverser visits that contributed to
+                            * action_evs during the EV walk. Used to normalize the
+                            * accumulated EVs into averages at export time. Relaxed atomic. */
 } BPInfoSet;
 
 /* Hash table (open addressing, linear probing) */
@@ -411,6 +419,54 @@ BP_EXPORT int bp_save_regrets(const BPSolver *s, const char *path);
  * Returns number of entries loaded, or -1 on error.
  */
 BP_EXPORT int64_t bp_load_regrets(BPSolver *s, const char *path);
+
+/**
+ * Phase 1.3: Compute per-action expected values under the average strategy σ̄.
+ *
+ * Runs num_iterations of a modified MCCFR traversal where:
+ *   - Strategies at all decision nodes are sampled from strategy_sum (the
+ *     average strategy), not regret-matched from current regrets.
+ *   - At traverser nodes, per-action EVs `action_values[a]` are accumulated
+ *     into `is->action_evs[a]` and `is->ev_visit_count` is incremented.
+ *   - Regrets and strategy_sum are NOT updated (read-only with respect to
+ *     the underlying blueprint).
+ *
+ * After this runs, `action_evs[a] / ev_visit_count` is an unbiased estimator
+ * of `v̄(I, a)` — the counterfactual value of action `a` at info set `I`
+ * under the average strategy. See docs/PHASE_1_3_DESIGN.md for the math.
+ *
+ * Must be called AFTER bp_load_regrets or bp_solve so that strategy_sum is
+ * populated. Must be called BEFORE bp_export_action_evs.
+ *
+ * Multi-threaded via OpenMP (same thread count as bp_solve).
+ *
+ * Returns 0 on success.
+ */
+BP_EXPORT int bp_compute_action_evs(BPSolver *s, int64_t num_iterations);
+
+/**
+ * Phase 1.3: Export per-action EVs to a binary buffer.
+ *
+ * For each occupied slot with ev_visit_count > 0, writes:
+ *   player(1) + street(1) + bucket(2) + action_hash(8) + num_actions(1)
+ *   + float32[num_actions] avg_ev (= action_evs[a] / ev_visit_count)
+ *
+ * Header: "BPR3" (4) + u32 num_entries
+ *
+ * Info sets with ev_visit_count == 0 are skipped. Consumer should fall back
+ * to equity approximation at those info sets.
+ *
+ * Args:
+ *   s: solver state (after bp_compute_action_evs)
+ *   buf: output buffer (pre-allocated; pass NULL to query required size)
+ *   buf_size: size of buf in bytes
+ *   bytes_written: output, actual bytes written (or required size if buf=NULL)
+ *
+ * Returns 0 on success, -1 if buffer too small.
+ */
+BP_EXPORT int bp_export_action_evs(const BPSolver *s,
+                                    unsigned char *buf, size_t buf_size,
+                                    size_t *bytes_written);
 
 /**
  * Export EHS values and bucket assignments for all hands.

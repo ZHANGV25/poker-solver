@@ -600,6 +600,21 @@ static void ensure_strategy_sum(BPInfoSet *is) {
     }
 }
 
+/* Phase 1.3: allocate action_evs accumulator for an info set. Lazy
+ * allocation on first traverser visit during the EV walk. Arena-backed.
+ * See docs/PHASE_1_3_DESIGN.md for the algorithm. */
+static void ensure_action_evs(BPInfoSet *is) {
+    if (__atomic_load_n((void**)&is->action_evs, __ATOMIC_ACQUIRE) == NULL) {
+        float *buf = (float*)arena_alloc(is->num_actions);
+        if (!buf) return;
+        float *expected = NULL;
+        if (!__atomic_compare_exchange_n(&is->action_evs, &expected, buf,
+                                          0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            /* CAS lost, buf wasted — same trade-off as strategy_sum. */
+        }
+    }
+}
+
 static void info_table_free(BPInfoTable *t) {
     /* Both regrets and strategy_sum are arena-allocated — freed in bulk */
     arena_free_all();
@@ -638,6 +653,37 @@ static void regret_match(const int *regrets, float *strategy, int num_actions) {
         for (int a = 0; a < num_actions; a++)
             strategy[a] = u;
     }
+}
+
+/* Phase 1.3: Extract the AVERAGE strategy σ̄ from strategy_sum (or fall
+ * back to regret-matched σ if strategy_sum is NULL for this info set).
+ * Mirrors the computation inside bp_get_strategy() but operates on a
+ * BPInfoSet pointer directly (no hash lookup).
+ *
+ * This is the sampling distribution used by traverse_ev() at both
+ * traverser and opponent decision nodes — we want to measure action EVs
+ * under the blueprint's average strategy, not the current regret-matched
+ * strategy that training was mid-optimizing. */
+static void avg_strategy(const BPInfoSet *is, float *out, int num_actions) {
+    float *ss = __atomic_load_n((float**)&is->strategy_sum, __ATOMIC_ACQUIRE);
+    if (ss) {
+        float sum = 0;
+        for (int a = 0; a < num_actions; a++) {
+            float v = ss[a];
+            if (v < 0) v = 0;
+            out[a] = v;
+            sum += v;
+        }
+        if (sum > 0) {
+            float inv = 1.0f / sum;
+            for (int a = 0; a < num_actions; a++) out[a] *= inv;
+            return;
+        }
+    }
+    /* No strategy_sum or zero sum — fall back to regret matching.
+     * This happens for info sets that were only visited during pruning or
+     * never had strategy_sum accumulated. Best we can do. */
+    regret_match(is->regrets, out, num_actions);
 }
 
 static int sample_action(const float *strategy, int num_actions, uint64_t *rng) {
@@ -1436,6 +1482,428 @@ static float traverse(TraversalState *ts, int acting_order_idx,
         }
 
         return traverse(&child, next_order, acting_order, num_in_order);
+    }
+}
+
+/* ── Phase 1.3: σ̄-sampled EV walk ────────────────────────────────── */
+
+/* traverse_ev() is a read-only sibling of traverse() that computes per-action
+ * expected values under the average strategy σ̄. Changes from traverse():
+ *   1. Strategies sourced from avg_strategy() (strategy_sum normalized, with
+ *      regret_match fallback), not from regret_match on current regrets.
+ *   2. At traverser nodes, exhaustively enumerates actions (same as traverse),
+ *      but instead of updating regrets, accumulates action_values[a] into
+ *      is->action_evs[a] and increments is->ev_visit_count.
+ *   3. At opponent nodes, samples one action from σ̄ (external sampling).
+ *   4. No regret updates, no strategy_sum updates. Read-only with respect
+ *      to training state.
+ *   5. Pruning DISABLED — we want to measure EVs for ALL actions, including
+ *      those training pruned away (they may still matter for biased
+ *      continuation strategies at depth-limited leaves).
+ *
+ * See docs/PHASE_1_3_DESIGN.md for the full math. */
+static float traverse_ev(TraversalState *ts, int acting_order_idx,
+                         const int *acting_order, int num_in_order);
+
+static float traverse_ev(TraversalState *ts, int acting_order_idx,
+                         const int *acting_order, int num_in_order) {
+    BPSolver *s = ts->solver;
+    int NP = s->num_players;
+    int n_active = count_active(ts->active, NP);
+
+    /* Terminal: all folded */
+    if (n_active <= 1) {
+        for (int p = 0; p < NP; p++) {
+            if (ts->active[p]) {
+                if (p == ts->traverser)
+                    return (float)(ts->pot - ts->invested[ts->traverser]);
+                else
+                    return -(float)ts->invested[ts->traverser];
+            }
+        }
+        return 0;
+    }
+
+    /* Round complete -> next street or showdown */
+    if (round_done(ts->bets, ts->active, ts->has_acted, NP)) {
+        if (ts->num_board >= 5) {
+            return eval_showdown_n(s, ts->board, ts->traverser,
+                                    ts->active, ts->sampled_hands,
+                                    ts->pot, ts->invested);
+        }
+
+        /* Build blocked set: board cards + all active players' cards */
+        int blocked[52] = {0};
+        for (int b = 0; b < ts->num_board; b++) blocked[ts->board[b]] = 1;
+        for (int p = 0; p < NP; p++) {
+            if (!ts->active[p]) continue;
+            int h = ts->sampled_hands[p];
+            blocked[s->hands[p][h][0]] = 1;
+            blocked[s->hands[p][h][1]] = 1;
+        }
+
+        int valid[52], nv = 0;
+        for (int c = 0; c < 52; c++)
+            if (!blocked[c]) valid[nv++] = c;
+        if (nv == 0) return 0;
+
+        TraversalState next = *ts;
+        memset(next.bets, 0, sizeof(next.bets));
+        memset(next.has_acted, 0, sizeof(next.has_acted));
+        next.num_raises = 0;
+
+        FlopBucketCache flop_cache_local;
+
+        if (ts->num_board == 0) {
+            /* Preflop -> Flop: deal 3 cards */
+            if (nv < 3) return 0;
+            partial_shuffle(valid, nv, 3, ts->rng);
+            next.board[0] = valid[0];
+            next.board[1] = valid[1];
+            next.board[2] = valid[2];
+            next.num_board = 3;
+
+            /* Look up precomputed 200-bucket mapping for this flop texture
+             * (same canonicalization logic as traverse() — see the extended
+             * comment there for the reasoning). */
+            if (s->num_cached_textures > 0) {
+                int sorted[3] = {next.board[0], next.board[1], next.board[2]};
+                for (int a = 0; a < 2; a++)
+                    for (int b = a+1; b < 3; b++)
+                        if ((sorted[a]>>2) < (sorted[b]>>2)) {
+                            int tmp = sorted[a]; sorted[a] = sorted[b]; sorted[b] = tmp;
+                        }
+
+                int r0 = sorted[0]>>2, r1 = sorted[1]>>2, r2 = sorted[2]>>2;
+                int s0 = sorted[0]&3, s1 = sorted[1]&3, s2 = sorted[2]&3;
+
+                int canon[3];
+                if (r0 == r1 && r1 == r2) {
+                    canon[0] = r0*4+3; canon[1] = r1*4+2; canon[2] = r2*4+1;
+                } else if (r0 == r1 || r1 == r2) {
+                    if (r0 == r1) {
+                        if (s2 == s0 || s2 == s1) {
+                            canon[0] = r0*4+3; canon[1] = r1*4+2; canon[2] = r2*4+3;
+                        } else {
+                            canon[0] = r0*4+3; canon[1] = r1*4+2; canon[2] = r2*4+1;
+                        }
+                    } else {
+                        if (s0 == s1 || s0 == s2) {
+                            canon[0] = r0*4+3; canon[1] = r1*4+3; canon[2] = r2*4+2;
+                        } else {
+                            canon[0] = r0*4+3; canon[1] = r1*4+2; canon[2] = r2*4+1;
+                        }
+                    }
+                } else {
+                    if (s0 == s1 && s1 == s2) {
+                        canon[0] = r0*4+3; canon[1] = r1*4+3; canon[2] = r2*4+3;
+                    } else if (s0 == s1) {
+                        canon[0] = r0*4+3; canon[1] = r1*4+3; canon[2] = r2*4+2;
+                    } else if (s0 == s2) {
+                        canon[0] = r0*4+3; canon[1] = r1*4+2; canon[2] = r2*4+3;
+                    } else if (s1 == s2) {
+                        canon[0] = r0*4+2; canon[1] = r1*4+3; canon[2] = r2*4+3;
+                    } else {
+                        canon[0] = r0*4+3; canon[1] = r1*4+2; canon[2] = r2*4+1;
+                    }
+                }
+
+                uint64_t flop_hash = compute_board_hash(canon, 3);
+                int found = texture_index_lookup(s, flop_hash);
+                if (found >= 0) {
+                    int *cache_row = &s->texture_bucket_cache[found * BP_MAX_HANDS];
+                    memcpy(flop_cache_local.buckets, cache_row, BP_MAX_HANDS * sizeof(int));
+                    flop_cache_local.num_buckets_actual = s->postflop_num_buckets;
+                    flop_cache_local.computed = 1;
+                    next.flop_cache = &flop_cache_local;
+                }
+
+                next.canon_board[0] = canon[0];
+                next.canon_board[1] = canon[1];
+                next.canon_board[2] = canon[2];
+                next.num_canon_board = 3;
+
+                for (int i = 0; i < 4; i++) next.suit_map[i] = -1;
+                for (int i = 0; i < 3; i++) {
+                    int actual_suit = sorted[i] & 3;
+                    int canon_suit = canon[i] & 3;
+                    if (next.suit_map[actual_suit] == -1)
+                        next.suit_map[actual_suit] = canon_suit;
+                }
+                int next_canon = 0;
+                for (int i = 0; i < 4; i++) {
+                    if (next.suit_map[i] == -1) {
+                        while (next_canon < 4) {
+                            int used = 0;
+                            for (int j = 0; j < 4; j++)
+                                if (next.suit_map[j] == next_canon) { used = 1; break; }
+                            if (!used) break;
+                            next_canon++;
+                        }
+                        if (next_canon < 4)
+                            next.suit_map[i] = next_canon++;
+                        else
+                            next.suit_map[i] = 0;
+                    }
+                }
+            }
+
+            int postflop_order[BP_MAX_PLAYERS];
+            for (int i = 0; i < NP; i++) postflop_order[i] = i;
+            return traverse_ev(&next, 0, postflop_order, NP);
+        } else {
+            /* Flop->Turn or Turn->River: deal 1 card */
+            int dealt = valid[rng_int(ts->rng, nv)];
+            next.board[next.num_board++] = dealt;
+            if (next.num_canon_board < 5) {
+                int rank = dealt >> 2;
+                int suit = dealt & 3;
+                int canon_suit = (suit >= 0 && suit < 4) ? next.suit_map[suit] : 0;
+                if (canon_suit < 0) canon_suit = 0;
+                next.canon_board[next.num_canon_board++] = rank * 4 + canon_suit;
+            }
+
+            /* Recompute turn/river bucket cache at deal time (same as traverse) */
+            if (next.num_board == 4 && s->turn_centroids_k > 0) {
+                for (int p = 0; p < NP; p++) {
+                    next.turn_bucket[p] = -1;
+                    if (!next.active[p]) continue;
+                    int ph[1][2];
+                    ph[0][0] = s->hands[p][next.sampled_hands[p]][0];
+                    ph[0][1] = s->hands[p][next.sampled_hands[p]][1];
+                    float feat[1][3];
+                    ca_compute_features(next.board, 4, (const int(*)[2])ph, 1, 200, feat);
+                    next.turn_bucket[p] = ca_nearest_centroid(
+                        feat[0], (const float(*)[3])s->turn_centroids,
+                        s->turn_centroids_k);
+                }
+            } else if (next.num_board == 5) {
+                for (int p = 0; p < NP; p++) {
+                    next.river_bucket[p] = -1;
+                    if (!next.active[p]) continue;
+                    int ph = next.sampled_hands[p];
+                    int c0 = s->hands[p][ph][0], c1 = s->hands[p][ph][1];
+                    int blk[52] = {0};
+                    for (int b = 0; b < 5; b++) blk[next.board[b]] = 1;
+                    blk[c0] = 1; blk[c1] = 1;
+                    int av[52]; int nav = 0;
+                    for (int c = 0; c < 52; c++) if (!blk[c]) av[nav++] = c;
+                    int wins = 0, ties = 0, total = 0;
+                    uint64_t erng = (uint64_t)c0 * 1000003ULL + (uint64_t)c1 * 999983ULL;
+                    for (int b = 0; b < 5; b++)
+                        erng = erng * 6364136223846793005ULL + (uint64_t)next.board[b];
+                    for (int si = 0; si < 200 && nav >= 2; si++) {
+                        partial_shuffle(av, nav, 2, &erng);
+                        int h7[7] = {next.board[0], next.board[1], next.board[2],
+                                     next.board[3], next.board[4], c0, c1};
+                        int o7[7] = {next.board[0], next.board[1], next.board[2],
+                                     next.board[3], next.board[4], av[0], av[1]};
+                        uint32_t hs = eval7(h7), os = eval7(o7);
+                        if (hs > os) wins++; else if (hs == os) ties++;
+                        total++;
+                    }
+                    float ehs = (total > 0) ? ((float)wins + 0.5f*(float)ties) / (float)total : 0.5f;
+                    int b = (int)(ehs * (float)s->postflop_num_buckets);
+                    if (b >= s->postflop_num_buckets) b = s->postflop_num_buckets - 1;
+                    next.river_bucket[p] = b;
+                }
+            }
+
+            return traverse_ev(&next, 0, acting_order, num_in_order);
+        }
+    }
+
+    /* Current player */
+    int ap = acting_order[acting_order_idx];
+    if (!ts->active[ap]) {
+        int ni = next_active(acting_order, num_in_order, ts->active, NP, acting_order_idx);
+        if (ni < 0) return 0;
+        return traverse_ev(ts, ni, acting_order, num_in_order);
+    }
+
+    /* Generate actions (same as traverse) */
+    int mx = 0;
+    for (int p = 0; p < NP; p++)
+        if (ts->active[p] && ts->bets[p] > mx) mx = ts->bets[p];
+    int to_call = mx - ts->bets[ap];
+    if (to_call < 0) to_call = 0;
+
+    BPAction actions[BP_MAX_ACTIONS];
+    int remaining_stack = ts->stacks[ap];
+    const float *cur_bet_sizes;
+    int cur_num_bet_sizes;
+    int max_raises = 3;
+    if (ts->num_board == 0 && s->num_preflop_bet_sizes > 0) {
+        if (s->num_preflop_tiers > 0) {
+            int level = ts->num_raises;
+            if (level >= s->num_preflop_tiers) level = s->num_preflop_tiers - 1;
+            cur_bet_sizes = s->preflop_tiered_sizes[level];
+            cur_num_bet_sizes = s->num_preflop_tiered_sizes[level];
+        } else {
+            cur_bet_sizes = s->preflop_bet_sizes;
+            cur_num_bet_sizes = s->num_preflop_bet_sizes;
+        }
+        max_raises = (s->preflop_max_raises > 0) ? s->preflop_max_raises : 4;
+    } else if (ts->num_raises > 0 && s->num_subsequent_bet_sizes > 0) {
+        cur_bet_sizes = s->subsequent_bet_sizes;
+        cur_num_bet_sizes = s->num_subsequent_bet_sizes;
+    } else {
+        cur_bet_sizes = s->bet_sizes;
+        cur_num_bet_sizes = s->num_bet_sizes;
+    }
+    int na = generate_actions(actions, BP_MAX_ACTIONS, ts->pot, remaining_stack,
+                              to_call, ts->num_raises, max_raises,
+                              cur_bet_sizes, cur_num_bet_sizes);
+    if (na == 0) return 0;
+
+    /* Info set lookup — read-only. We do NOT create new info sets here;
+     * if the info set wasn't visited during training, we skip it (return 0).
+     * This is safe because the blueprint is the ground truth — we only
+     * measure EVs against what training actually produced. */
+    int street = board_to_street(ts->num_board);
+    int bucket;
+    if (street == 0) {
+        bucket = get_bucket(s, street, ap, ts->sampled_hands[ap]);
+    } else if (street == 1 && ts->flop_cache && ts->flop_cache->computed) {
+        bucket = ts->flop_cache->buckets[ts->sampled_hands[ap]];
+    } else if (street == 2 && ts->num_board == 4 && s->turn_centroids_k > 0 &&
+               ts->turn_bucket[ap] >= 0) {
+        bucket = ts->turn_bucket[ap];
+    } else if (street >= 2 && ts->num_board == 5 && ts->river_bucket[ap] >= 0) {
+        bucket = ts->river_bucket[ap];
+    } else {
+        bucket = get_bucket(s, street, ap, ts->sampled_hands[ap]);
+    }
+
+    BPInfoKey key;
+    key.player = ap;
+    key.street = street;
+    key.bucket = bucket;
+    key.board_hash = 0;
+    key.action_hash = compute_action_hash(ts->action_history, ts->history_len);
+
+    /* Read-only lookup — DO NOT create. Info sets that training never
+     * visited are outside the blueprint's support and we have no data
+     * for them. Return 0 (neutral EV) in that case. */
+    uint64_t h = hash_combine(key.board_hash, key.action_hash);
+    h = hash_combine(h, (uint64_t)key.player);
+    h = hash_combine(h, (uint64_t)key.street);
+    h = hash_combine(h, (uint64_t)key.bucket);
+    int64_t slot = (int64_t)(h % (uint64_t)s->info_table.table_size);
+
+    BPInfoSet *is = NULL;
+    for (int probe = 0; probe < HASH_PROBE_LIMIT_READ; probe++) {
+        int64_t idx = (slot + probe) % s->info_table.table_size;
+        int state = __atomic_load_n(&s->info_table.occupied[idx], __ATOMIC_ACQUIRE);
+        if (state == 0) break;
+        if (state == 2) continue;  /* another thread initializing, skip */
+        if (key_eq(&s->info_table.keys[idx], &key)) {
+            is = &s->info_table.sets[idx];
+            break;
+        }
+    }
+    if (is == NULL) return 0;  /* info set not in blueprint — skip */
+
+    /* Clamp down only — same safety as traverse(). */
+    if (na > is->num_actions) {
+        na = is->num_actions;
+    }
+
+    /* Sample strategy from σ̄ (average strategy), not regret-matched σ. */
+    float strategy[BP_MAX_ACTIONS];
+    avg_strategy(is, strategy, na);
+
+    int next_order = next_active(acting_order, num_in_order, ts->active, NP, acting_order_idx);
+    if (next_order < 0) next_order = acting_order_idx;
+
+    if (ap == ts->traverser) {
+        /* Traverser: exhaustively enumerate all actions (NO pruning — we
+         * want EVs for everything, including pruned actions). For each
+         * action, compute the child subtree EV and accumulate into
+         * is->action_evs[a]. */
+        float action_values[BP_MAX_ACTIONS];
+        float node_value = 0;
+
+        for (int a = 0; a < na; a++) {
+            TraversalState child = *ts;
+            child.action_history[child.history_len++] = a;
+
+            if (actions[a].type == ACT_FOLD) {
+                child.active[ap] = 0;
+            } else if (actions[a].type == ACT_CHECK) {
+                child.has_acted[ap] = 1;
+            } else if (actions[a].type == ACT_CALL) {
+                int call_amount = (to_call > child.stacks[ap]) ? child.stacks[ap] : to_call;
+                child.bets[ap] += call_amount;
+                child.invested[ap] += call_amount;
+                child.stacks[ap] -= call_amount;
+                child.pot += call_amount;
+                child.has_acted[ap] = 1;
+            } else {
+                int amount = actions[a].amount;
+                if (amount > child.stacks[ap]) amount = child.stacks[ap];
+                child.bets[ap] += amount;
+                child.invested[ap] += amount;
+                child.stacks[ap] -= amount;
+                child.pot += amount;
+                child.has_acted[ap] = 1;
+                for (int p = 0; p < NP; p++)
+                    if (p != ap && child.active[p]) child.has_acted[p] = 0;
+                child.num_raises++;
+            }
+
+            action_values[a] = traverse_ev(&child, next_order, acting_order, num_in_order);
+            node_value += strategy[a] * action_values[a];
+        }
+
+        /* Accumulate per-action EVs for this info set. Hogwild-style: each
+         * thread does atomic adds into the same accumulator. Per-action
+         * EVs are float32 so we need a compare-and-swap loop (no atomic
+         * float add in C11), OR we accept slight precision loss from
+         * non-atomic += and rely on the averaging to smooth it out. The
+         * existing regret updates use non-atomic += (Hogwild accepts this),
+         * so we match that pattern. */
+        ensure_action_evs(is);
+        if (is->action_evs) {
+            for (int a = 0; a < na; a++)
+                is->action_evs[a] += action_values[a];
+            __atomic_fetch_add(&is->ev_visit_count, 1, __ATOMIC_RELAXED);
+        }
+
+        return node_value;
+
+    } else {
+        /* Non-traverser: sample one action from σ̄. */
+        int sampled = sample_action(strategy, na, ts->rng);
+
+        TraversalState child = *ts;
+        child.action_history[child.history_len++] = sampled;
+
+        if (actions[sampled].type == ACT_FOLD) {
+            child.active[ap] = 0;
+        } else if (actions[sampled].type == ACT_CHECK) {
+            child.has_acted[ap] = 1;
+        } else if (actions[sampled].type == ACT_CALL) {
+            int call_amount = (to_call > child.stacks[ap]) ? child.stacks[ap] : to_call;
+            child.bets[ap] += call_amount;
+            child.invested[ap] += call_amount;
+            child.stacks[ap] -= call_amount;
+            child.pot += call_amount;
+            child.has_acted[ap] = 1;
+        } else {
+            int amount = actions[sampled].amount;
+            if (amount > child.stacks[ap]) amount = child.stacks[ap];
+            child.bets[ap] += amount;
+            child.invested[ap] += amount;
+            child.stacks[ap] -= amount;
+            child.pot += amount;
+            child.has_acted[ap] = 1;
+            for (int p = 0; p < NP; p++)
+                if (p != ap && child.active[p]) child.has_acted[p] = 0;
+            child.num_raises++;
+        }
+
+        return traverse_ev(&child, next_order, acting_order, num_in_order);
     }
 }
 
@@ -2962,6 +3430,252 @@ int bp_export_strategies(const BPSolver *s,
             if (q < 0) q = 0;
             if (q > 255) q = 255;
             *p++ = (unsigned char)q;
+        }
+    }
+
+    return 0;
+}
+
+/* ── Phase 1.3: σ̄-sampled action EV computation + export ─────────── */
+
+int bp_compute_action_evs(BPSolver *s, int64_t num_iterations) {
+    int NP = s->num_players;
+    if (NP <= 0) return -1;
+    if (s->info_table.num_entries == 0) {
+        fprintf(stderr, "[BP1.3] No info sets in table — run bp_solve or bp_load_regrets first\n");
+        return -1;
+    }
+
+    int nt = s->config.num_threads;
+    if (nt <= 0) {
+        #ifdef _OPENMP
+        nt = omp_get_max_threads();
+        #else
+        nt = 1;
+        #endif
+    }
+
+    /* Make sure each thread has its own RNG state. bp_solve() allocates these.
+     * If we're running after bp_load_regrets without a prior bp_solve, they
+     * may not exist. Allocate on demand. */
+    if (!s->rng_states || s->num_rng_states < nt * 8) {
+        if (s->rng_states) free(s->rng_states);
+        s->rng_states = (uint64_t*)calloc(nt * 8, sizeof(uint64_t));
+        if (!s->rng_states) return -1;
+        s->num_rng_states = nt * 8;
+        /* Seed each thread's RNG with a distinct value — use wall time
+         * XOR'd with the thread index so the streams don't collide. */
+        uint64_t base_seed = (uint64_t)time(NULL) ^ 0xDEADBEEFCAFEBABEULL;
+        for (int t = 0; t < nt; t++) {
+            s->rng_states[t * 8] = base_seed + (uint64_t)t * 0x9E3779B97F4A7C15ULL;
+            if (s->rng_states[t * 8] == 0) s->rng_states[t * 8] = 1;
+        }
+    }
+
+    printf("[BP1.3] Computing action EVs: %lld iterations, %d threads, %lld info sets\n",
+           (long long)num_iterations, nt, (long long)s->info_table.num_entries);
+    fflush(stdout);
+
+    #ifdef _OPENMP
+    double t_start = omp_get_wtime();
+    omp_set_num_threads(nt);
+    #else
+    clock_t t_start = clock();
+    #endif
+
+    int64_t progress_interval = num_iterations / 20;  /* 5% progress marks */
+    if (progress_interval < 1) progress_interval = 1;
+
+    #ifdef _OPENMP
+    #pragma omp parallel if(nt > 1)
+    #endif
+    {
+        #ifdef _OPENMP
+        int tid = omp_get_thread_num();
+        #else
+        int tid = 0;
+        #endif
+        uint64_t *my_rng = &s->rng_states[tid * 8];
+
+        #ifdef _OPENMP
+        #pragma omp for schedule(dynamic, 64)
+        #endif
+        for (int64_t iter = 1; iter <= num_iterations; iter++) {
+            int traverser = (int)((iter - 1) % NP);
+
+            int sampled_hands[BP_MAX_PLAYERS];
+            for (int p = 0; p < NP; p++)
+                sampled_hands[p] = rng_int(my_rng, s->num_hands[p]);
+
+            /* Card conflict check (same as bp_solve) */
+            int conflict = 0;
+            for (int p = 0; p < NP && !conflict; p++) {
+                int c0 = s->hands[p][sampled_hands[p]][0];
+                int c1 = s->hands[p][sampled_hands[p]][1];
+                if (!s->config.include_preflop) {
+                    if (card_in_set(c0, s->flop, 3) || card_in_set(c1, s->flop, 3))
+                        { conflict = 1; break; }
+                }
+                for (int q = 0; q < p; q++) {
+                    int d0 = s->hands[q][sampled_hands[q]][0];
+                    int d1 = s->hands[q][sampled_hands[q]][1];
+                    if (cards_conflict(c0, c1, d0, d1)) { conflict = 1; break; }
+                }
+            }
+            if (conflict) continue;
+
+            TraversalState ts;
+            ts.solver = s;
+            ts.rng = my_rng;
+            ts.traverser = traverser;
+            ts.iteration = iter;
+            ts.use_pruning = 0;  /* NEVER prune in the EV walk */
+            ts.num_raises = 0;
+            ts.num_canon_board = 0;
+            ts.history_len = 0;
+            ts.flop_cache = NULL;
+            for (int p = 0; p < BP_MAX_PLAYERS; p++) {
+                ts.turn_bucket[p] = -1;
+                ts.river_bucket[p] = -1;
+            }
+            memcpy(ts.sampled_hands, sampled_hands, sizeof(sampled_hands));
+
+            if (s->config.include_preflop) {
+                ts.num_board = 0;
+                for (int p = 0; p < NP; p++) ts.active[p] = 1;
+                ts.num_active = NP;
+                ts.pot = s->small_blind + s->big_blind;
+
+                for (int p = 0; p < NP; p++) {
+                    ts.stacks[p] = s->initial_stack;
+                    ts.invested[p] = 0;
+                    ts.bets[p] = 0;
+                    ts.has_acted[p] = 0;
+                }
+                if (NP > 0) {
+                    ts.bets[0] = s->small_blind;
+                    ts.invested[0] = s->small_blind;
+                    ts.stacks[0] -= s->small_blind;
+                }
+                if (NP > 1) {
+                    ts.bets[1] = s->big_blind;
+                    ts.invested[1] = s->big_blind;
+                    ts.stacks[1] -= s->big_blind;
+                }
+                int preflop_order[BP_MAX_PLAYERS];
+                for (int i = 0; i < NP; i++)
+                    preflop_order[i] = (i + 2) % NP;
+
+                traverse_ev(&ts, 0, preflop_order, NP);
+            } else {
+                memcpy(ts.board, s->flop, 3 * sizeof(int));
+                ts.num_board = 3;
+                for (int p = 0; p < NP; p++) ts.active[p] = 1;
+                ts.num_active = NP;
+                ts.pot = s->starting_pot;
+                for (int p = 0; p < NP; p++) {
+                    ts.stacks[p] = s->effective_stack;
+                    ts.invested[p] = s->starting_pot / NP;
+                    ts.bets[p] = 0;
+                    ts.has_acted[p] = 0;
+                }
+                int postflop_order[BP_MAX_PLAYERS];
+                for (int i = 0; i < NP; i++) postflop_order[i] = i;
+                traverse_ev(&ts, 0, postflop_order, NP);
+            }
+
+            /* Progress reporting from thread 0 only */
+            if (tid == 0 && (iter % progress_interval) == 0) {
+                #ifdef _OPENMP
+                double elapsed = omp_get_wtime() - t_start;
+                #else
+                double elapsed = (double)(clock() - t_start) / CLOCKS_PER_SEC;
+                #endif
+                double frac = (double)iter / (double)num_iterations;
+                double rate = iter / (elapsed > 0 ? elapsed : 1);
+                printf("[BP1.3] iter %lld/%lld (%.0f%%), %.1fs, %.0f iter/s\n",
+                       (long long)iter, (long long)num_iterations,
+                       frac * 100.0, elapsed, rate);
+                fflush(stdout);
+            }
+        }
+    }
+
+    #ifdef _OPENMP
+    double total_time = omp_get_wtime() - t_start;
+    #else
+    double total_time = (double)(clock() - t_start) / CLOCKS_PER_SEC;
+    #endif
+
+    /* Report how many info sets got visited */
+    int64_t visited = 0;
+    for (int64_t i = 0; i < s->info_table.table_size; i++) {
+        if (s->info_table.occupied[i] != 1) continue;
+        if (s->info_table.sets[i].ev_visit_count > 0) visited++;
+    }
+
+    printf("[BP1.3] Done: %lld iterations, %.1fs, %lld/%lld info sets visited (%.1f%%)\n",
+           (long long)num_iterations, total_time,
+           (long long)visited, (long long)s->info_table.num_entries,
+           100.0 * (double)visited / (double)s->info_table.num_entries);
+    fflush(stdout);
+
+    return 0;
+}
+
+int bp_export_action_evs(const BPSolver *s,
+                          unsigned char *buf, size_t buf_size,
+                          size_t *bytes_written) {
+    const BPInfoTable *t = &s->info_table;
+
+    /* First pass: compute required size */
+    size_t total = 0;
+    int count = 0;
+    /* Header: 4 bytes magic + 4 bytes num_entries */
+    total += 8;
+    for (int64_t i = 0; i < t->table_size; i++) {
+        if (t->occupied[i] != 1) continue;
+        BPInfoSet *is = &t->sets[i];
+        if (is->ev_visit_count <= 0) continue;  /* skip unvisited */
+        if (is->action_evs == NULL) continue;   /* shouldn't happen if visit>0 */
+        /* Key: player(1) + street(1) + bucket(2) + action_hash(8) = 12 bytes
+         * Meta: num_actions(1) = 1 byte
+         * EVs:  4 * num_actions bytes (float32) */
+        total += 12 + 1 + 4 * is->num_actions;
+        count++;
+    }
+
+    *bytes_written = total;
+    if (buf == NULL) return 0;
+    if (buf_size < total) return -1;
+
+    unsigned char *p = buf;
+    memcpy(p, "BPR3", 4); p += 4;
+    memcpy(p, &count, 4); p += 4;
+
+    for (int64_t i = 0; i < t->table_size; i++) {
+        if (t->occupied[i] != 1) continue;
+        BPInfoKey *key = &t->keys[i];
+        BPInfoSet *is = &t->sets[i];
+        if (is->ev_visit_count <= 0) continue;
+        if (is->action_evs == NULL) continue;
+
+        unsigned char player_byte = (unsigned char)key->player;
+        unsigned char street_byte = (unsigned char)key->street;
+        unsigned short bucket_short = (unsigned short)key->bucket;
+        memcpy(p, &player_byte, 1); p += 1;
+        memcpy(p, &street_byte, 1); p += 1;
+        memcpy(p, &bucket_short, 2); p += 2;
+        memcpy(p, &key->action_hash, 8); p += 8;
+
+        unsigned char na_byte = (unsigned char)is->num_actions;
+        memcpy(p, &na_byte, 1); p += 1;
+
+        /* Write average EV per action: sum / visit_count */
+        float inv_count = 1.0f / (float)is->ev_visit_count;
+        for (int a = 0; a < is->num_actions; a++) {
+            float avg_ev = is->action_evs[a] * inv_count;
+            memcpy(p, &avg_ev, 4); p += 4;
         }
     }
 

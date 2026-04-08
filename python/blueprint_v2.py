@@ -209,6 +209,14 @@ class BlueprintV2:
         self._textures = {}
         self._metadata = {}
 
+        # Phase 1.3: per-action EVs (schema v3+). Parallel structure to
+        # self._textures; keyed the same way but stores [num_buckets, num_actions]
+        # float32 arrays where the value is the average EV in chips of
+        # taking action a at this info set with a hand in this bucket,
+        # under the blueprint's average strategy σ̄.
+        # Populated from the trailing BPR3 section of schema_version>=3 .bps files.
+        self._action_evs = {}
+
         # File index: supports both v1 and v2 layouts
         # v1: _file_index[texture_key] = path
         # v2: _scenario_file_index[(scenario_id, texture_key)] = path
@@ -373,7 +381,87 @@ class BlueprintV2:
         if cache_key != texture_key:
             self._textures[texture_key] = table
             self._metadata[texture_key] = meta
+
+        # Phase 1.3: attempt to load the trailing BPR3 per-action EV section.
+        # Schema v3+ files have this; schema v2 files don't.
+        if meta.get('schema_version', 2) >= 3 and meta.get('has_action_evs', False):
+            try:
+                self._load_action_evs_section(f, cache_key, texture_key,
+                                               num_buckets, preflop_buckets)
+            except Exception as e:
+                # Non-fatal: consumer will fall back to equity approximation
+                print(f"[blueprint_v2] WARN: failed to load action EVs section: {e}")
+
         return True
+
+    def _load_action_evs_section(self, f, cache_key, texture_key,
+                                  num_buckets, preflop_buckets) -> None:
+        """Load the trailing BPR3 per-action EV section of a schema v3+ .bps.
+
+        File layout (after the strategies section and meta JSON):
+            'BPR3' (4B) + u64 compressed_size + LZMA(payload)
+
+        Payload format:
+            'BPR3' (4B) + u32 num_entries
+            Per entry: player(1) + street(1) + bucket(2) + action_hash(8)
+                     + num_actions(1) + float32[num_actions] avg_ev
+        """
+        magic = f.read(4)
+        if magic != b'BPR3':
+            # No trailing section — treat as v2 (fallback to equity path)
+            return
+
+        compressed_size = struct.unpack('<Q', f.read(8))[0]
+        compressed = f.read(compressed_size)
+        payload = lzma.decompress(compressed)
+
+        p = 0
+        inner_magic = payload[p:p+4]; p += 4
+        if inner_magic != b'BPR3':
+            raise ValueError(f"Expected BPR3 inner magic, got {inner_magic!r}")
+        n_entries = struct.unpack_from('<I', payload, p)[0]; p += 4
+
+        # Group entries by node key (like strategies do). board_hash is always 0
+        # in schema v3 (board is abstracted by bucket).
+        node_entries = {}  # (board_hash=0, action_hash, player, street) -> {bucket: (na, evs)}
+
+        for _ in range(n_entries):
+            player = payload[p]; p += 1
+            street = payload[p]; p += 1
+            bucket = struct.unpack_from('<H', payload, p)[0]; p += 2
+            action_hash = struct.unpack_from('<Q', payload, p)[0]; p += 8
+            na = payload[p]; p += 1
+
+            if street in self.streets_to_load:
+                evs = np.frombuffer(payload, dtype=np.float32, count=na, offset=p)
+                evs = evs.copy()  # detach from the bytes buffer
+
+                key = (0, action_hash, player, street)
+                if key not in node_entries:
+                    node_entries[key] = {}
+                node_entries[key][bucket] = (na, evs)
+
+            p += na * 4  # advance past the EV floats
+
+        # Build per-node EV tables: [num_buckets, num_actions] arrays.
+        # Default for unvisited buckets: 0.0 (the consumer will fall back
+        # via the ev_visit_count check elsewhere if needed).
+        ev_table = {}
+        for key, bucket_map in node_entries.items():
+            street = key[3]
+            nb = preflop_buckets if street == 0 else num_buckets
+            sample_na = next(iter(bucket_map.values()))[0]
+            evs_arr = np.zeros((nb, sample_na), dtype=np.float32)
+            for bucket, (na, evs) in bucket_map.items():
+                if bucket < nb:
+                    evs_arr[bucket, :na] = evs[:na]
+            ev_table[key] = evs_arr
+
+        self._action_evs[cache_key] = ev_table
+        if cache_key != texture_key:
+            self._action_evs[texture_key] = ev_table
+        print(f"[blueprint_v2] Loaded {sum(len(v) for v in node_entries.values())} "
+              f"action-EV entries across {len(ev_table)} nodes")
 
     def _load_bps2(self, f, cache_key, texture_key) -> bool:
         """Load per-scenario blueprint in BPS2 format (per-hand strategies)."""
@@ -558,6 +646,57 @@ class BlueprintV2:
             return None
 
         return table.get(key)
+
+    def get_all_bucket_action_evs(self, board: List[int],
+                                   action_history: List[int],
+                                   player: int,
+                                   street: int = 1) -> Optional[np.ndarray]:
+        """Phase 1.3: Get per-action EVs for ALL buckets at a node.
+
+        Returns [num_buckets, num_actions] array of float32 EVs in chips,
+        where EV[b, a] = expected value in chips for player `player` of taking
+        action `a` at this info set when holding a hand in bucket `b`, under
+        the blueprint's average strategy σ̄.
+
+        Returns None if:
+          - The blueprint was loaded from a schema v2 .bps (no action EV data)
+          - The specific info set wasn't visited during the EV walk
+          - The blueprint isn't loaded yet
+
+        Consumers that get None should fall back to the equity approximation
+        in leaf_values.py (compute_flop_leaf_equity etc.).
+
+        Note: matches the IMPORTANT board-canonicalization warning on
+        get_strategy() — pass the canonical board from the texture, not the
+        raw game cards.
+        """
+        # Action EVs use board_hash=0 per the v3 export format (board is
+        # abstracted by bucket, same as strategies in bucket-in-key mode).
+        action_hash = _compute_action_hash(action_history)
+        key = (0, action_hash, player, street)
+
+        # Check unified blueprint first
+        if getattr(self, '_unified_loaded', False):
+            ev_table = self._action_evs.get('__unified__')
+            if ev_table is not None:
+                return ev_table.get(key)
+
+        # Per-texture lookup for non-unified loads
+        texture_key = board_to_texture_key(board[:3])
+        ev_table = self._action_evs.get(texture_key)
+        if ev_table is None:
+            return None
+        return ev_table.get(key)
+
+    def has_action_evs(self) -> bool:
+        """Phase 1.3: whether this blueprint has per-action EVs loaded.
+
+        True only if a schema v3+ .bps was loaded AND it had a non-empty
+        BPR3 trailing section. Use this to decide at consumer startup
+        whether to enable the Pluribus-exact leaf value path or fall back
+        to the equity approximation.
+        """
+        return len(self._action_evs) > 0
 
     def get_metadata(self, texture_key: str) -> Optional[dict]:
         """Get metadata for a loaded texture."""
