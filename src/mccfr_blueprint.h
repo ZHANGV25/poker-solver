@@ -110,7 +110,13 @@ typedef struct {
     int64_t prune_start_iter;       /* start pruning after this (Pluribus: 200 min) */
     int64_t snapshot_start_iter;    /* start saving snapshots after this (Pluribus: 800 min) */
     int64_t snapshot_interval;      /* save snapshot every N iterations (Pluribus: ~200 min) */
-    int64_t strategy_interval;      /* update round-1 avg strategy every N iters (Pluribus: 10K) */
+    /* DEPRECATED — F2 fix in v3 (see V3_PLAN.md Phase 2.8). This field is set
+     * by ~30 callers but never read by mccfr_blueprint.c. The original Pluribus
+     * design uses Strategy Interval = 10K to gate sampled UPDATE-STRATEGY calls
+     * for round 1; our implementation accumulates strategy_sum on every visit
+     * (see SOLVER_CONFIG.md §10), so this field is dead code. Kept in the
+     * struct for ABI safety with the 30+ ctypes callers; ignore in new code. */
+    int64_t strategy_interval;
     int num_threads;            /* OpenMP threads (0 = auto) */
     int64_t hash_table_size;    /* 0 = auto. Supports >2B (e.g. 3B for 376GB instance) */
     const char *snapshot_dir;   /* directory for strategy snapshots (NULL = no snapshots) */
@@ -186,8 +192,17 @@ typedef struct {
      * Value: bucket_map[1326] for that texture.
      * Allocated at init, freed by bp_free. */
     #define BP_MAX_TEXTURES 1760
+    /* Bug 7 fix: open-addressing hashmap on top of texture_hash_keys[].
+     * Sized to next power of 2 above 2 * BP_MAX_TEXTURES → 4096 buckets,
+     * load factor ≤43% so probe chains stay under 3-4 on average. The hash
+     * mixer is splitmix64-style. Replaces the previous O(N) linear scan
+     * (~1755 comparisons per flop deal). Populated by
+     * `texture_index_rebuild()` after the texture cache is loaded or
+     * precomputed. */
+    #define BP_TEXTURE_INDEX_SIZE 4096
     int *texture_bucket_cache;     /* [BP_MAX_TEXTURES * BP_MAX_HANDS] flat array */
     uint64_t texture_hash_keys[BP_MAX_TEXTURES];  /* hash key per texture */
+    int texture_hash_index[BP_TEXTURE_INDEX_SIZE]; /* open-addressed: -1 = empty, else idx into texture_hash_keys */
     int num_cached_textures;
 
     /* Precomputed turn k-means centroids for bucketing.

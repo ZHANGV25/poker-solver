@@ -228,9 +228,34 @@ static void arena_free_all(void) {
 #define HASH_PROBE_LIMIT_INSERT 4096
 #define HASH_PROBE_LIMIT_READ   4096
 
-static uint64_t hash_combine(uint64_t a, uint64_t b) {
-    a ^= b + 0x9e3779b97f4a7c15ULL + (a << 6) + (a >> 2);
-    return a;
+/* splitmix64 — high-quality 64-bit avalanche mixer used throughout the
+ * solver's hash functions. Defined here (rather than later) so hash_combine
+ * and friends can use it. Same mixer as the texture lookup hashmap. */
+static inline uint64_t bp_mix64(uint64_t x) {
+    x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27; x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31;
+    return x;
+}
+
+/* Bug 6 fix: replaces the previous boost::hash_combine
+ *     a ^= b + 0x9e3779b97f4a7c15 + (a << 6) + (a >> 2);
+ * which has known weak distribution on small structured inputs (sequences
+ * of small action indices, in our case). The new mixer runs each input
+ * through two rounds of splitmix64 — full 64-bit avalanche, no structural
+ * residue from the input pattern. This is the same family of mixer used
+ * by xxHash3 and gives ~uniform distribution over uint64.
+ *
+ * Note on backwards compatibility: this changes the slot derivation for
+ * every info set in the hash table. v2's regrets_*.bin checkpoints can
+ * still be LOADED by code with this fix (the load just reads stored key
+ * fields and re-inserts them), and EXPORT works correctly because export
+ * iterates the table without re-querying by key. RESUMING training from
+ * a v2 checkpoint with this fix in place WOULD create duplicates because
+ * the new hash places the same key in a different slot than v2 did.
+ * v3 training is a fresh start from iter 0 so this is fine. */
+static inline uint64_t hash_combine(uint64_t a, uint64_t b) {
+    return bp_mix64(a ^ bp_mix64(b));
 }
 
 static uint64_t compute_board_hash(const int *board, int num_board) {
@@ -238,6 +263,66 @@ static uint64_t compute_board_hash(const int *board, int num_board) {
     for (int i = 0; i < num_board; i++)
         h = hash_combine(h, (uint64_t)board[i] * 31 + 7);
     return h;
+}
+
+/* Bug 7 fix: O(1) texture lookup via open-addressing hashmap.
+ *
+ * Replaces the previous O(N) linear scan over `s->num_cached_textures`
+ * (~1755 entries per scan, fired on every flop deal during traversal). At
+ * 30K iter/s × 192 threads × ~1 flop deal/iter, the scan was costing
+ * ~5-15% of solver throughput.
+ *
+ * The hashmap lives in `s->texture_hash_index[BP_TEXTURE_INDEX_SIZE]` and
+ * stores indices into `s->texture_hash_keys[]`. -1 means empty.
+ *
+ * Hash mixer: bp_mix64 (splitmix64) — same mixer used by hash_combine
+ * for the main hash table. Much better distribution on small integer
+ * inputs than the previous boost::hash_combine. */
+
+/* Look up a flop_hash in the texture hashmap. Returns the index into
+ * texture_hash_keys[] / texture_bucket_cache rows, or -1 if not found. */
+static inline int texture_index_lookup(const BPSolver *s, uint64_t flop_hash) {
+    uint64_t mixed = bp_mix64(flop_hash);
+    int idx = (int)(mixed & (uint64_t)(BP_TEXTURE_INDEX_SIZE - 1));
+    /* Linear probe. With BP_MAX_TEXTURES=1760 entries in BP_TEXTURE_INDEX_SIZE=4096
+     * slots (~43% load), expected probe length is ~1.4. Probe up to 32 slots
+     * to bound the worst case. */
+    for (int p = 0; p < 32; p++) {
+        int slot = (idx + p) & (BP_TEXTURE_INDEX_SIZE - 1);
+        int t = s->texture_hash_index[slot];
+        if (t < 0) return -1;
+        if (s->texture_hash_keys[t] == flop_hash) return t;
+    }
+    return -1;
+}
+
+/* Insert a (flop_hash, texture_index) pair into the hashmap. */
+static inline void texture_index_insert(BPSolver *s, uint64_t flop_hash, int texture_idx) {
+    uint64_t mixed = bp_mix64(flop_hash);
+    int idx = (int)(mixed & (uint64_t)(BP_TEXTURE_INDEX_SIZE - 1));
+    for (int p = 0; p < 32; p++) {
+        int slot = (idx + p) & (BP_TEXTURE_INDEX_SIZE - 1);
+        if (s->texture_hash_index[slot] < 0) {
+            s->texture_hash_index[slot] = texture_idx;
+            return;
+        }
+    }
+    /* Should never reach here at our load factor (≤43% with 32 probe slots
+     * and a uniform splitmix mixer, the probability of failing all 32 probes
+     * is astronomically small). If we do, the texture is silently dropped
+     * from the index and the lookup will return -1, falling back to the
+     * caller's "not found" path. */
+}
+
+/* Rebuild the texture hashmap from `texture_hash_keys[0..num_cached_textures]`.
+ * Called after the texture cache is precomputed or loaded from disk. */
+static void texture_index_rebuild(BPSolver *s) {
+    for (int i = 0; i < BP_TEXTURE_INDEX_SIZE; i++) {
+        s->texture_hash_index[i] = -1;
+    }
+    for (int t = 0; t < s->num_cached_textures; t++) {
+        texture_index_insert(s, s->texture_hash_keys[t], t);
+    }
 }
 
 /* Canonicalize a board for info set hashing.
@@ -417,6 +502,19 @@ static int64_t info_table_find_or_create(BPInfoTable *t, BPInfoKey key,
                                             __ATOMIC_ACQUIRE)) {
                 t->sets[idx].num_actions = num_actions;
                 t->sets[idx].regrets = (int*)arena_alloc(num_actions);
+                /* Bug 9 fix: defensive NULL check. arena_alloc returns NULL
+                 * on OOM. Without this check, the slot would be published
+                 * with regrets=NULL and the next access (regret_match,
+                 * regret update, etc.) would segfault. Roll back the slot
+                 * state and report failure to the caller. The caller treats
+                 * a -1 return as "this iteration's traversal cannot proceed"
+                 * and skips the regret update — same handling as the
+                 * probe-cap-exhausted case. */
+                if (!t->sets[idx].regrets) {
+                    __atomic_store_n(&t->occupied[idx], 0, __ATOMIC_RELEASE);
+                    __atomic_fetch_add(&t->insertion_failures, 1, __ATOMIC_RELAXED);
+                    return -1;
+                }
                 t->sets[idx].strategy_sum = NULL;
                 t->keys[idx] = key;
                 __atomic_store_n(&t->occupied[idx], 1, __ATOMIC_RELEASE);
@@ -968,13 +1066,8 @@ static float traverse(TraversalState *ts, int acting_order_idx,
                 }
 
                 uint64_t flop_hash = compute_board_hash(canon, 3);
-                int found = -1;
-                for (int t = 0; t < s->num_cached_textures; t++) {
-                    if (s->texture_hash_keys[t] == flop_hash) {
-                        found = t;
-                        break;
-                    }
-                }
+                /* Bug 7 fix: O(1) hashmap lookup instead of O(N) linear scan */
+                int found = texture_index_lookup(s, flop_hash);
                 if (found >= 0) {
                     int *cache_row = &s->texture_bucket_cache[found * BP_MAX_HANDS];
                     memcpy(flop_cache_local.buckets, cache_row, BP_MAX_HANDS * sizeof(int));
@@ -1183,9 +1276,20 @@ static float traverse(TraversalState *ts, int acting_order_idx,
     }
     BPInfoSet *is = &s->info_table.sets[is_slot];
 
-    /* Guard: if hash collision causes action count mismatch, use stored count
-     * to prevent buffer overflow on regrets (arena) and strategy_sum (heap). */
-    if (na != is->num_actions) {
+    /* Bug 2 fix: clamp DOWN only, never up.
+     *
+     * If a hash collision causes the stored slot to have MORE actions than the
+     * caller's local na, raising local na would cause subsequent code to
+     * access actions[BP_MAX_ACTIONS] indices that generate_actions never
+     * initialized — uninitialized stack data dispatched as if it were a
+     * valid BPAction. The previous unconditional clamp set na = is->num_actions
+     * unconditionally, exposing this bug on the rare hash collision case.
+     *
+     * Lowering only is always safe: the stack-allocated arrays (strategy[],
+     * action_values[], explored[], actions[]) are sized BP_MAX_ACTIONS, and
+     * generate_actions populated the first `local_na` entries. Reducing na
+     * means we just iterate over fewer of the populated entries. */
+    if (na > is->num_actions) {
         na = is->num_actions;
     }
 
@@ -1225,10 +1329,17 @@ static float traverse(TraversalState *ts, int acting_order_idx,
             } else if (actions[a].type == ACT_CHECK) {
                 child.has_acted[ap] = 1;
             } else if (actions[a].type == ACT_CALL) {
-                child.bets[ap] = mx;
-                child.invested[ap] += to_call;
-                child.stacks[ap] -= to_call;
-                child.pot += to_call;
+                /* Bug 1 fix: cap call against remaining stack. In equal-stack
+                 * 6-max with our betting tree this case is unreachable in
+                 * practice (the BET branch caps bets at stack so to_call <=
+                 * stacks[ap] always holds), but the call branch lacked the
+                 * defensive cap. Adding it makes the call branch first-class
+                 * bug-free regardless of upstream tree assumptions. */
+                int call_amount = (to_call > child.stacks[ap]) ? child.stacks[ap] : to_call;
+                child.bets[ap] += call_amount;
+                child.invested[ap] += call_amount;
+                child.stacks[ap] -= call_amount;
+                child.pot += call_amount;
                 child.has_acted[ap] = 1;
             } else {
                 /* amount = total new chips committed this action.
@@ -1303,10 +1414,13 @@ static float traverse(TraversalState *ts, int acting_order_idx,
         } else if (actions[sampled].type == ACT_CHECK) {
             child.has_acted[ap] = 1;
         } else if (actions[sampled].type == ACT_CALL) {
-            child.bets[ap] = mx;
-            child.invested[ap] += to_call;
-            child.stacks[ap] -= to_call;
-            child.pot += to_call;
+            /* Bug 1 fix: cap call against remaining stack. See traverser
+             * branch above for the rationale. */
+            int call_amount = (to_call > child.stacks[ap]) ? child.stacks[ap] : to_call;
+            child.bets[ap] += call_amount;
+            child.invested[ap] += call_amount;
+            child.stacks[ap] -= call_amount;
+            child.pot += call_amount;
             child.has_acted[ap] = 1;
         } else {
             int amount = actions[sampled].amount;
@@ -1372,7 +1486,21 @@ static void apply_discount(BPInfoTable *t, float discount) {
             if (is->regrets[a] < BP_REGRET_FLOOR)
                 is->regrets[a] = BP_REGRET_FLOOR;
         }
-        if (is->strategy_sum) {
+        /* F3 fix: only discount strategy_sum on round 1 (street 0). Per the
+         * Pluribus paper (Supp. p. 14-15), Linear CFR discounts both regrets
+         * AND average strategies during the discount phase, but the average
+         * strategy that gets discounted is the round-1 average (phi). The
+         * rounds 2-4 strategy_sum is constructed from snapshots taken AFTER
+         * the discount phase ends, and Pluribus does NOT discount those.
+         *
+         * Currently this fix is defensive — discount_stop_iter (e.g. 35M)
+         * is always less than snapshot_start_iter (e.g. 70M) under our
+         * canonical Python config, so rounds 2-4 strategy_sum is NULL when
+         * apply_discount fires and the original `if (is->strategy_sum)`
+         * check skipped them. But that's a config-fragile invariant. Adding
+         * an explicit street filter makes the discount semantics correct
+         * regardless of how the timing parameters get tuned. */
+        if (is->strategy_sum && t->keys[i].street == 0) {
             for (int a = 0; a < na; a++)
                 is->strategy_sum[a] *= discount;
         }
@@ -1622,8 +1750,15 @@ int bp_init_unified(BPSolver *s, int num_players,
      * once before training starts. We do the same here. */
     s->postflop_num_buckets = (config->postflop_num_buckets > 0) ? config->postflop_num_buckets : 200;
     s->postflop_ehs_samples = 500;  /* MC samples for precompute (Pluribus: ~500) */
-    s->num_cached_textures = 0;
-    s->texture_bucket_cache = (int*)calloc(BP_MAX_TEXTURES * (size_t)BP_MAX_HANDS, sizeof(int));
+    /* Bug 14 fix: only allocate the texture cache if the caller hasn't already
+     * loaded one via bp_load_texture_cache(). The canonical Python driver
+     * (blueprint_worker_unified.py) calls bp_load_texture_cache BEFORE
+     * bp_init_unified, and without this guard the previous unconditional
+     * calloc here would leak the loaded buffer (~9 MB). */
+    if (!s->texture_bucket_cache) {
+        s->num_cached_textures = 0;
+        s->texture_bucket_cache = (int*)calloc(BP_MAX_TEXTURES * (size_t)BP_MAX_HANDS, sizeof(int));
+    }
 
     printf("[BP] Unified init: %d players, blinds %d/%d, stack %d, "
            "preflop=%d sizes, postflop=%d sizes, hands=%d, "
@@ -1753,6 +1888,8 @@ int bp_init_unified(BPSolver *s, int num_players,
         }
 
         s->num_cached_textures = tex_count;
+        /* Bug 7 fix: build the texture lookup hashmap */
+        texture_index_rebuild(s);
         double pc_elapsed = (double)(clock() - pc_start) / CLOCKS_PER_SEC;
         printf("[BP] Precomputed %d textures in %.1fs\n", tex_count, pc_elapsed);
     }
@@ -2133,20 +2270,29 @@ int bp_solve(BPSolver *s, int64_t max_iterations) {
      *     threads with chunk 64 have ~150K chunks of work — full parallelism.
      *   - Snapshots fire when (global_batch_end % snapshot_interval) < batch_size,
      *     which works for both small and large batch sizes.
-     */
-    int64_t batch_size;
+     *
+     * Bug 10 fix: batch_size is recomputed inside the batch loop below
+     * (rather than once at solve start) so that a chunk crossing the
+     * discount→post-discount boundary correctly switches to the larger
+     * batch_size mid-chunk instead of using the small discount_interval
+     * for the entire chunk. */
+    int64_t POSTDISCOUNT_BATCH_SIZE = 10000000;
+    int64_t initial_batch_size;
     int64_t global_start_iter = iter_offset + 1;
     if (global_start_iter <= s->config.discount_stop_iter) {
-        batch_size = s->config.discount_interval;
-        if (batch_size <= 0) batch_size = max_iterations;
+        initial_batch_size = s->config.discount_interval;
+        if (initial_batch_size <= 0) initial_batch_size = max_iterations;
     } else {
-        /* Past discount phase — use 10M batch for parallelism. */
-        batch_size = 10000000;
+        initial_batch_size = POSTDISCOUNT_BATCH_SIZE;
     }
-    if (batch_size > max_iterations) batch_size = max_iterations;
-    int64_t num_batches = (max_iterations + batch_size - 1) / batch_size;
-    printf("[BP] batch_size=%lld (%lld batches), discount_phase=%s\n",
-           (long long)batch_size, (long long)num_batches,
+    if (initial_batch_size > max_iterations) initial_batch_size = max_iterations;
+    /* num_batches is an upper-bound estimate for logging and the loop
+     * counter; the actual number of batches may be slightly different if
+     * batch_size changes mid-chunk at the discount boundary. We use a
+     * generous upper bound (assuming smallest possible batch size). */
+    int64_t num_batches_estimate = (max_iterations + initial_batch_size - 1) / initial_batch_size;
+    printf("[BP] batch_size=%lld (~%lld batches), discount_phase=%s\n",
+           (long long)initial_batch_size, (long long)num_batches_estimate,
            (global_start_iter <= s->config.discount_stop_iter) ? "yes" : "no");
     fflush(stdout);
 
@@ -2161,8 +2307,25 @@ int bp_solve(BPSolver *s, int64_t max_iterations) {
         #endif
         uint64_t *my_rng = &s->rng_states[tid * 8];
 
-        for (int64_t batch = 0; batch < num_batches; batch++) {
-            int64_t batch_start = batch * batch_size + 1;
+        /* Bug 10 fix: this loop replaces a fixed-num_batches `for` loop with
+         * a position-tracking `while` loop so batch_size can be recomputed
+         * mid-chunk when crossing the discount→post-discount boundary. */
+        int64_t cur_iter_in_chunk = 1;
+        int64_t batch = 0;
+        while (cur_iter_in_chunk <= max_iterations) {
+            /* Recompute batch_size for THIS batch based on current global iter
+             * (not just the start of the chunk). Switches from
+             * discount_interval to POSTDISCOUNT_BATCH_SIZE the moment we cross
+             * the discount_stop_iter threshold. */
+            int64_t cur_global_iter = cur_iter_in_chunk + iter_offset;
+            int64_t batch_size;
+            if (cur_global_iter <= s->config.discount_stop_iter) {
+                batch_size = s->config.discount_interval;
+                if (batch_size <= 0) batch_size = max_iterations - cur_iter_in_chunk + 1;
+            } else {
+                batch_size = POSTDISCOUNT_BATCH_SIZE;
+            }
+            int64_t batch_start = cur_iter_in_chunk;
             int64_t batch_end = batch_start + batch_size - 1;
             if (batch_end > max_iterations) batch_end = max_iterations;
 
@@ -2312,9 +2475,9 @@ int bp_solve(BPSolver *s, int64_t max_iterations) {
                 double elapsed = (double)(clock() - t_start) / CLOCKS_PER_SEC;
                 #endif
                 double rate = (batch_end > 0 && elapsed > 0) ? (double)batch_end / elapsed : 0.0;
-                printf("[BP] batch %lld/%lld done at iter %lld (global %lld), "
+                printf("[BP] batch %lld/~%lld done at iter %lld (global %lld), "
                        "%.1fs, %.0f iter/s, info sets: %lld\n",
-                       (long long)(batch + 1), (long long)num_batches,
+                       (long long)(batch + 1), (long long)num_batches_estimate,
                        (long long)batch_end, (long long)global_batch_end,
                        elapsed, rate, (long long)s->info_table.num_entries);
                 fflush(stdout);
@@ -2357,6 +2520,13 @@ int bp_solve(BPSolver *s, int64_t max_iterations) {
             #ifdef _OPENMP
             #pragma omp barrier
             #endif
+
+            /* Advance to the next batch position. Bug 10 fix: this is now
+             * inside the while loop so the loop variable advances by the
+             * actual batch_size used (which may differ from the previous
+             * iteration if we crossed the discount→post-discount boundary). */
+            cur_iter_in_chunk = batch_end + 1;
+            batch++;
         }
     } /* end parallel */
 
@@ -2391,7 +2561,20 @@ int bp_get_strategy(const BPSolver *s, int player,
 
     for (int probe = 0; probe < HASH_PROBE_LIMIT_READ; probe++) {
         int64_t idx = (slot + probe) % s->info_table.table_size;
-        if (!s->info_table.occupied[idx]) return 0;
+        /* Bug 8 fix: use ACQUIRE load + state-machine handling. The previous
+         * code used a non-atomic `!s->info_table.occupied[idx]` check which
+         * (a) didn't use an acquire barrier so reads of keys[idx] and
+         * sets[idx] could be reordered before the state load, and (b) treated
+         * state==2 (initializing) as state==1 (ready), allowing key_eq to
+         * compare against partially-initialized keys. With proper handling we
+         * spin-wait on state==2 slots and only proceed once they're ready. */
+        int state = __atomic_load_n(&s->info_table.occupied[idx], __ATOMIC_ACQUIRE);
+        if (state == 0) return 0;
+        if (state == 2) {
+            spin_until_ready((const int*)&s->info_table.occupied[idx]);
+            state = __atomic_load_n(&s->info_table.occupied[idx], __ATOMIC_ACQUIRE);
+            if (state != 1) continue;
+        }
         if (key_eq(&s->info_table.keys[idx], &key)) {
             BPInfoSet *is = &s->info_table.sets[idx];
             int na = is->num_actions;
@@ -2437,7 +2620,14 @@ int bp_get_regrets(const BPSolver *s, int player,
 
     for (int probe = 0; probe < HASH_PROBE_LIMIT_READ; probe++) {
         int64_t idx = (slot + probe) % s->info_table.table_size;
-        if (!s->info_table.occupied[idx]) return 0;
+        /* Bug 8 fix: same state-machine handling as bp_get_strategy above. */
+        int state = __atomic_load_n(&s->info_table.occupied[idx], __ATOMIC_ACQUIRE);
+        if (state == 0) return 0;
+        if (state == 2) {
+            spin_until_ready((const int*)&s->info_table.occupied[idx]);
+            state = __atomic_load_n(&s->info_table.occupied[idx], __ATOMIC_ACQUIRE);
+            if (state != 1) continue;
+        }
         if (key_eq(&s->info_table.keys[idx], &key)) {
             BPInfoSet *is = &s->info_table.sets[idx];
             int na = is->num_actions;
@@ -2676,6 +2866,8 @@ int bp_load_texture_cache(BPSolver *s, const char *path) {
     fread(s->texture_bucket_cache, sizeof(int), (size_t)num_tex * BP_MAX_HANDS, f);
     s->num_cached_textures = num_tex;
     fclose(f);
+    /* Bug 7 fix: build the texture lookup hashmap */
+    texture_index_rebuild(s);
     printf("[BP] Loaded texture cache: %d textures from %s\n", num_tex, path);
     return num_tex;
 }
