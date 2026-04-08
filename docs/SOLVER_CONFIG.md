@@ -1,5 +1,7 @@
 # Solver Configuration — Source of Truth
 
+> See [`STATUS.md`](../STATUS.md) for project state and forward plan. This file is the parameter source of truth.
+
 This is the canonical reference for every parameter in our blueprint solver, what
 Pluribus uses for the same parameter, and the rationale for any deviation.
 
@@ -9,9 +11,9 @@ Pluribus uses for the same parameter, and the rationale for any deviation.
 - [`pluribus_technical_details.md`](../pluribus_technical_details.md) — local extracted Pluribus paper details (verbatim from supplementary)
 
 **Authoritative internal references:**
+- [`STATUS.md`](../STATUS.md) — single source of truth for project state
 - [`docs/BLUEPRINT_BUGS.md`](BLUEPRINT_BUGS.md) — historical bug log (Bugs 1-11)
 - [`docs/BLUEPRINT_CHRONICLE.md`](BLUEPRINT_CHRONICLE.md) — narrative history of training runs
-- [`AGENT_COORDINATION.md`](../AGENT_COORDINATION.md) — live coordination state, BUG-A through BUG-G
 - [`src/mccfr_blueprint.h`](../src/mccfr_blueprint.h) — algorithm constants
 - [`precompute/blueprint_worker_unified.py`](../precompute/blueprint_worker_unified.py) — training driver
 - [`precompute/launch_blueprint_unified.sh`](../precompute/launch_blueprint_unified.sh) — EC2 launch
@@ -67,13 +69,14 @@ the Pluribus-aligned fallback + warning is the pragmatic compromise. The Python 
 overrides all timing values from `args.iterations` so the C defaults only matter for callers
 that forget to override.
 
-**Earlier "35% of training" claim was a fabrication.** AGENT_COORDINATION.md cited
+**Earlier "35% of training" claim was a fabrication.** Earlier docs cited
 "Pluribus discounts during the first 35% of training" — this is wrong. The actual
 fraction is 3.47%. Anyone reading this doc should disregard the "35%" claim wherever
 it appears in older docs.
 
 **Earlier "Pluribus did 100B iterations" claim was a fabrication.** The paper does
-not specify an iteration count. Pluribus iterations are unknown.
+not specify an iteration count. Pluribus iterations are unknown (estimated 2-4B
+based on hardware-throughput math, see [STATUS.md §2](../STATUS.md#2-pluribus-iter-count-is-unknown)).
 
 ## 3. Card abstraction
 
@@ -132,7 +135,7 @@ Source: pluribus_technical_details.md §6.
 
 | Param | Pluribus | v1 (custom run_solver.py) | v2 | Source |
 |---|---|---|---|---|
-| Slots | not specified (sized for ~665M action sequences) | 1B (BUG: custom override) | **2B** | BUG-G research, AGENT_COORDINATION.md |
+| Slots | not specified (sized for ~665M action sequences) | 1B (BUG: custom override) | **2B** | BUG-G research, STATUS.md |
 | Per-slot size | not specified | ~56 bytes | ~56 bytes | BPInfoKey + BPInfoSet + occupied |
 | Total metadata | not specified | ~56 GB | ~112 GB | computed |
 | Arena (entries) | "lazy allocation" | ~50 GB | ~50 GB | per-thread sliced |
@@ -144,7 +147,7 @@ Source: pluribus_technical_details.md §6.
 **v2 sizing rationale (2B slots):**
 - Empirical projection: ~1.05B entries at 8B target → 52% load
 - Linear probing is comfortable up to ~70% load
-- 2B is the BUG-G research answer per AGENT_COORDINATION.md, after user pushed back on 3B for cache-hostility concerns
+- 2B is the BUG-G research answer per STATUS.md, after user pushed back on 3B for cache-hostility concerns
 - All sizes (1B/2B/3B) are equally L3-hostile (L3 is 384 MB, hash table is ≥56 GB regardless), so 3B does not actually win on cache; 2B saves 56 GB metadata RAM
 
 ## 7. Hardware
@@ -272,7 +275,7 @@ strategic granularity at the most important decision (open raise).
 | 2026-04-07 | Launch script perf optimizations | missing | numactl install + THP enable + OMP env vars + numactl --interleave=all | Bug α: canonical script omitted all 6 optimizations from current run; would be ~50% slower |
 | 2026-04-07 | Launch script spot mode | on-demand | spot one-time terminate | Bug ζ: cost reduction |
 | 2026-04-07 | S3 bucket isolation | shared with v1 | poker-blueprint-unified-v2 | Bug θ: avoid checkpoint collisions |
-| 2026-04-07 | Pluribus correction | "35% of training" / "100B iters" | 3.47% of training / unknown iters | AGENT_COORDINATION.md was wrong; pluribus_technical_details.md is the source of truth |
+| 2026-04-07 | Pluribus correction | "35% of training" / "100B iters" | 3.47% of training / unknown iters | STATUS.md was wrong; pluribus_technical_details.md is the source of truth |
 | 2026-04-07 | Postflop all-in option | not added to v2 | not added to v2 | User decision: current sizing is correct, already reduced |
 
 ---
@@ -331,10 +334,10 @@ For the record, these were claimed by the bug-hunt audit and verified to be wron
    appropriate row in the relevant section AND add a row to the Decision log
    with the date and reason.
 3. **When a bug is fixed**, update the bug's Status row above and add a Decision
-   log entry. Cross-reference the BLUEPRINT_BUGS.md or AGENT_COORDINATION.md
+   log entry. Cross-reference the BLUEPRINT_BUGS.md or STATUS.md
    entry where appropriate.
 4. **When in doubt about Pluribus's behavior**, the source of truth is
    [`pluribus_technical_details.md`](../pluribus_technical_details.md), which is
    the local extracted version of the Brown & Sandholm 2019 supplementary
-   materials. Do NOT trust other docs (including this one, AGENT_COORDINATION.md,
+   materials. Do NOT trust other docs (including this one, STATUS.md,
    or BLUEPRINT_BUGS.md) over the paper extract for Pluribus values.

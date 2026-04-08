@@ -1,7 +1,9 @@
 """Blueprint I/O — read precomputed flop/turn strategies for range narrowing.
 
-Loads precomputed solutions from the ACR HUD's flop_solutions directory
-and extracts P(action|hand) for Bayesian range narrowing.
+Loads precomputed solutions from a flop_solutions directory and extracts
+P(action|hand) for Bayesian range narrowing. Used by the older per-flop
+precompute path; the unified blueprint pipeline uses `blueprint_store.py`
+and `.bps` files instead.
 
 Usage:
     bp = Blueprint("path/to/flop_solutions")

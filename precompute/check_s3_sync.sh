@@ -6,7 +6,7 @@
 # fetch source onto a fresh EC2 instance. If you commit a fix to git but forget
 # to push the same files to S3, the EC2 instance compiles the OLD version and
 # silently produces a bad .bps. This happened on 2026-04-07 with the Bug B fix
-# (see AGENT_COORDINATION.md "Recent decisions").
+# (see STATUS.md "Recent decisions").
 #
 # This script catches the gap BEFORE you spend EC2 compute on a doomed run.
 #
@@ -33,7 +33,7 @@ AUTO_FIX="${1:-}"
 # the _s3 version, not the gitted version. The compile succeeds because
 # undefined function symbols in a -shared build are resolved at runtime, and
 # the export pipeline doesn't call those functions. This is a known divergence
-# documented in AGENT_COORDINATION.md Bug F. Remove this exception when the
+# documented in STATUS.md Bug F. Remove this exception when the
 # two-file setup is collapsed to a single canonical version.
 FILES=(
     "src/mccfr_blueprint.c"

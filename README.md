@@ -1,95 +1,93 @@
 # poker-solver
 
-Exact Pluribus replica — 6-player unified preflop-through-river MCCFR blueprint + GPU real-time subgame search for 6-max No-Limit Hold'em.
+A 6-player No-Limit Hold'em MCCFR blueprint solver matching the Pluribus algorithm (Brown & Sandholm, *Science* 2019), plus GPU real-time subgame search for the postflop streets. Built for training/analysis use, with the goal of being **the first true 6-player postflop solver** (commercial alternatives cap at 3 players postflop).
 
-## Goal
+> 📖 **Read [`STATUS.md`](STATUS.md) first.** It is the single source of truth for project state, what's running, what's committed, what's next, and pointers into the rest of the docs.
 
-A commercial-grade poker AI matching Pluribus (Brown & Sandholm, Science 2019):
-1. **Blueprint**: One unified 6-player MCCFR solve, preflop through river, on a single 72-core machine for 8 days
-2. **Runtime**: GPU real-time subgame search with 4 continuation strategies, strategy freezing (A3), Bayesian range narrowing
-3. **HUD**: Wire into ACR Poker for live play assistance
+## Components
 
-## Current Status
-
-**Blueprint compute is RUNNING on EC2** (launched 2026-03-27, ~April 4 ETA).
-
-| Milestone | Status |
-|-----------|--------|
-| Unified 6-player MCCFR engine | Done |
-| 169 lossless preflop + 200 k-means postflop buckets | Done |
-| Checkpoint/resume for spot instances | Done |
-| EC2 pipeline (solver + watchdog) | Running |
-| GPU N-player street solver | Done |
-| A3 strategy freezing in GPU CFR | Done |
-| Bayesian range narrowing (1326 hands) | Done |
-| 4 continuation strategies (5x bias) | Done |
-| Pseudoharmonic off-tree mapping | Done |
-| HUD integration | Done (needs blueprint) |
-
-See [GTO_GAPS.md](GTO_GAPS.md) for detailed tracking.
-
-## Architecture
-
-```
-BLUEPRINT TRAINING (EC2, 8 days):
-  bp_init_unified() → precompute 1,755 flop textures (k-means)
-  → bp_solve() × N iterations (72-core OpenMP, Hogwild hash table)
-  → bp_save_regrets() checkpoint to S3 every 1M iters
-  → watchdog auto-relaunches on spot reclaim
-
-RUNTIME (local GPU, <1 second):
-  Preflop: blueprint lookup (169 classes)
-  Flop:    GPU re-solve with narrowed ranges + 4 continuation strategies
-  Turn:    GPU re-solve with equity leaf values
-  River:   GPU re-solve to showdown
-```
-
-### Key Files
-
-| Component | Files | Description |
-|-----------|-------|-------------|
-| **Blueprint engine** | `src/mccfr_blueprint.c` + `card_abstraction.c` | Production 6-player external-sampling MCCFR with bucket-in-key info sets, k-means bucketing, Linear CFR, pruning, arena allocator |
-| **GPU solver** | `src/cuda/street_solve.cu` + `.cuh` | N-player single-street Linear CFR with exact showdowns, A3 strategy freezing, continuation strategies |
-| **Blueprint worker** | `precompute/blueprint_worker_unified.py` | EC2 solver wrapper with checkpoint/resume, S3 upload |
-| **Watchdog** | `precompute/watchdog.sh` | Auto-restart on spot reclaim + staleness detection |
-| **HUD solver** | `python/hud_solver.py` | Full decision pipeline: blueprint → range narrowing → GPU re-solve |
-| **Range narrowing** | `python/range_narrowing.py` | Bayesian updates over 1326 hands per player |
-| **Leaf values** | `python/leaf_values.py` | N-player depth-limited continuation values |
-| **Off-tree** | `python/off_tree.py` | Pseudoharmonic bet interpolation |
+- **Blueprint engine** (`src/mccfr_blueprint.c` + `src/card_abstraction.c`) — Production 6-player external-sampling MCCFR with bucket-in-key info sets, k-means card abstraction, Linear CFR, regret pruning, Hogwild parallelism, arena allocator.
+- **GPU street solver** (`src/cuda/street_solve.cu`) — N-player single-street Linear CFR with exact showdowns, A3 strategy freezing, 4 continuation strategies at depth-limited leaves.
+- **Realtime decision pipeline** (`python/hud_solver.py` + `python/leaf_values.py` + `python/range_narrowing.py` + `python/off_tree.py`) — End-to-end inference: blueprint lookup → range narrowing → GPU re-solve → off-tree mapping.
+- **Training driver** (`precompute/blueprint_worker_unified.py`) — EC2 wrapper for the C solver with checkpoint/resume and S3 upload.
+- **Export tool** (`precompute/export_v2.py`) — Converts a trained `regrets.bin` checkpoint into the `.bps` blueprint file consumed by the realtime path.
 
 ## Building
 
 ```bash
-# Blueprint engine (requires both .c files + OpenMP)
+# Blueprint engine (requires OpenMP)
 make blueprint
 
 # Or manually:
-gcc -O2 -shared -fopenmp -o build/mccfr_blueprint.dll \
+clang -O2 -shared -fPIC -fopenmp -o build/mccfr_blueprint.so \
     src/mccfr_blueprint.c src/card_abstraction.c -I src -lm
 
-# Street solver (requires CUDA)
-nvcc -O2 -shared -o build/street_solve.dll src/cuda/street_solve.cu -I src
+# GPU street solver (requires CUDA)
+nvcc -O2 -shared -o build/street_solve.so src/cuda/street_solve.cu -I src
 ```
 
-## Pluribus Parameter Match
+## Pluribus parameter alignment
 
 | Parameter | Pluribus | Ours |
 |-----------|----------|------|
 | Players | 6 | 6 |
-| Algorithm | External-sampling MCCFR | Same |
-| Training | 8 days, 64 cores | 8 days, 72 cores |
+| Algorithm | External-sampling MCCFR + Linear CFR + pruning | Same |
 | Preflop buckets | 169 lossless | 169 lossless |
 | Postflop buckets | 200 k-means | 200 k-means |
-| Discount | d=T/(T+1) every 10 min | Same (proportional) |
-| Pruning | -300M threshold, 95% | Same |
-| Regret floor | -310M (int32) | Same |
-| Search | Linear CFR, 4 cont, 5x bias | Same (GPU) |
-| Freezing | A3 (hero's past actions) | Same |
-| Off-tree | Pseudoharmonic | Same |
-| Beliefs | Uniform 1/1326 | Same |
+| Pruning threshold | -300M | -300M |
+| Pruning probability | 95% | 95% |
+| Regret floor | -310M | -310M |
+| Discount formula | `d = (T/10)/(T/10+1)` | Same |
+| Linear CFR discount window | First 3.47% of training | Same |
+| Pruning start | 1.74% of training | 1.74% |
+| Strategy interval | 10,000 iters | 10,000 iters |
+
+For the full parameter matrix and any deviations, see [`docs/SOLVER_CONFIG.md`](docs/SOLVER_CONFIG.md).
+For the Pluribus paper extraction, see [`pluribus_technical_details.md`](pluribus_technical_details.md).
+
+## Where everything is
+
+```
+poker-solver/
+├── STATUS.md                     ← single source of truth — read first
+├── README.md                     ← you are here
+├── ARCHITECTURE.md               ← component overview
+├── pluribus_technical_details.md ← Pluribus paper extract (frozen reference)
+├── REFERENCES.md                 ← citations
+├── COMMERCIALIZATION.md          ← business strategy (separate concern)
+├── src/
+│   ├── mccfr_blueprint.c         ← the C solver (3000 LOC)
+│   ├── mccfr_blueprint.h         ← algorithm constants
+│   ├── card_abstraction.c        ← EHS computation + k-means bucketing
+│   └── cuda/street_solve.cu      ← GPU N-player single-street CFR
+├── python/
+│   ├── hud_solver.py             ← realtime decision pipeline
+│   ├── leaf_values.py            ← depth-limited continuation values
+│   ├── range_narrowing.py        ← Bayesian range tracking
+│   ├── off_tree.py               ← pseudoharmonic interpolation
+│   └── ...
+├── precompute/
+│   ├── blueprint_worker_unified.py  ← C solver wrapper for EC2 training
+│   ├── export_v2.py              ← regrets.bin → .bps conversion
+│   └── launch_*.sh               ← EC2 launch scripts
+├── tests/
+│   ├── enumerate_tree.py         ← betting-tree enumeration
+│   ├── sweep_config_tree.py      ← config sweep
+│   ├── count_actionhash_vs_logical.py
+│   ├── check_convergence.c       ← regret checkpoint analysis
+│   └── ...                       ← many one-off analysis scripts (kept on purpose)
+├── verification/
+│   └── ...                       ← convergence checks
+└── docs/
+    ├── SOLVER_CONFIG.md          ← parameter source of truth
+    ├── REALTIME_TODO.md          ← realtime/subgame backlog
+    ├── V3_PLAN.md                ← v3 execution plan (Phase 1-3 shipped)
+    ├── BLUEPRINT_BUGS.md         ← solver bug log
+    ├── EXTRACTOR_BUGS.md         ← frontend extractor bug log
+    └── BLUEPRINT_CHRONICLE.md    ← narrative training history
+```
 
 ## References
 
-- Brown & Sandholm, "Superhuman AI for multiplayer poker", Science 2019
-- See [pluribus_technical_details.md](pluribus_technical_details.md) for full parameter extraction
-- See [REFERENCES.md](REFERENCES.md) for additional citations
+- Brown & Sandholm, *"Superhuman AI for multiplayer poker"*, **Science** 2019. [Paper](https://www.science.org/doi/10.1126/science.aay2400) · [Supplement](https://noambrown.github.io/papers/19-Science-Superhuman_Supp.pdf)
+- See [`REFERENCES.md`](REFERENCES.md) for the full citation list.

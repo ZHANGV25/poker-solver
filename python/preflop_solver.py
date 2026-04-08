@@ -217,7 +217,7 @@ class PreflopSolver:
         """
         all_matchups = self.solve_all_matchups()
 
-        # Convert to the format expected by the HUD
+        # Convert to the standard ranges.json format consumed downstream
         ranges = {"rfi": {}, "vs_rfi": {}, "vs_3bet": {}}
 
         for scenario_id, data in all_matchups.items():

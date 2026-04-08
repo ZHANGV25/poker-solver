@@ -1,18 +1,23 @@
-"""HUD Solver — Pluribus-style street-by-street solver for the ACR Poker HUD.
+"""HUD Solver — Pluribus-style street-by-street realtime solver.
+
+Naming note: this module is named `hud_solver.py` for historical reasons. It
+is the realtime decision pipeline for the trainer/analysis use case, NOT a HUD.
+The class is `HUDSolver` for the same historical reason; rename pending an ABI
+break.
 
 Implements the full Pluribus hybrid architecture:
-  - PREFLOP: lookup ranges from ranges.json
+  - PREFLOP: lookup strategies from the blueprint .bps
   - FLOP: blueprint lookup (first action) or GPU re-solve with turn leaf values
   - TURN: GPU re-solve with river leaf values + 4 continuation strategies
   - RIVER: GPU re-solve to showdown (no depth limit)
   - Range narrowing: WEIGHTED AVERAGE strategy (not final iteration)
   - Off-tree bets: pseudoharmonic interpolation
-  - Multiway: heuristic adjustments when 3+ players
+  - Multiway: pure N-player CFR (no heuristic adjustments — see V3_PLAN.md T1.2)
 
 Decision pipeline:
-  1. Load preflop ranges for this scenario
+  1. Load preflop strategies from the blueprint
   2. On each villain/hero action: narrow ranges using weighted avg P(action|hand)
-  3. On hero's turn to act: solve current street only (~50-100ms GPU)
+  3. On hero's turn to act: solve current street only (~500ms GPU at 2000 iters)
   4. Leaf values from precomputed blueprint (flop/turn) or showdown (river)
 """
 
@@ -61,10 +66,14 @@ except Exception:
 
 
 class HUDSolver:
-    """Pluribus-style poker solver for the HUD.
+    """Pluribus-style realtime poker solver.
 
     Manages range tracking, blueprint lookups, and street-by-street GPU solving
-    for a single table. Create one instance per table.
+    for a single hand or table. Create one instance per table.
+
+    Naming: kept as `HUDSolver` for backwards compatibility with existing
+    callers; the class is the realtime decision pipeline for the trainer/analysis
+    use case, not specifically a HUD.
     """
 
     # Default bet sizes per street (Pluribus uses 3-14 sizes depending on
@@ -219,8 +228,8 @@ class HUDSolver:
             self.narrower.set_uniform_range("hero")
             self.narrower.set_uniform_range("villain")
         else:
-            # Default: start from known preflop ranges (better for HUD use
-            # case where we know the preflop ranges from population data).
+            # Default: start from known preflop ranges (useful when an external
+            # caller has population-derived ranges to seed from, e.g. a tracker).
             self.narrower.set_initial_range("hero", hero_hands)
             self.narrower.set_initial_range("villain", villain_hands)
 
@@ -498,11 +507,11 @@ class HUDSolver:
 
     # Default CFR iteration count for realtime re-solves.
     # Pluribus uses 1-33 seconds per subgame which is thousands of iterations.
-    # We previously used 200 to fit a sub-100ms HUD latency budget. With the
-    # pivot to a trainer use case the latency budget is gone, so we bump to
-    # 2000 — much closer to Pluribus convergence and only ~500ms per re-solve
-    # at typical subgame sizes. Override per-call via cfr_iterations= if you
-    # need a different speed/quality trade-off.
+    # An older configuration used 200 to fit a sub-100ms latency budget; with
+    # the trainer use case (no latency budget) we use 2000 — much closer to
+    # Pluribus convergence and only ~500ms per re-solve at typical subgame
+    # sizes. Override per-call via cfr_iterations= if you need a different
+    # speed/quality trade-off.
     DEFAULT_CFR_ITERATIONS = 2000
 
     def get_strategy(self, board, hero_cards, street="river",
@@ -522,7 +531,7 @@ class HUDSolver:
             stack_bb: effective stack in BB
             cfr_iterations: number of LCFR iterations for this re-solve.
                 Defaults to DEFAULT_CFR_ITERATIONS (2000). Pluribus uses
-                thousands; 200 was the old HUD-latency-budget value.
+                thousands; 200 was the old low-latency value.
 
         Returns:
             dict with actions, ev, solving status

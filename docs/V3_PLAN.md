@@ -1,13 +1,17 @@
 # v3 Execution Plan
 
+> **STATUS: Phase 1–3 SHIPPED.** All Phase 1–3 items are committed in `a82219b` and `48da71b`. Phase 1.3 is partially shipped (realtime side done, export-tool side still pending — see [`STATUS.md`](../STATUS.md#v3-commit-status)).
+>
+> For current state and forward plan, **read [`STATUS.md`](../STATUS.md)**, not this file. This document is preserved as the historical execution plan.
+
 This is the canonical execution order for fixing every non-intentional deviation
 from Pluribus, across both the blueprint solver and the realtime path. This doc
 is the **WHEN** — for the **WHAT** of each item, see [`SOLVER_CONFIG.md`](SOLVER_CONFIG.md)
 §11 (blueprint backlog) and [`REALTIME_TODO.md`](REALTIME_TODO.md) (realtime backlog).
 
-**Use case context:** pivoted from HUD to trainer. Latency budget relaxed from
-<100ms to seconds-to-minutes. This unlocks several fixes that were previously
-blocked.
+**Use case context:** the realtime path was originally designed for sub-100ms response.
+Now operating in trainer mode where seconds-to-minutes per re-solve is acceptable.
+This unlocks several fixes that were previously blocked.
 
 ## Already done (intentional matches + completed v2 fixes)
 
@@ -21,36 +25,38 @@ These are confirmed Pluribus-aligned and tracked in `SOLVER_CONFIG.md`:
 - Bug B (probe symmetry), C/F (default config), E (% 10007 gate), γ (iterations_run race), α (launch perf), B/D (export bug + metadata) — fixed in v2
 - Bug 11 (Hogwild duplicates) fix already in code
 
-## Phase 1 — High impact, low cost (parallel with v2, ~1 day)
+## Phase 1 — High impact, low cost (parallel with v2, ~1 day)  ✅ SHIPPED in a82219b
 
-| # | Item | File:line | Effort | Disturbs v2? |
-|---|---|---|---|---|
-| 1.1 | **T1.1: bump CFR iterations 200 → 2000** in realtime solver | `python/hud_solver.py:829` | 5 LOC | no |
-| 1.2 | **T1.2: delete `python/multiway_adjust.py`** and remove callers | `python/multiway_adjust.py`, `hud_solver.py:561-562, 568-569` | 30 min | no |
-| 1.3 | **T2.1: per-action EVs for realtime leaf values** | `python/leaf_values.py` (computation), `python/hud_solver.py` (wiring) | ~1 day | no |
+| # | Item | File:line | Status |
+|---|---|---|---|
+| 1.1 | **T1.1: bump CFR iterations 200 → 2000** in realtime solver | `python/hud_solver.py:506` (`DEFAULT_CFR_ITERATIONS`) | ✅ done |
+| 1.2 | **T1.2: delete `python/multiway_adjust.py`** and remove callers | file deleted | ✅ done |
+| 1.3 | **T2.1: per-action EVs for realtime leaf values** | `python/leaf_values.py` (+303 lines) | ⚠️ **PARTIAL** — realtime side done, but the export-tool side (`bp_export_regrets()` in `mccfr_blueprint.c` + `precompute/export_v2.py` schema_version bump) was NOT done. See [STATUS.md](../STATUS.md#v3-commit-status). |
 
-## Phase 2 — Defense-in-depth fixes (parallel with v2, ~2-3 hours)
+## Phase 2 — Defense-in-depth fixes (parallel with v2, ~2-3 hours)  ✅ SHIPPED in 48da71b
 
 These are small isolated bug fixes. None affect v2's output (defensive only)
 but they need to be in the next-training-run code base.
 
-| # | Item | File:line | Effort |
+All committed in 48da71b. Items 2.1–2.8 below match the order in V3_PLAN.md, not the order in the commit message.
+
+| # | Item | File:line | Status |
 |---|---|---|---|
-| 2.1 | **Bug 1**: cap CALL against player stack | `mccfr_blueprint.c:1227-1232, 1305-1310` | 10 LOC |
-| 2.2 | **Bug 2**: lower-only `na` clamp on hash collision | `mccfr_blueprint.c:1186-1190` | 3 LOC |
-| 2.3 | **Bug 9**: NULL check after `arena_alloc` | `mccfr_blueprint.c:418-422` | 5 LOC |
-| 2.4 | **Bug 14**: texture cache double-allocation guard | `mccfr_blueprint.c:1626` | 3 LOC |
-| 2.5 | **Bug 10**: recompute `batch_size` at discount→post-discount boundary | `mccfr_blueprint.c:2143-2150` | 10 LOC |
-| 2.6 | **Bug 8**: `spin_until_ready` in `bp_get_strategy`/`bp_get_regrets` | `mccfr_blueprint.c:2392-2418, 2378-2424` | 15 LOC |
-| 2.7 | **F3**: `street == 0` filter in `apply_discount` | `mccfr_blueprint.c:1374-1378` | 3 LOC |
-| 2.8 | **F2**: remove dead `strategy_interval` field (or rename for ABI safety) | `mccfr_blueprint.h:102`, ~30 callers | 30 min |
+| 2.1 | **Bug 1**: cap CALL against player stack | `mccfr_blueprint.c:1227-1232, 1305-1310` | ✅ done |
+| 2.2 | **Bug 2**: lower-only `na` clamp on hash collision | `mccfr_blueprint.c:1186-1190` | ✅ done |
+| 2.3 | **Bug 9**: NULL check after `arena_alloc` | `mccfr_blueprint.c:418-422` | ✅ done |
+| 2.4 | **Bug 14**: texture cache double-allocation guard | `mccfr_blueprint.c:1626` | ✅ done |
+| 2.5 | **Bug 10**: recompute `batch_size` at discount→post-discount boundary | `mccfr_blueprint.c:2143-2150` | ✅ done |
+| 2.6 | **Bug 8**: `spin_until_ready` in `bp_get_strategy`/`bp_get_regrets` | `mccfr_blueprint.c:2392-2418, 2378-2424` | ✅ done |
+| 2.7 | **F3**: `street == 0` filter in `apply_discount` | `mccfr_blueprint.c:1374-1378` | ✅ done |
+| 2.8 | **F2**: remove dead `strategy_interval` field (or rename for ABI safety) | `mccfr_blueprint.h:102`, ~30 callers | ✅ done |
 
-## Phase 3 — Quality / perf improvements (parallel with v2, ~3-4 hours)
+## Phase 3 — Quality / perf improvements (parallel with v2, ~3-4 hours)  ✅ SHIPPED in 48da71b
 
-| # | Item | File:line | Effort | Impact |
+| # | Item | File:line | Status | Impact |
 |---|---|---|---|---|
-| 3.1 | **Bug 7**: replace texture lookup linear scan with hashmap | `mccfr_blueprint.c:971-977` | 30 LOC | 5-15% solver speedup |
-| 3.2 | **Bug 6**: replace `hash_combine` with xxHash3 for `action_hash` | `mccfr_blueprint.c:223-226, 322-336` | 50 LOC | ~3% → ~0.001% collision rate |
+| 3.1 | **Bug 7**: replace texture lookup linear scan with hashmap | `mccfr_blueprint.c:268+` | ✅ done | 5-15% solver speedup |
+| 3.2 | **Bug 6**: replace `hash_combine` with splitmix64 mixer for `action_hash` | `mccfr_blueprint.c:241-259` | ✅ done (splitmix64, not xxHash3 — same family, simpler implementation) | Eliminates `max_probe = 4096` clustering |
 
 ## Phase 4 — Wait for v2 to finish (~3 days, passive)
 
@@ -113,3 +119,6 @@ Total code change estimate: ~400-500 LOC across ~10 files.
 | Date | Decision |
 |---|---|
 | 2026-04-07 | Approved Phases 1-3 for immediate execution. F1 (Phase 8.1) marked as recommended-skip. |
+| 2026-04-07 | Phases 1-3 committed in `a82219b` and `48da71b`. Phase 1.3 partial (realtime side only). |
+| 2026-04-08 | A fresh v3 retraining run is **not planned** — marginal blueprint quality improvement vs. cost. The Phase 1-3 realtime fixes work with v2's blueprint. See [`STATUS.md`](../STATUS.md). |
+| 2026-04-08 | Subgame depth analysis (T3.1) and real-time multi-street search (T5.1) are the next high-value items. Tracked in [`REALTIME_TODO.md`](REALTIME_TODO.md), prioritized in [`STATUS.md`](../STATUS.md#forward-roadmap-next-month). |

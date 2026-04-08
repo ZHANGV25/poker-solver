@@ -1,5 +1,7 @@
 # Realtime solver TODO
 
+> See [`STATUS.md`](../STATUS.md) for the overall project state and prioritization. This file is the detailed realtime/subgame backlog.
+
 Backlog for the realtime / subgame-solving side of the system. The blueprint
 solver (`mccfr_blueprint.c` + `precompute/blueprint_worker_unified.py`) is
 mostly Pluribus-aligned and tracked in [`SOLVER_CONFIG.md`](SOLVER_CONFIG.md).
@@ -9,37 +11,28 @@ This file tracks the realtime path (`python/hud_solver.py`,
 
 ## Use case context
 
-**Pivoted from HUD to trainer.** The realtime solver was originally written for
-the ACR Poker HUD which needed sub-100ms response times. The current target use
-case is a trainer / analysis tool where seconds-to-minutes per re-solve is
-acceptable. **The latency budget is no longer load-bearing** for design choices.
-Multiple gaps below were forced by the HUD latency budget and can be reopened
-now that the constraint is gone.
+The realtime solver was originally designed with a sub-100ms response time
+constraint. The current target use case is a trainer/analysis tool where
+seconds-to-minutes per re-solve is acceptable. **The latency budget is no longer
+load-bearing** for design choices. Multiple gaps below were forced by the old
+latency budget and were reopened once the constraint was removed.
 
 ## Priority 1 — easy wins from the latency relaxation
 
-### T1.1 — Up `iterations` from 200 to 2000-5000
+### T1.1 — Up `iterations` from 200 to 2000-5000  ✅ SHIPPED in a82219b
 
-**Where:** `python/hud_solver.py:829`
-```python
-solver.solve(iterations=200)
-```
+**Where:** `python/hud_solver.py:506` — `DEFAULT_CFR_ITERATIONS = 2000`
+
 **Why:** Linear CFR converges roughly as O(1/√T). 200 → 2000 is one extra log
 unit of convergence quality. Pluribus runs 1-33 seconds per subgame, which is
-thousands of iterations. We're capped at 200 because of the HUD latency budget,
+thousands of iterations. We were capped at 200 because of the old latency budget,
 which no longer applies.
 
-**Change:** Make `iterations` a parameter with a sensible default like 2000.
-Add a fast path (200) for any future low-latency callers, but make trainer
-calls use the higher count.
+**Status:** Shipped. `HUDSolver.DEFAULT_CFR_ITERATIONS = 2000` and
+`get_strategy()` accepts a `cfr_iterations` parameter for any callers that need
+to override.
 
-**Effort:** 5 lines.
-
-**Expected impact:** Largest single quality improvement available. Subgame
-strategies become noticeably more converged on mixed-strategy spots
-(bluff/value combos, mixed call/raise frequencies).
-
-### T1.2 — Delete `python/multiway_adjust.py` and remove its callers
+### T1.2 — Delete `python/multiway_adjust.py` and remove its callers  ✅ SHIPPED in a82219b
 
 **Why:** The file is a relic from when the GPU solver was heads-up only. The
 header comment says it explicitly:
@@ -71,9 +64,16 @@ Despite that, `hud_solver.py:561-562` and `:568-569` still apply
 real N-player CFR convergence issues that were previously masked by the
 heuristics — those would be separate bugs to investigate.
 
-## Priority 2 — Blueprint export fix (no restart needed)
+## Priority 2 — Blueprint export fix (no restart needed)  ⚠️ PARTIAL
 
-### T2.1 — Extend .bps export with per-action EVs
+### T2.1 — Extend .bps export with per-action EVs  ⚠️ PARTIAL
+
+**Status:** Realtime side is shipped (`python/leaf_values.py +303 lines` in `a82219b`). The export-tool side and the C-side `bp_export_regrets()` are NOT yet shipped. The realtime path falls back to equity-only computation until the export work is complete. **`precompute/export_v2.py` still writes `schema_version: 2`.**
+
+**To complete:**
+1. Add `bp_export_regrets()` to `src/mccfr_blueprint.c` (~30 LOC)
+2. Update `precompute/export_v2.py` to call it and bump `schema_version` to 3 (~20 LOC)
+3. Re-export from any v2 checkpoint and verify the realtime path produces 4 distinct biased leaf values
 
 **Where the breakage actually is:** the **blueprint training itself is fine** —
 `mccfr_blueprint.c:1259-1270` does the standard MCCFR regret update
@@ -261,11 +261,11 @@ Pluribus uses both depending on subgame size.
 
 ## Priority 6 — Cosmetic / cleanup
 
-### T6.1 — Remove the heads-up-only assumption from comments
+### T6.1 — Remove the heads-up-only assumption from comments  ✅ DONE 2026-04-08
 
-After T1.2 deletes `multiway_adjust.py`, scrub remaining "the solver is
-heads-up only" claims from `hud_solver.py` and other docs. The solver has been
-N-player capable since `street_solve.cu` was written; the comments lag.
+After T1.2 deleted `multiway_adjust.py`, "the solver is heads-up only" claims
+were scrubbed from `hud_solver.py` and other code comments as part of the doc
+consolidation.
 
 ### T6.2 — Replace pseudoharmonic with explicit re-solve for round 1 large deviations
 
@@ -279,10 +279,11 @@ boundary. Document this in `off_tree.py`.
 
 | Date | Item | Decision |
 |---|---|---|
-| 2026-04-07 | Realtime use case | Pivoted from HUD to trainer. Latency budget relaxed from <100ms to seconds-to-minutes. |
-| 2026-04-07 | T1.1 iteration count | Approved in principle; bump from 200 to 2000-5000 once trainer-mode is the only consumer |
-| 2026-04-07 | T1.2 multiway heuristics | Approved removal. The heuristics double-correct on top of N-player CFR and are based on arbitrary tuning constants, not principled analysis. |
-| 2026-04-07 | T2.1 export per-action EVs | Approved. Hot-fix path (no solver restart) is identified: extend export tool only, modify C export functions, re-export from the final v2 8B checkpoint. |
+| 2026-04-07 | Realtime use case | Trainer mode confirmed. Latency budget relaxed from <100ms to seconds-to-minutes. |
+| 2026-04-07 | T1.1 iteration count | ✅ shipped in `a82219b` (`DEFAULT_CFR_ITERATIONS = 2000`) |
+| 2026-04-07 | T1.2 multiway heuristics | ✅ shipped in `a82219b` (file deleted) |
+| 2026-04-07 | T2.1 export per-action EVs | ⚠️ Realtime side shipped in `a82219b`. Export-tool + C-side work outstanding. |
 | 2026-04-07 | T3.1 subgame depth analysis | Approved as research task. Never been done. Should precede T5.1. |
 | 2026-04-07 | T4.1 preflop re-solve | Approved as priority 4. Defer until T1-T3 are done. |
 | 2026-04-07 | T5.1 multi-street kernel | Pending T3.1 outcome. |
+| 2026-04-08 | T6.1 comment scrub | ✅ done as part of doc consolidation |

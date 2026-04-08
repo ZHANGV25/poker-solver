@@ -615,3 +615,63 @@ slot because it's still state=2 (only checks state=1).
 - Bug 11 fix ready: `spin_until_ready` prevents new duplicates, merge-on-load
   recovers existing ones
 - Next: launch spot in us-east-1f, resume from 200M, target 4B iterations
+
+---
+
+## Phase 7: v1 termination, v2 launch, v3 commit (2026-04-07 to 2026-04-08)
+
+### v1 termination (2026-04-07)
+
+v1 ran on instance `i-08b967d731137c9b6` against the original `poker-blueprint-unified` S3 bucket. Targeted 4B iterations, terminated at ~1.7B (~43% complete). Reasons:
+
+- **Bug 6** (boost `hash_combine` clustering on small structured inputs) was creating pathological probe distances; insertion failures growing
+- **Bug B** (asymmetric probe limits 4096 insert / 1024 read) made many entries silently invisible to lookups
+- **Bug E** (`% 10007` strategy_sum gate from a regression) was rate-limiting strategy accumulation
+- **Bug γ** (non-atomic `iterations_run` write race) caused checkpoint resume offset issues
+- **Bug α** (launch script missing all 6 perf optimizations: numactl, THP, OMP env vars) ran ~50% slower than necessary
+
+Per frontend-agent's end-to-end test of the 1.6B export, the v1 strategies were not ship-ready. The remaining ~24h of compute would not produce usable data. v1 baseline `unified_blueprint_1600M.bps` preserved on S3 for comparison.
+
+### v2 launch (2026-04-07 22:18 UTC)
+
+v2 launched on instance `i-0d36756d6aa2e6fcb` (c7a.metal-48xl, 192 cores) against the new `poker-blueprint-unified-v2` S3 bucket. Target: 8B iterations.
+
+v2 launch fixes (vs v1):
+- Bug B: probe symmetry 4096/4096
+- Bug C: `discount_stop_iter` default no longer hardcoded for 1000 iter/min hardware
+- Bug E: removed `% 10007` strategy_sum gate
+- Bug F: other timing C defaults set to Pluribus-aligned fractions of 1B baseline + soft warning if suspicious
+- Bug γ: atomic `iterations_run` write
+- Bug α: launch script gets all 6 perf optimizations
+- New instrumentation: `insertion_failures` and `max_probe_observed` counters exposed via `bp_get_table_stats()` API
+- Hash table sized to 2B slots (52% projected load at 8B target)
+
+### v3 commits (2026-04-07 21:50 UTC and 21:51 UTC)
+
+Two commits on `master`:
+
+- `a82219b` — Phase 1 (realtime fixes, no v2 disturbance):
+  - T1.1: `DEFAULT_CFR_ITERATIONS = 2000` in `python/hud_solver.py:506` (was 200)
+  - T1.2: deleted `python/multiway_adjust.py` and removed callers
+  - T2.1: per-action EVs in `python/leaf_values.py` (+303 lines) — **PARTIAL**, the export-tool side and C-side `bp_export_regrets()` not yet implemented
+- `48da71b` — Phases 2 + 3:
+  - Phase 2: 8 defensive bug fixes (Bug 1 short-stack CALL cap, Bug 2 `na` clamp, Bug 9 arena_alloc NULL check, Bug 14 texture cache double-alloc, Bug 10 batch_size recompute, Bug 8 spin_until_ready in get_strategy, F3 street==0 filter in apply_discount, F2 strategy_interval cleanup)
+  - Phase 3: Bug 7 texture lookup hashmap (+5–15% throughput), Bug 6 hash mixer replaced with splitmix64 (eliminates `max_probe = 4096` clustering)
+
+v3 commits do not affect the running v2. They take effect at the next training run (Phase 3.x changes slot derivation, can't resume from a v2 checkpoint), or when the realtime path is redeployed (Phase 1.x).
+
+### Tree investigation (2026-04-08)
+
+A research session enumerated the full betting tree for the deployed config and several alternatives. Key findings (all in [`STATUS.md` §Verified facts](../STATUS.md#verified-facts)):
+
+- **Action_hash hypothesis REJECTED**: full-action-history encoding only inflates the tree by 8% over a "logical state" encoding that preserves all EV-relevant state.
+- **5-bet jam line is in active use** (AA jams 49%, KK 77%, QQ 99.9% at iter 400M). Cannot cut `PREFLOP_MAX_RAISES`.
+- **`POSTFLOP_MAX_RAISES = 3 → 2` only saves 14%** of tree size. Not worth the strategic loss.
+- **River bucket abstraction is mildly degenerate** (2-6% of boards), not catastrophic. EHS-only clustering on the river is mathematically correct since PPot/NPot are zero with 5 cards known. Pluribus's EHS-histogram + EMD approach is a v4 nice-to-have, not v3 critical.
+- **Comparison to Pluribus's published 664M is ambiguous** — even the absolute-minimum config (1 bet size everywhere, max_raises 2) bottoms out at 1.34B = 2x Pluribus. Likely structural difference (per-player counting? sparse bucket allocation? something else). Can't be reached with action-abstraction tuning alone.
+
+### Doc consolidation (2026-04-08)
+
+The repo had 21 markdown files with significant overlap, stale state, and contradictory claims. Consolidated to a smaller set with `STATUS.md` as the single source of truth at root. Archived: 9 one-off prompt files, 1 stale transition doc, 1 superseded gap-tracking doc, 1 stale precompute doc, plus the agent-coordination blackboard (no longer needed since the project is solo work).
+
+Decision: **skip the v3 fresh training run.** Marginal blueprint quality improvement (1-3%) doesn't justify the cost ($55-75 + 3 days). The Phase 1-3 realtime work delivers most of the v3 benefit without retraining. Real-time multi-street search (T5.1) is the next big lever, not retraining.

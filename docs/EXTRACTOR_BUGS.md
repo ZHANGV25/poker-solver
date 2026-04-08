@@ -181,7 +181,7 @@ What worked:
    the extractor).
 2. **Conventions need to be written down.** Both the C code and the Python extractor
    "knew" how buckets were numbered, but they disagreed silently. The
-   `AGENT_COORDINATION.md` Convention Agreements section now documents the canonical
+   `STATUS.md` Convention Agreements section now documents the canonical
    bucket order so future consumers don't drift.
 3. **Don't trust your own diagnostic when both directions use the same broken
    convention.** When my diagnostic streamed strategy_sum and printed "bucket 1"
@@ -193,7 +193,7 @@ What worked:
 ## Bug B: .bps contains regret-matched strategies, not strategy_sum averages
 
 **Severity:** 🟡 moderate
-**Status:** open, owned by solver-agent (see `AGENT_COORDINATION.md` BUG-B)
+**Status:** open, owned by solver-agent (see `STATUS.md` BUG-B)
 **Affects:** all .bps files exported with current `bp_export_strategies`
 
 ### The problem
