@@ -1,0 +1,115 @@
+# v3 Execution Plan
+
+This is the canonical execution order for fixing every non-intentional deviation
+from Pluribus, across both the blueprint solver and the realtime path. This doc
+is the **WHEN** — for the **WHAT** of each item, see [`SOLVER_CONFIG.md`](SOLVER_CONFIG.md)
+§11 (blueprint backlog) and [`REALTIME_TODO.md`](REALTIME_TODO.md) (realtime backlog).
+
+**Use case context:** pivoted from HUD to trainer. Latency budget relaxed from
+<100ms to seconds-to-minutes. This unlocks several fixes that were previously
+blocked.
+
+## Already done (intentional matches + completed v2 fixes)
+
+These are confirmed Pluribus-aligned and tracked in `SOLVER_CONFIG.md`:
+
+- All algorithm constants (BP_PRUNE_PROB=0.95, regret floor -310M, regret ceiling 2B, prune threshold -300M)
+- Card abstraction (169 preflop, 200 per postflop street)
+- Linear CFR discount formula
+- Pluribus timing fractions (3.47% / 1.74% / 6.94% / 1.74%)
+- External-sampling MCCFR core
+- Bug B (probe symmetry), C/F (default config), E (% 10007 gate), γ (iterations_run race), α (launch perf), B/D (export bug + metadata) — fixed in v2
+- Bug 11 (Hogwild duplicates) fix already in code
+
+## Phase 1 — High impact, low cost (parallel with v2, ~1 day)
+
+| # | Item | File:line | Effort | Disturbs v2? |
+|---|---|---|---|---|
+| 1.1 | **T1.1: bump CFR iterations 200 → 2000** in realtime solver | `python/hud_solver.py:829` | 5 LOC | no |
+| 1.2 | **T1.2: delete `python/multiway_adjust.py`** and remove callers | `python/multiway_adjust.py`, `hud_solver.py:561-562, 568-569` | 30 min | no |
+| 1.3 | **T2.1: per-action EVs for realtime leaf values** | `python/leaf_values.py` (computation), `python/hud_solver.py` (wiring) | ~1 day | no |
+
+## Phase 2 — Defense-in-depth fixes (parallel with v2, ~2-3 hours)
+
+These are small isolated bug fixes. None affect v2's output (defensive only)
+but they need to be in the next-training-run code base.
+
+| # | Item | File:line | Effort |
+|---|---|---|---|
+| 2.1 | **Bug 1**: cap CALL against player stack | `mccfr_blueprint.c:1227-1232, 1305-1310` | 10 LOC |
+| 2.2 | **Bug 2**: lower-only `na` clamp on hash collision | `mccfr_blueprint.c:1186-1190` | 3 LOC |
+| 2.3 | **Bug 9**: NULL check after `arena_alloc` | `mccfr_blueprint.c:418-422` | 5 LOC |
+| 2.4 | **Bug 14**: texture cache double-allocation guard | `mccfr_blueprint.c:1626` | 3 LOC |
+| 2.5 | **Bug 10**: recompute `batch_size` at discount→post-discount boundary | `mccfr_blueprint.c:2143-2150` | 10 LOC |
+| 2.6 | **Bug 8**: `spin_until_ready` in `bp_get_strategy`/`bp_get_regrets` | `mccfr_blueprint.c:2392-2418, 2378-2424` | 15 LOC |
+| 2.7 | **F3**: `street == 0` filter in `apply_discount` | `mccfr_blueprint.c:1374-1378` | 3 LOC |
+| 2.8 | **F2**: remove dead `strategy_interval` field (or rename for ABI safety) | `mccfr_blueprint.h:102`, ~30 callers | 30 min |
+
+## Phase 3 — Quality / perf improvements (parallel with v2, ~3-4 hours)
+
+| # | Item | File:line | Effort | Impact |
+|---|---|---|---|---|
+| 3.1 | **Bug 7**: replace texture lookup linear scan with hashmap | `mccfr_blueprint.c:971-977` | 30 LOC | 5-15% solver speedup |
+| 3.2 | **Bug 6**: replace `hash_combine` with xxHash3 for `action_hash` | `mccfr_blueprint.c:223-226, 322-336` | 50 LOC | ~3% → ~0.001% collision rate |
+
+## Phase 4 — Wait for v2 to finish (~3 days, passive)
+
+No work. Monitor v2 progress until it reaches 8B iters (~2026-04-11).
+
+## Phase 5 — Verify after v2 finishes (~1 hour)
+
+| # | Item |
+|---|---|
+| 5.1 | Verify the realtime solver works with the new (Phase 1.3) leaf-value code against v2's exported `unified_blueprint.bps` |
+| 5.2 | Run on test spots, confirm 4 continuation strategies produce 4 distinct biased leaf values |
+| 5.3 | Verify multiway path (Phase 1.2) works without heuristics in 3-way and 4-way scenarios |
+
+## Phase 6 — Subgame depth analysis (research, ~3-5 days)
+
+| # | Item | Effort |
+|---|---|---|
+| 6.1 | T3.1: build a multi-street CPU CFR for ground-truth comparison | ~2 days |
+| 6.2 | Run on 30-50 representative spots | ~1-2 days |
+| 6.3 | Measure single-street vs multi-street vs full-game L1 distance | ~1 day |
+
+**Decision point at end of Phase 6:** if single-street stays within ~5% L1 of
+full-game on most spots, skip Phase 7.1. Otherwise proceed.
+
+## Phase 7 — Subgame depth and large gaps (size depends on Phase 6)
+
+| # | Item | Effort | Conditional? |
+|---|---|---|---|
+| 7.1 | T5.1: multi-street GPU kernel | ~1-2 weeks | only if Phase 6 says it's needed |
+| 7.2 | T4.1: preflop re-solve on large deviations | ~1 week | always |
+| 7.3 | Realtime action set expansion (3 → 5-7 sizes) | ~1 day + tuning | always |
+
+## Phase 8 — Optional / final cleanup
+
+| # | Item | Notes |
+|---|---|---|
+| 8.1 | F1: literal Pluribus average strategy mechanism | **Recommended SKIP.** Our per-visit accumulation is mathematically lower-variance than the paper's. Implementing the paper's method makes the solver worse on every dimension except literal alignment. |
+| 8.2 | Documentation cleanup — scrub stale "heads-up only" comments | Cosmetic |
+
+---
+
+## Summary
+
+| Phase | When | Duration | Disturbs v2? |
+|---|---|---|---|
+| 1 | now | ~1 day | no |
+| 2 | now (parallel) | ~2-3 hours | no |
+| 3 | now (parallel) | ~3-4 hours | no |
+| 4 | passive | ~3 days | n/a |
+| 5 | after v2 | ~1 hour | no |
+| 6 | after Phase 5 | ~3-5 days | no |
+| 7 | after Phase 6 | 1-3 weeks | no |
+| 8 | last | ~1-2 days | requires v3 retrain |
+
+**Phases 1-3 can all be committed today and don't disturb the running v2.**
+Total code change estimate: ~400-500 LOC across ~10 files.
+
+## Decision log
+
+| Date | Decision |
+|---|---|
+| 2026-04-07 | Approved Phases 1-3 for immediate execution. F1 (Phase 8.1) marked as recommended-skip. |
