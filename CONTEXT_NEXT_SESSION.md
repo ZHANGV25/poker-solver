@@ -80,7 +80,7 @@ An exact copy of Pluribus (Brown & Sandholm, Science 2019):
 - `bias_strategy()` — 5x fold/call/raise biasing (Pluribus-exact)
 
 **`off_tree.py`** — Pseudoharmonic bet interpolation
-**`multiway_adjust.py`** — Heuristic N-player adjustments (fallback when true N-player search unavailable)
+**(`multiway_adjust.py` was deleted in v3 — see docs/V3_PLAN.md Phase 1.2. The N-player GPU solver in `src/cuda/street_solve.cu` handles 2-6 players natively now.)**
 
 ### Python — Blueprint Generation (`precompute/`)
 

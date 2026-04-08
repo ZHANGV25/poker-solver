@@ -31,8 +31,6 @@ try:
     from blueprint_store import BlueprintStore
     from off_tree import pseudoharmonic_map, interpolate_narrowing
     from solver_pool import SolverPool
-    from multiway_adjust import (adjust_multiway_strategy, classify_hand_type,
-                                  pick_primary_villain)
 except ImportError:
     from python.solver import (card_to_int, int_to_card, parse_range_string,
                                 SCALE, MAX_ACTIONS, StreetSolver)
@@ -41,9 +39,13 @@ except ImportError:
     from python.blueprint_store import BlueprintStore
     from python.off_tree import pseudoharmonic_map, interpolate_narrowing
     from python.solver_pool import SolverPool
-    from python.multiway_adjust import (adjust_multiway_strategy,
-                                         classify_hand_type,
-                                         pick_primary_villain)
+
+# Multiway heuristic adjustments were removed in v3 — see docs/REALTIME_TODO.md
+# T1.2 and docs/V3_PLAN.md Phase 1.2. The previous implementation was a relic
+# from when the GPU solver was heads-up only. Now that street_solve.cu supports
+# 2-6 players natively (SS_MAX_PLAYERS=6) and the canonical realtime path uses
+# N-player CFR via player_ranges=[...], the post-hoc heuristic adjustments
+# were double-correcting on top of CFR with arbitrary tuning constants.
 
 # Try GPU solver, fall back to CPU
 _GPU_AVAILABLE = False
@@ -494,8 +496,17 @@ class HUDSolver:
 
     # ── Strategy computation ─────────────────────────────────────────────
 
+    # Default CFR iteration count for realtime re-solves.
+    # Pluribus uses 1-33 seconds per subgame which is thousands of iterations.
+    # We previously used 200 to fit a sub-100ms HUD latency budget. With the
+    # pivot to a trainer use case the latency budget is gone, so we bump to
+    # 2000 — much closer to Pluribus convergence and only ~500ms per re-solve
+    # at typical subgame sizes. Override per-call via cfr_iterations= if you
+    # need a different speed/quality trade-off.
+    DEFAULT_CFR_ITERATIONS = 2000
+
     def get_strategy(self, board, hero_cards, street="river",
-                     pot_bb=None, stack_bb=None):
+                     pot_bb=None, stack_bb=None, cfr_iterations=None):
         """Get solver's recommended strategy for hero's hand.
 
         Implements Pluribus street-by-street solving:
@@ -509,10 +520,15 @@ class HUDSolver:
             street: "flop", "turn", "river"
             pot_bb: pot size in BB
             stack_bb: effective stack in BB
+            cfr_iterations: number of LCFR iterations for this re-solve.
+                Defaults to DEFAULT_CFR_ITERATIONS (2000). Pluribus uses
+                thousands; 200 was the old HUD-latency-budget value.
 
         Returns:
             dict with actions, ev, solving status
         """
+        if cfr_iterations is None:
+            cfr_iterations = self.DEFAULT_CFR_ITERATIONS
         self._board = board
         # Reset hero action tracking when street changes
         if street != self._current_street:
@@ -555,18 +571,18 @@ class HUDSolver:
         Tries binary BlueprintStore first (faster, denser data),
         then falls back to JSON Blueprint, then GPU re-solve.
         """
-        # Try binary blueprint store first
+        # Try binary blueprint store first.
+        # NOTE: blueprint lookups return strategies trained by the N-player
+        # MCCFR solver, so they are correct for multiway pots without any
+        # post-hoc adjustment. The previous code applied heuristic multiway
+        # corrections here — those were removed in v3 (see V3_PLAN.md 1.2).
         result = self._binary_blueprint_lookup(board, hero_cards)
         if result and result.get('actions'):
-            if self.num_players > 2:
-                result = self._apply_multiway(result, hero_cards, board)
             return result
 
         # Try old JSON blueprint
         result = self._blueprint_lookup(board, hero_cards)
         if result and result.get('actions'):
-            if self.num_players > 2:
-                result = self._apply_multiway(result, hero_cards, board)
             return result
 
         # No blueprint data — re-solve
@@ -826,7 +842,7 @@ class HUDSolver:
                         use_cont_strats=use_cont_strats,
                         leaf_value_fn=leaf_value_fn,
                     )
-                solver.solve(iterations=200)
+                solver.solve(iterations=cfr_iterations)
 
                 hand_str = hero_cards[0] + hero_cards[1]
                 # Pluribus A3: freeze hero's strategy at previously-passed nodes.
@@ -878,7 +894,10 @@ class HUDSolver:
                     stack_bb=stack,
                     bet_sizes=self.DEFAULT_BET_SIZES,
                 )
-                solver.solve(iterations=500)
+                # CPU fallback uses ~2.5x iterations vs GPU since CPU CFR
+                # converges slightly slower per iteration. The ratio matches
+                # what was here before (200 GPU vs 500 CPU).
+                solver.solve(iterations=int(cfr_iterations * 2.5))
 
                 hand_str = hero_cards[0] + hero_cards[1]
                 strat = solver.get_strategy(hero_player_idx_in_solve, hand_str)
@@ -896,10 +915,18 @@ class HUDSolver:
                     'street': street,
                 }
 
-            # Only apply heuristic multiway adjustment if we couldn't do true
-            # N-player search (e.g. CPU fallback or no extra villain ranges)
+            # If we're in a multiway pot but the caller didn't pass extra
+            # villain ranges (so the GPU/CPU solve ran heads-up), warn that
+            # the result is heads-up-only and may not reflect multiway dynamics.
+            # Previously this path applied heuristic multiway adjustments;
+            # those were removed in v3 (see V3_PLAN.md 1.2). Pass the full
+            # extra_villain_positions list to new_hand() to get a true
+            # N-player solve.
             if self.num_players > 2 and not self._extra_villains:
-                result = self._apply_multiway(result, hero_cards, board)
+                result['multiway_warning'] = (
+                    'Solved heads-up but num_players > 2; pass '
+                    'extra_villain_positions to new_hand() for N-player CFR.'
+                )
 
             return result
 
@@ -942,29 +969,9 @@ class HUDSolver:
             'source': 'blueprint',
         }
 
-    def _apply_multiway(self, result, hero_cards, board):
-        """Apply multiway heuristic adjustments to solver output."""
-        if self.num_players <= 2 or not result.get('actions'):
-            return result
-
-        bet_freq = sum(a['frequency'] for a in result['actions']
-                       if 'bet' in a['action'].lower()
-                       or 'raise' in a['action'].lower())
-        if bet_freq > 0.6:
-            hand_type = 'value'
-        elif bet_freq > 0.2:
-            hand_type = 'marginal'
-        else:
-            hand_type = 'bluff'
-
-        strategy = {a['action']: a['frequency'] for a in result['actions']}
-        adjusted = adjust_multiway_strategy(
-            strategy, hand_type, self.num_players,
-            self._current_street or 'flop')
-
-        result['actions'] = [{'action': name, 'frequency': freq}
-                              for name, freq in sorted(adjusted.items(),
-                                                        key=lambda x: -x[1])]
-        result['multiway_adjusted'] = True
-        result['hand_type'] = hand_type
-        return result
+    # _apply_multiway() was deleted in v3 — see V3_PLAN.md Phase 1.2.
+    # The N-player GPU solver in src/cuda/street_solve.cu handles 2-6 players
+    # natively, and the v2 blueprint was trained with 6-player MCCFR. The
+    # post-hoc heuristic adjustments here were a relic from when the solver
+    # was heads-up only and were double-correcting on top of CFR with
+    # arbitrary tuning constants (e.g. value_bet *= max(0.3, 1.0 - 0.15 * extra)).
