@@ -75,12 +75,31 @@ heuristics — those would be separate bugs to investigate.
 
 ### T2.1 — Extend .bps export with per-action EVs
 
-**The bug:** The .bps export currently stores `strategy[bucket, action]` only.
-The realtime solver's leaf-value path needs `EV[bucket, action]` to compute the
-4 Pluribus continuation strategies (unmodified, fold-bias, call-bias, raise-bias)
-properly. Without per-action EVs, all 4 bias profiles collapse to the same leaf
-value, defeating the entire point of depth-limited solving with continuation
-strategies.
+**Where the breakage actually is:** the **blueprint training itself is fine** —
+`mccfr_blueprint.c:1259-1270` does the standard MCCFR regret update
+(`delta = action_values[a] - node_value`), regrets accumulate correctly, and
+the strategy derived from regrets is Pluribus-aligned. The blueprint represents
+the strategy, not EVs, and it doesn't need to.
+
+The breakage is **only in the realtime leaf-value path**:
+`python/leaf_values.py.compute_flop_leaf_equity` (called from
+`hud_solver.py:754-779` on the v2 .bps path) computes leaf values as
+"showdown equity from this position", which doesn't depend on what action
+the player took at the leaf info set. So when the GPU CFR sits at a leaf
+decision and asks "what's the value of each action?" it gets the SAME
+number for every action.
+
+This collapses Pluribus's 4 continuation strategies (unmodified, fold-bias,
+call-bias, raise-bias) to a single equity value. The depth-limited solving
+loses its main variance-reduction trick.
+
+**Impact:** flop subgame strategies are slightly less accurate than Pluribus's
+would be, particularly on close-call mixed-strategy spots. River play is
+**unaffected** (river leaves are showdown which has exact values). Turn play
+has a smaller effect (1 street to the leaf vs 2 for flop). The Brown & Sandholm
+2018 NeurIPS paper showed depth-limited + continuation strategies stays within
+~5% of full-solving exploitability; without continuation strategies the gap
+grows to ~10-20%. For our flop solver, that's the gap we're paying.
 
 The honest comment is in `python/hud_solver.py:740-751`:
 > "Without full per-action turn EVs from the v2 blueprint, we compute per-turn-card
@@ -88,39 +107,54 @@ The honest comment is in `python/hud_solver.py:740-751`:
 > equity value since we lack per-action EVs to differentiate them. This is
 > conservative — the GPU search refines leaf values via CFR iterations regardless."
 
-**The math:** From the regret-matching identity,
-```
-R(I, a) = E[u(a)] - E[u(σ))
-→ E[u(a)] = R(I, a) + E[u(σ))
-```
-We don't store `E[u(σ))` (the node value at info set I) but we can compute it
-during export by accumulating regret-weighted action values.
+**The fix path (no restart needed):**
 
-**Change (no restart needed — export is a separate process):**
+The .bps export is a separate one-shot process from the running solver. The
+running v2 just writes raw regret checkpoints periodically; the export tool
+(`precompute/export_v2.py`) loads a checkpoint and produces a .bps. Modifying
+the export tool doesn't affect the running solver.
+
+**The right approach is a post-hoc tree walk at export time** that computes
+per-action EVs from the converged blueprint strategies. Math: at every info
+set `I`, `node_value(I) = sum_a strategy(I, a) * action_value(I, a)` where
+`action_value(I, a) = expected immediate value + node_value(child(I, a))`.
+This gives an **exact** computation of "EV of action a assuming both players
+play the converged blueprint from this point on" — which is exactly what
+the Pluribus continuation-strategy formula needs.
+
+**Why post-hoc is strictly better than tracking-during-training:** if you
+tracked EVs during training instead, you'd be averaging samples taken under
+a *changing* strategy (early iterations use a near-uniform strategy, late
+iterations use the near-converged strategy). The result is a noisy mix.
+Post-hoc uses the *converged* strategy at every node, giving exact EVs.
+
+**Three-step implementation:**
 
 1. **C side:** add `bp_export_regrets()` companion to `bp_export_strategies()`
    in `src/mccfr_blueprint.c`. Output the same `(bucket, action)` indexing as
-   strategies, but emitting `regrets[a]` instead of `strategy[a]`. ~30 LOC.
+   strategies, but emitting `regrets[a]` instead of `strategy[a]`. Optionally
+   also emit a precomputed per-action EV table from a single bottom-up tree
+   walk during export. ~30-80 LOC depending on whether we precompute EVs in C
+   or in Python. ~30 LOC.
 
 2. **Export tool side:** extend `precompute/export_v2.py` to also call
-   `bp_export_regrets()` and pack the regrets alongside strategies in the .bps
-   file. Bump `schema_version` from 2 to 3. ~20 LOC.
+   `bp_export_regrets()` (and optionally `bp_export_action_evs()`) and pack
+   the new data alongside strategies in the .bps file. Bump `schema_version`
+   from 2 to 3. ~20 LOC.
 
 3. **Realtime solver side:** in `python/leaf_values.py`, add a path that reads
-   regrets from the v2 .bps blueprint, computes per-action EVs via the
-   regret-matching identity (with node values from a one-pass tree walk over
-   the blueprint), and plugs into the existing `bias_strategy()` and
-   `compute_*_leaf_values()` machinery. ~50 LOC.
+   per-action EVs from the v2 .bps blueprint and plugs into the existing
+   `bias_strategy()` and `compute_*_leaf_values()` machinery. ~50 LOC.
 
 **Effort:** ~1 day.
 
-**No restart needed:** the .bps export is a one-shot tool that loads a
-checkpoint and writes a file. Modifying `mccfr_blueprint.c`'s export functions
-and re-running `export_v2.py` against the final v2 8B checkpoint produces a
-new .bps with per-action EVs. The running v2 solver doesn't need to know.
+**No restart needed.** The running v2 solver just writes raw regret checkpoints.
+The export tool runs after v2 finishes (or right now from any existing
+checkpoint). Modifying the export tool and re-running it against the final
+v2 8B checkpoint produces the corrected .bps. The running solver process
+doesn't need to know.
 
-**When to apply:** after v2 reaches 8B target naturally. Don't terminate v2 to
-do this.
+**When to apply:** after v2 reaches 8B target naturally. Don't terminate v2.
 
 ## Priority 3 — Subgame depth analysis
 
