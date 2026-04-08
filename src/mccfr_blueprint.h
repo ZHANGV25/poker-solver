@@ -68,8 +68,19 @@ typedef struct {
 /* Info set data — integer regrets for memory efficiency.
  * Pluribus stores regrets as int32, strategies derived from regrets.
  * With bucket-in-key, each info set stores regrets for ONE bucket only.
- * strategy_sum is only maintained for round 1 (preflop).
- * For rounds 2-4, snapshots of current strategy are saved to disk. */
+ *
+ * strategy_sum lifecycle (NOTE: this differs from Pluribus — see SOLVER_CONFIG.md §10):
+ *   - Round 1: accumulated continuously by traverse() at mccfr_blueprint.c:1283-1289
+ *     on every traverser visit (full regret-matched distribution added).
+ *   - Rounds 2-4: accumulated in-memory by accumulate_snapshot() at
+ *     mccfr_blueprint.c:1343-1358, called from bp_solve at snapshot barriers.
+ *     Note that accumulate_snapshot does NOT filter by street, so round 1 also
+ *     gets snapshot-accumulated in addition to per-visit accumulation.
+ *
+ * Pluribus uses a sparse sampled UPDATE-STRATEGY for round 1 (every 10K iters,
+ * one path sampled, single phi[I,a] += 1) and on-disk snapshots for rounds 2-4
+ * to halve memory. We use full-distribution per-visit + in-memory snapshots,
+ * which is algorithmically defensible (lower variance, more memory). */
 typedef struct {
     int num_actions;
     int *regrets;          /* [num_actions], int32 */
