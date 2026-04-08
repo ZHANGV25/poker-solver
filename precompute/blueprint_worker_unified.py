@@ -352,9 +352,14 @@ def main():
     t0 = time.time()
 
     # Checkpoint schedule: dense early, then every 300M for spot safety.
-    # Target: 4B iterations. Every checkpoint uploaded to S3 so spot
-    # reclamation loses at most ~300M iterations (~5.5h at 15K iter/s).
+    # Target: 8B iterations. Every checkpoint uploaded to S3 so spot
+    # reclamation loses at most one checkpoint's worth of iterations.
+    #
+    # Early checkpoints (50M/100M/150M) were added after the v3 run died to
+    # spot reclamation at 178M iters with no checkpoint to resume from. With
+    # these, worst-case loss from an early spot kill is ~50M iters (~25 min).
     checkpoint_milestones = [
+        50_000_000, 100_000_000, 150_000_000,
         200_000_000, 400_000_000, 600_000_000,
         900_000_000, 1_200_000_000, 1_500_000_000, 1_800_000_000,
         2_100_000_000, 2_400_000_000, 2_700_000_000, 3_000_000_000,

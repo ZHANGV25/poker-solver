@@ -239,7 +239,7 @@ INSTANCE_ID=$(aws ec2 run-instances \
     --key-name "$KEY_NAME" \
     --security-groups "$SECURITY_GROUP" \
     --iam-instance-profile "Name=$PROFILE_NAME" \
-    --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":200,"VolumeType":"gp3"}}]' \
+    --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":200,"VolumeType":"gp3","Throughput":1000,"Iops":16000}}]' \
     $SPOT_ARGS \
     --user-data "$USERDATA_B64" \
     --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=bp-unified-v3},{Key=Project,Value=poker-solver-unified-v3}]" \
