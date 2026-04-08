@@ -2,7 +2,7 @@
 
 **This is the single source of truth for the poker-solver repo.** Read this first. Everything else is either reference (frozen) or appendix (for one specific subsystem).
 
-Last updated: 2026-04-08
+Last updated: 2026-04-08 (Phase 1.3 implementation landed on master, verification in progress)
 
 ---
 
@@ -39,7 +39,7 @@ All v3 work is in **two commits on `master`**: `a82219b` (Phase 1) and `48da71b`
 |---|---|---|---|---|
 | 1.1 | CFR iters 200 → 2000 in realtime solver | `python/hud_solver.py:506` | ✅ | `DEFAULT_CFR_ITERATIONS = 2000` |
 | 1.2 | Delete `multiway_adjust.py` heuristics | `python/multiway_adjust.py` (gone) | ✅ | Trust N-player CFR |
-| 1.3 | Per-action EVs in `leaf_values.py` | `python/leaf_values.py` (+303 lines) | ⚠️ **PARTIAL** | Realtime side reads per-action EVs, but the export tool was NOT updated and the C side `bp_export_regrets()` was NOT added. `precompute/export_v2.py` still writes `schema_version: 2`. The realtime path falls back to the equity-only computation. **To fully ship, need the export-tool changes.** |
+| 1.3 | Per-action EVs via σ̄-sampled walk | `src/mccfr_blueprint.c`, `precompute/export_v2.py`, `python/blueprint_v2.py`, `docs/PHASE_1_3_DESIGN.md` | ⚠️ **CODE LANDED, VERIFICATION PENDING** | Code shipped to master in commits `199c243` + `73c6adc`. Linux build verified clean. Real-data verification blocked mid regret-load on r6i.8xlarge — session time budget hit before the load completed (~25-30 min serial fread dominates). Next session: resume verification against the 1.5B v2 checkpoint, run sentinels, upload v3 .bps. See §"Finish the Phase 1.3 export-tool work" below. |
 | 2.1–2.8 | 8 defensive bug fixes | `src/mccfr_blueprint.c` | ✅ | All defensive — none change blueprint output in normal v2 conditions |
 | 3.1 | Bug 7: texture lookup → hashmap | `src/mccfr_blueprint.c:268+` | ✅ | +5–15% throughput when applied |
 | 3.2 | Bug 6: hash mixer → splitmix64 | `src/mccfr_blueprint.c:241–259` | ✅ | Eliminates the `max_probe = 4096` clustering. Requires fresh run to take effect (changes slot derivation). |
@@ -190,13 +190,56 @@ ETA ~2026-04-11. No action needed. Don't terminate. Watch the dashboard at `http
 
 ### 2. Finish the Phase 1.3 export-tool work
 
-Currently the realtime side reads per-action EVs but the export side doesn't write them. To complete Phase 1.3 you need:
+**Status as of 2026-04-08 evening: code landed on master (commits `199c243` and `73c6adc`),
+Linux build verified, real-data verification blocked mid-regret-load due to session time budget.**
 
-1. **C side:** add `bp_export_regrets()` to `src/mccfr_blueprint.c`. Output `(bucket, action) → int regret` in the same indexing as `bp_export_strategies()`. ~30 LOC.
-2. **Export tool:** extend `precompute/export_v2.py` to call `bp_export_regrets()` and pack the new data alongside strategies in the .bps file. Bump `schema_version` from 2 to 3. ~20 LOC.
-3. **Realtime:** the consumer side in `python/leaf_values.py` is already done.
+Code changes (landed on master):
+- `src/mccfr_blueprint.c`: `traverse_ev()` (σ̄-sampled MCCFR walk), `bp_compute_action_evs()`,
+  `bp_export_action_evs()`, `ensure_action_evs()`, `avg_strategy()` helpers
+- `src/mccfr_blueprint.h`: `BPInfoSet` gains `action_evs` + `ev_visit_count` fields;
+  two new public function declarations
+- `precompute/export_v2.py`: ctypes bindings, EV walk invocation (controlled by
+  `EV_WALK_ITERS` env var, default 50M), LZMA-compressed BPR3 section appended to .bps,
+  schema_version bumped 2→3
+- `python/blueprint_v2.py`: trailing BPR3 section parser, `get_all_bucket_action_evs()`,
+  `has_action_evs()` accessors
+- `precompute/verify_phase_1_3.py`: sentinel verification script
+- `docs/PHASE_1_3_DESIGN.md`: full mathematical design and algorithm
 
-This work is **separable from the running v2** — the export tool runs after v2 finishes (or at any checkpoint), and modifying it doesn't affect the live process.
+Rather than a simple raw-regret export, Phase 1.3 does a **post-hoc σ̄-sampled MCCFR
+walk** (see `docs/PHASE_1_3_DESIGN.md` for the math). `traverse_ev()` is a read-only
+sibling of `traverse()` that samples from the average strategy and accumulates
+per-action EVs into `is->action_evs[]`. No retraining required — it runs against any
+existing checkpoint.
+
+**To complete verification (next session):**
+
+1. Launch EC2: **`r6i.8xlarge`** (256 GB RAM, ~$2/hr). Important:
+   - `r6i.2xlarge` (64 GB) and `r6i.4xlarge` (128 GB) both **OOM** during regret load.
+     The Phase 1.3 BPInfoSet extensions add ~8 GB of struct overhead on top of the
+     existing hash table, which pushes the 1.5B v2 checkpoint over the r6i.4xlarge
+     limit.
+2. `poker-solver-key` in us-east-1, Ubuntu 22.04 AMI, sg `poker-solver-sg`.
+3. SCP source tarball (or clone via GitHub auth — the public mirror is too stale).
+4. Download caches to `/tmp/` BEFORE running:
+   - `s3://poker-blueprint-unified-v2/texture_cache.bin` → `/tmp/texture_cache.bin`
+   - Turn centroids need fresh compute (~7.5 min) because the S3 file has stale
+     magic `TKC1` — C code expects `TCN1`. Copy the regenerated file to
+     `/home/ubuntu/` so stop/start cycles don't lose it. Subsequent runs skip the
+     precompute when `/tmp/turn_centroids.bin` with `TCN1` magic is present.
+5. `EV_WALK_ITERS=1000000 python3 precompute/export_v2.py /path/to/regrets_1500M.bin
+   /home/ubuntu/out '' 1073741824` for a fast smoke test. Scale to 50M for production.
+6. **Regret load takes ~25-30 minutes** on a single thread because the loader is
+   serial fread of 1.2B entries. This dominates the wall time.
+7. Run `python3 precompute/verify_phase_1_3.py /home/ubuntu/out/unified_blueprint.bps`
+   to sentinel-check.
+8. If sentinels pass: upload v3 .bps to S3 as `unified_blueprint_v3_1.5B.bps`.
+9. **Terminate EC2** (don't just stop — EBS charges continue). Verify in console.
+
+Known gotcha: the EC2 AWS credentials uploaded for S3 access need to be wiped
+(`shred -u ~/.aws/credentials`) before termination, AND the user's long-lived access
+key `AKIAQD7AYAUBM43NHZWY` (for IAM user `prithish`) **should be rotated** — it was
+exposed in the previous session's terminal output.
 
 ### 3. After v2 reaches 8B: re-export with the new tool
 
