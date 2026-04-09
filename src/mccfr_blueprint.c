@@ -3253,6 +3253,19 @@ static int64_t load_regrets_serial(BPSolver *s, FILE *f,
 
         BPInfoSet *is = &t->sets[slot];
 
+        /* Read regrets into a temp buffer, check if the slot already
+         * has data (= duplicate key from the Hogwild race bug), then
+         * ADD to the slot. For fresh slots (arena zeroed): 0 + new =
+         * new. For duplicate keys: existing + new = merged sum.
+         *
+         * NOTE: the is_dup counter is a LOWER BOUND, not an exact
+         * count. If a pair of duplicate regrets happens to sum to
+         * zero in every slot, a third duplicate would see all-zero
+         * regrets and be mis-reported as "not a duplicate". The
+         * arithmetic is still correct (the add is idempotent on the
+         * zero state); only the `[BP] WARNING: merged N` log line
+         * would under-count. Rare in practice on non-trivially
+         * trained checkpoints. */
         fread(tmp_regrets, sizeof(int), na, f);
         int is_dup = 0;
         for (int a = 0; a < na; a++) {

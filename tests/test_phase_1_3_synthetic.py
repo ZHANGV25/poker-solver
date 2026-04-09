@@ -499,6 +499,213 @@ def parse_bpr3_inner(blob: bytes):
 TOLERANCE_CHIPS = 2.0  # loose — accounts for σ̄-sampling variance in C
 
 
+# ── Check C: root-enumeration cross-check ──
+#
+# Independently computes v̄(root, a) for each action at the flop root
+# by enumerating the ENTIRE game tree in Python: all betting sequences
+# × all 45 × 44 valid (turn, river) card combinations × treys showdown
+# evaluations. Uses the C-exported σ̄ as the decision-node distribution
+# (at both traverser and opponent nodes — we compute the true
+# expectation, not a σ̄-sample).
+#
+# If the computed values match the exported action_evs[root] to within
+# sampling noise, that's strong evidence the C walker's chance-node
+# averaging and showdown evaluation are correct. It doesn't prove σ̄
+# itself is correct (we still trust the solver for that), but it proves
+# the EV export is self-consistent with σ̄ at the root under an
+# independent computation path that goes through every piece of the
+# chance/showdown code.
+#
+# Requires `treys` for eval7. Skipped if not installed.
+
+try:
+    from treys import Card as _TreysCard, Evaluator as _TreysEvaluator
+    _TREYS_OK = True
+    _TREYS_EVAL = _TreysEvaluator()
+except ImportError:
+    _TREYS_OK = False
+    _TREYS_EVAL = None
+
+_RANKS = "23456789TJQKA"
+_SUITS = "cdhs"
+
+
+def _solver_to_treys(c: int) -> int:
+    return _TreysCard.new(_RANKS[c >> 2] + _SUITS[c & 3])
+
+
+def _showdown_ev_2p(board5: List[int], hands: List[Tuple[int, int]],
+                    pot: int, invested: Tuple[int, ...],
+                    traverser: int) -> float:
+    """2-player showdown EV from traverser's perspective. Assumes both
+    active."""
+    b = [_solver_to_treys(c) for c in board5]
+    h0 = [_solver_to_treys(c) for c in hands[0]]
+    h1 = [_solver_to_treys(c) for c in hands[1]]
+    s0 = _TREYS_EVAL.evaluate(h0, b)
+    s1 = _TREYS_EVAL.evaluate(h1, b)
+    # Lower treys score = better hand
+    if s0 < s1:
+        winner = 0
+    elif s1 < s0:
+        winner = 1
+    else:
+        return pot / 2.0 - invested[traverser]
+    if winner == traverser:
+        return float(pot - invested[traverser])
+    return -float(invested[traverser])
+
+
+def _enum_v(node: DecisionNode, board: Tuple[int, ...],
+            cfg: GameConfig, strat_table: Dict, traverser: int,
+            blocked: set) -> float:
+    """Recursively compute v̄(node) under the σ̄-weighted tree walk,
+    from `traverser`'s perspective. `board` is the current board
+    (3 cards before turn, 4 before river, 5 at/after river deal)."""
+    # Terminal: all but one folded
+    if count_active(node.active) <= 1:
+        winner = next(p for p in range(cfg.num_players) if node.active[p])
+        if winner == traverser:
+            return float(node.pot - node.invested[traverser])
+        return -float(node.invested[traverser])
+
+    if round_done(node, cfg):
+        if len(board) >= 5 and node.street >= 3:
+            # River showdown
+            return _showdown_ev_2p(list(board), cfg.hands,
+                                   node.pot, node.invested, traverser)
+        # Street transition: enumerate all valid next cards
+        next_street = node.street + 1
+        blocked_now = blocked | set(board)
+        valid_cards = [c for c in range(52) if c not in blocked_now]
+        if not valid_cards:
+            return 0.0
+        total = 0.0
+        for card in valid_cards:
+            new_board = board + (card,)
+            next_node = DecisionNode(
+                street=next_street,
+                acting_player=0,
+                bets=tuple([0] * cfg.num_players),
+                invested=node.invested,
+                stacks=node.stacks,
+                pot=node.pot,
+                num_raises=0,
+                active=node.active,
+                has_acted=tuple([0] * cfg.num_players),
+                action_history=node.action_history,
+            )
+            # Advance to first active player (player 0 by convention)
+            if not next_node.active[0]:
+                nxt = next_active_order(next_node, cfg)
+                if nxt is None:
+                    continue
+                next_node = DecisionNode(
+                    street=next_node.street, acting_player=nxt,
+                    bets=next_node.bets, invested=next_node.invested,
+                    stacks=next_node.stacks, pot=next_node.pot,
+                    num_raises=next_node.num_raises,
+                    active=next_node.active,
+                    has_acted=next_node.has_acted,
+                    action_history=next_node.action_history,
+                )
+            total += _enum_v(next_node, new_board, cfg, strat_table,
+                             traverser, blocked)
+        return total / len(valid_cards)
+
+    # Decision node: σ̄-weighted average over all actions
+    bucket = 0
+    ah = _compute_action_hash(list(node.action_history))
+    key = (node.acting_player, node.street, bucket, ah)
+    strat = strat_table.get(key)
+    legal = legal_actions(node, cfg)
+
+    if strat is None:
+        # Info set not in exported table → fall back to uniform
+        strat = np.full(len(legal), 1.0 / len(legal), dtype=np.float32)
+
+    if len(strat) != len(legal):
+        # Action count mismatch — can't proceed cleanly. Fall back to
+        # uniform on the legal count.
+        strat = np.full(len(legal), 1.0 / len(legal), dtype=np.float32)
+
+    total = 0.0
+    for a_idx, action in enumerate(legal):
+        if strat[a_idx] == 0:
+            continue
+        child = apply_action(node, action, cfg)
+        kind, next_node, meta = advance_to_next_decision(child, cfg)
+        if kind == "fold_terminal":
+            v = meta["payoffs"][traverser]
+        elif kind == "decision":
+            v = _enum_v(next_node, board, cfg, strat_table, traverser, blocked)
+        else:
+            # chance — use the same child state, let _enum_v resolve it
+            v = _enum_v(child, board, cfg, strat_table, traverser, blocked)
+        total += float(strat[a_idx]) * v
+    return total
+
+
+def check_c_root_enumeration(cfg: GameConfig, strat_table: Dict,
+                              ev_table: Dict) -> Optional[str]:
+    """Compute v̄(root, a) for each action at the flop root via full
+    tree enumeration, compare to exported action_evs[root]. Returns
+    None on pass, or an error string on failure."""
+    if not _TREYS_OK:
+        return "SKIP: treys not installed"
+
+    # Build blocked set: hole cards only (flop is the current board)
+    blocked = set()
+    for h in cfg.hands:
+        blocked.update(h)
+    # Also block the flop cards themselves so valid_cards excludes them
+    blocked.update(cfg.flop)
+
+    root = start_of_street_node(cfg, 1, ())
+    root_key = (0, 1, 0, _compute_action_hash([]))
+    exported_evs = ev_table.get(root_key)
+    if exported_evs is None:
+        return f"root info set {root_key} not in ev_table"
+
+    legal = legal_actions(root, cfg)
+    if len(legal) != len(exported_evs):
+        return (f"root action count mismatch: legal={len(legal)} "
+                f"exported={len(exported_evs)}")
+
+    print(f"  enumerating root ({len(legal)} actions × full tree)...")
+    print(f"  valid turn cards: {52 - len(blocked)}")
+
+    # For each root action, compute v̄(root, a) via enumeration
+    mismatches = 0
+    max_err = 0.0
+    for a_idx, action in enumerate(legal):
+        child = apply_action(root, action, cfg)
+        kind, next_node, meta = advance_to_next_decision(child, cfg)
+        if kind == "fold_terminal":
+            # Root fold — impossible for P0 (to_call=0 on flop), but
+            # handle it anyway
+            v = meta["payoffs"][0]
+        elif kind == "decision":
+            v = _enum_v(next_node, cfg.flop, cfg, strat_table, 0, blocked)
+        else:
+            v = _enum_v(child, cfg.flop, cfg, strat_table, 0, blocked)
+
+        err = abs(v - float(exported_evs[a_idx]))
+        if err > max_err:
+            max_err = err
+        status = "OK" if err <= TOLERANCE_CHIPS else "MISMATCH"
+        print(f"    action {a_idx} ({action.kind},amt={action.amount}): "
+              f"python={v:+.3f}  exported={exported_evs[a_idx]:+.3f}  "
+              f"err={err:.3f}  {status}")
+        if err > TOLERANCE_CHIPS:
+            mismatches += 1
+
+    print(f"  max root-action error: {max_err:.3f} chips")
+    if mismatches > 0:
+        return f"{mismatches} root action EVs mismatch tolerance"
+    return None
+
+
 def main() -> int:
     path = sys.argv[1] if len(sys.argv) > 1 else "build/phase_1_3_synthetic.tbn"
     if not os.path.exists(path):
@@ -728,6 +935,17 @@ def main() -> int:
             return 1
 
     print("  ✓ passed")
+
+    # ── Check C: root-enumeration cross-check ──
+    print("\n── Check C: root-enumeration cross-check ──")
+    err = check_c_root_enumeration(cfg, strat_table, ev_table)
+    if err is None:
+        print("  ✓ passed")
+    elif err.startswith("SKIP:"):
+        print(f"  {err}")
+    else:
+        print(f"  FAIL: {err}", file=sys.stderr)
+        return 1
 
     print("\n=== ALL CHECKS PASSED ===")
     return 0
