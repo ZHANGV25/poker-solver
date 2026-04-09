@@ -469,6 +469,39 @@ BP_EXPORT int bp_export_action_evs(const BPSolver *s,
                                     size_t *bytes_written);
 
 /**
+ * Phase 1.3: Aggregate visit count statistics across all info sets that
+ * the EV walk touched (ev_visit_count > 0).
+ *
+ * The exported BPR3 section only writes the NORMALIZED average EV per
+ * action, not the raw visit count. Downstream sentinels need the visit
+ * distribution to judge EV confidence and flag low-traffic info sets.
+ * This function reports the aggregate stats cheaply at export time.
+ *
+ * Fills the caller-provided struct with:
+ *   total_visited: number of info sets with ev_visit_count > 0
+ *   min/p10/p50/p90/p99/max: percentile visit counts across those sets
+ *   below_5: count with ev_visit_count < 5 (low-confidence)
+ *   below_100: count with ev_visit_count < 100
+ *   above_1000: count with ev_visit_count >= 1000 (high-confidence)
+ *
+ * Safe to call after bp_compute_action_evs. Iterates the hash table once.
+ */
+typedef struct {
+    int64_t total_visited;
+    int64_t min_visits;
+    int64_t p10_visits;
+    int64_t p50_visits;
+    int64_t p90_visits;
+    int64_t p99_visits;
+    int64_t max_visits;
+    int64_t below_5;
+    int64_t below_100;
+    int64_t above_1000;
+} BPEVVisitStats;
+
+BP_EXPORT int bp_get_ev_visit_stats(const BPSolver *s, BPEVVisitStats *out);
+
+/**
  * Export EHS values and bucket assignments for all hands.
  *
  * Writes per-hand: float32 EHS, int32 bucket_index

@@ -86,6 +86,25 @@ def main():
         ctypes.POINTER(ctypes.c_size_t)
     ]
 
+    # Phase 1.3: visit count distribution stats (for sentinel 5).
+    # Must mirror BPEVVisitStats in src/mccfr_blueprint.h exactly.
+    class BPEVVisitStats(ctypes.Structure):
+        _fields_ = [
+            ("total_visited", ctypes.c_int64),
+            ("min_visits",    ctypes.c_int64),
+            ("p10_visits",    ctypes.c_int64),
+            ("p50_visits",    ctypes.c_int64),
+            ("p90_visits",    ctypes.c_int64),
+            ("p99_visits",    ctypes.c_int64),
+            ("max_visits",    ctypes.c_int64),
+            ("below_5",       ctypes.c_int64),
+            ("below_100",     ctypes.c_int64),
+            ("above_1000",    ctypes.c_int64),
+        ]
+
+    bp.bp_get_ev_visit_stats.restype = ctypes.c_int
+    bp.bp_get_ev_visit_stats.argtypes = [ctypes.c_void_p, ctypes.POINTER(BPEVVisitStats)]
+
     timings["dll_load"] = time.time() - t0
     print(f"[{timings['dll_load']:.2f}s] DLL loaded", flush=True)
 
@@ -159,6 +178,7 @@ def main():
     # See docs/PHASE_1_3_DESIGN.md for the algorithm.
     ev_walk_iters = int(os.environ.get("EV_WALK_ITERS", "50000000"))
     action_evs_data = b""
+    ev_visit_stats = None
     if ev_walk_iters > 0:
         t0 = time.time()
         print(f"Phase 1.3: computing action EVs ({ev_walk_iters:,} iters)...", flush=True)
@@ -182,6 +202,33 @@ def main():
                 del ev_buf
                 timings["export_action_evs"] = time.time() - t0
                 print(f"[{timings['export_action_evs']:.2f}s] Exported {ev_written.value / (1024**2):.1f} MB of action EVs", flush=True)
+
+            # Collect EV visit count distribution for sentinel 5.
+            # Called BEFORE bp_free; we store the result in a dict that
+            # gets merged into the metadata JSON below. Safe to call even
+            # if the export failed — it just reports zeros in that case.
+            visit_stats_struct = BPEVVisitStats()
+            bp.bp_get_ev_visit_stats(solver, ctypes.byref(visit_stats_struct))
+            ev_visit_stats = {
+                "total_visited":  int(visit_stats_struct.total_visited),
+                "min":            int(visit_stats_struct.min_visits),
+                "p10":            int(visit_stats_struct.p10_visits),
+                "p50":            int(visit_stats_struct.p50_visits),
+                "p90":            int(visit_stats_struct.p90_visits),
+                "p99":            int(visit_stats_struct.p99_visits),
+                "max":            int(visit_stats_struct.max_visits),
+                "below_5":        int(visit_stats_struct.below_5),
+                "below_100":      int(visit_stats_struct.below_100),
+                "above_1000":     int(visit_stats_struct.above_1000),
+            }
+            print(f"[BP1.3] Visit distribution: total={ev_visit_stats['total_visited']:,}, "
+                  f"p50={ev_visit_stats['p50']}, p90={ev_visit_stats['p90']}, "
+                  f"p99={ev_visit_stats['p99']}, max={ev_visit_stats['max']}",
+                  flush=True)
+            print(f"[BP1.3]   below_5={ev_visit_stats['below_5']:,}, "
+                  f"below_100={ev_visit_stats['below_100']:,}, "
+                  f"above_1000={ev_visit_stats['above_1000']:,}",
+                  flush=True)
     else:
         print("Phase 1.3: skipped (EV_WALK_ITERS=0)", flush=True)
 
@@ -258,6 +305,13 @@ def main():
         "has_action_evs": has_action_evs,
         "action_evs_compute_method": "posthoc_sigma_bar_walk" if has_action_evs else None,
         "action_evs_walk_iterations": ev_walk_iters if has_action_evs else 0,
+        # Sentinel 5: visit count distribution stats collected at export
+        # time from the C solver's in-memory hash table. Consumers can
+        # use these to judge EV confidence per info set and to flag
+        # pathological distributions (everyone has 1 visit → sampling
+        # broken; nobody has >100 → training too short). None if no
+        # EV walk was performed.
+        "ev_visit_stats": ev_visit_stats,
     }
     meta_bytes = json.dumps(meta, separators=(",", ":")).encode("utf-8")
 

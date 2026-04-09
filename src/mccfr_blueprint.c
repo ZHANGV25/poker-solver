@@ -4105,6 +4105,61 @@ int bp_export_action_evs(const BPSolver *s,
     return 0;
 }
 
+static int cmp_int64(const void *a, const void *b) {
+    int64_t av = *(const int64_t*)a;
+    int64_t bv = *(const int64_t*)b;
+    if (av < bv) return -1;
+    if (av > bv) return 1;
+    return 0;
+}
+
+int bp_get_ev_visit_stats(const BPSolver *s, BPEVVisitStats *out) {
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+
+    const BPInfoTable *t = &s->info_table;
+
+    /* First pass: count visited entries to size the percentile array. */
+    int64_t n = 0;
+    for (int64_t i = 0; i < t->table_size; i++) {
+        if (t->occupied[i] != 1) continue;
+        if (t->sets[i].ev_visit_count > 0) n++;
+    }
+    out->total_visited = n;
+    if (n == 0) return 0;
+
+    /* Second pass: collect visit counts into a contiguous array for
+     * sort-based percentiles. For large tables (1.2B × 8B = 9.6 GB),
+     * this is a one-time transient allocation at export. */
+    int64_t *visits = (int64_t*)malloc((size_t)n * sizeof(int64_t));
+    if (!visits) {
+        fprintf(stderr, "[BP1.3] bp_get_ev_visit_stats: OOM for %lld "
+                "int64s — returning total_visited only\n", (long long)n);
+        return 0;  /* partial fill: total_visited set, percentiles zero */
+    }
+    int64_t k = 0;
+    for (int64_t i = 0; i < t->table_size; i++) {
+        if (t->occupied[i] != 1) continue;
+        const BPInfoSet *is = &t->sets[i];
+        if (is->ev_visit_count > 0) {
+            visits[k++] = (int64_t)is->ev_visit_count;
+            if (is->ev_visit_count < 5) out->below_5++;
+            if (is->ev_visit_count < 100) out->below_100++;
+            if (is->ev_visit_count >= 1000) out->above_1000++;
+        }
+    }
+
+    qsort(visits, (size_t)n, sizeof(int64_t), cmp_int64);
+    out->min_visits = visits[0];
+    out->max_visits = visits[n - 1];
+    out->p10_visits = visits[(int64_t)((double)n * 0.10)];
+    out->p50_visits = visits[(int64_t)((double)n * 0.50)];
+    out->p90_visits = visits[(int64_t)((double)n * 0.90)];
+    out->p99_visits = visits[(int64_t)((double)n * 0.99)];
+    free(visits);
+    return 0;
+}
+
 int bp_export_buckets(const BPSolver *s, int street, int player,
                        int *bucket_out) {
     if (street < 0 || street > 3 || player < 0 || player >= s->num_players)
