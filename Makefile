@@ -16,7 +16,7 @@ else
   SHLIB_FLAGS = -shared -fPIC
 endif
 
-.PHONY: all clean bench dll test blueprint
+.PHONY: all clean bench dll test test_phase_1_3 blueprint
 
 all: blueprint $(BUILD_DIR)/solver_v2$(SHLIB_EXT)
 
@@ -52,6 +52,17 @@ bench: $(BUILD_DIR)/bench_v2
 
 test: $(BUILD_DIR)/test_phase1
 	./$(BUILD_DIR)/test_phase1
+
+# ── Phase 1.3 synthetic ground-truth test ──
+# Statically links the blueprint solver for a self-contained test binary.
+# Python-side verifier (tests/test_phase_1_3_synthetic.py) consumes the
+# bundle this produces and asserts CFR identity + enumerated ground truth.
+$(BUILD_DIR)/test_phase_1_3: tests/test_phase_1_3_synthetic.c $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c $(SRC_DIR)/mccfr_blueprint.h $(SRC_DIR)/card_abstraction.h $(SRC_DIR)/hand_eval.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -fopenmp -I$(SRC_DIR) tests/test_phase_1_3_synthetic.c $(SRC_DIR)/mccfr_blueprint.c $(SRC_DIR)/card_abstraction.c -o $@ $(LDFLAGS)
+
+test_phase_1_3: $(BUILD_DIR)/test_phase_1_3
+	./$(BUILD_DIR)/test_phase_1_3 $(BUILD_DIR)/phase_1_3_synthetic.tbn
+	python3 tests/test_phase_1_3_synthetic.py $(BUILD_DIR)/phase_1_3_synthetic.tbn
 
 clean:
 	rm -rf $(BUILD_DIR)
