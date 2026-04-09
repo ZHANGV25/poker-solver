@@ -383,6 +383,19 @@ def main():
               "failed to parse it.", file=sys.stderr)
         sys.exit(1)
 
+    # Hash mixer backcompat: if the blueprint was written before the Bug 6
+    # fix, Python lookups via _compute_action_hash will miss every slot
+    # (Python uses splitmix64, the file's keys are boost-style). Bail out
+    # with a clear explanation rather than pretending every sentinel failed.
+    if getattr(bp, "_legacy_mixer", False):
+        print("\nFATAL: this blueprint was exported before the Bug 6 hash "
+              "mixer fix. Python lookups are incompatible — every "
+              "get_strategy / get_all_bucket_action_evs call will return "
+              "None. Re-export with a current solver build (or "
+              "BP_LEGACY_LOADER=1 is NOT the fix — that's a loader flag, "
+              "unrelated). See commit 48da71b.", file=sys.stderr)
+        sys.exit(1)
+
     # Run sentinels. Each returns True on pass, False on fail. We run
     # them all (don't short-circuit) so the user sees a complete report.
     results = []

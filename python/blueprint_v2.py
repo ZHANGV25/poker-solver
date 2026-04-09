@@ -231,6 +231,14 @@ class BlueprintV2:
         # Populated from the trailing BPR3 section of schema_version>=3 .bps files.
         self._action_evs = {}
 
+        # Set to True if a loaded blueprint was exported before the Bug 6
+        # hash mixer fix (commit 48da71b). In that case, Python info-set
+        # lookups via get_strategy/get_all_bucket_strategies will miss
+        # (the Python mixer is splitmix64, the file's keys are boost-style).
+        # A warning is printed at load time. Downstream code can check
+        # this flag to gracefully disable blueprint-based codepaths.
+        self._legacy_mixer = False
+
         # File index: supports both v1 and v2 layouts
         # v1: _file_index[texture_key] = path
         # v2: _scenario_file_index[(scenario_id, texture_key)] = path
@@ -395,6 +403,32 @@ class BlueprintV2:
         if cache_key != texture_key:
             self._textures[texture_key] = table
             self._metadata[texture_key] = meta
+
+        # Hash mixer backcompat check (Bug 6).
+        #
+        # Files written before commit 48da71b (Bug 6 fix) used a boost-style
+        # hash_combine. The current Python _hash_combine uses splitmix64 to
+        # match the C side. If someone queries an old file with the new
+        # mixer, every get_strategy/get_all_bucket_strategies/...
+        # lookup silently returns None. Make the failure mode loud.
+        mixer_tag = meta.get("hash_mixer")
+        if mixer_tag != "splitmix64":
+            import warnings as _warn
+            _warn.warn(
+                f"Blueprint {texture_key!r} has hash_mixer={mixer_tag!r} "
+                f"(expected 'splitmix64'). This file was exported before "
+                f"the Bug 6 hash mixer fix (commit 48da71b). Python "
+                f"get_strategy / get_all_bucket_strategies / "
+                f"get_all_bucket_action_evs lookups will return None for "
+                f"every non-empty action history because the in-Python "
+                f"action_hash no longer matches the keys in the file. "
+                f"Re-export the blueprint from a current solver build or "
+                f"pin a pre-Bug-6 checkout of blueprint_v2.py.",
+                stacklevel=2,
+            )
+            self._legacy_mixer = True
+        else:
+            self._legacy_mixer = False
 
         # Phase 1.3: attempt to load the trailing BPR3 per-action EV section.
         # Schema v3+ files have this; schema v2 files don't.

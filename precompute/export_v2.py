@@ -300,6 +300,14 @@ def main():
         # average-strategy data, not regret-matched-current data.
         "strategy_extraction_method": "strategy_sum_avg",
         "training_complete": True,
+        # Bug 6 / v3: explicit hash-mixer tag. Python consumers that
+        # recompute info-set hashes (e.g. get_strategy() calls in
+        # blueprint_v2.py) must use the same mixer as the C exporter
+        # or every lookup misses. Files tagged "splitmix64" work with
+        # the post-Bug-6 Python implementation; files without this
+        # field (legacy) were exported with the old boost-style mixer
+        # and are incompatible with current blueprint_v2.py lookups.
+        "hash_mixer": "splitmix64",
         # Phase 1.3: per-action EVs under the average strategy, computed
         # post-hoc via σ̄-sampled MCCFR walk. See docs/PHASE_1_3_DESIGN.md.
         "has_action_evs": has_action_evs,
