@@ -2,7 +2,7 @@
 
 **This is the single source of truth for the poker-solver repo.** Read this first. Everything else is either reference (frozen) or appendix (for one specific subsystem).
 
-Last updated: 2026-04-08 (Phase 1.3 implementation landed on master, verification in progress)
+Last updated: 2026-04-09 (Phase A verification complete — loader, tests, sentinels, Bug 6 sync all validated locally; Phase B EC2 run deferred pending AWS credits)
 
 ---
 
@@ -14,22 +14,22 @@ A 6-player No-Limit Hold'em MCCFR blueprint solver matching the Pluribus algorit
 
 ## Where we are right now
 
-### v2 training run (in flight)
+### v2 training run — PAUSED (as of 2026-04-09)
+
+No EC2 instance is currently running. The v2 training was stopped due to AWS
+budget ceiling; user has applied for AWS credits and is waiting on approval.
+Latest checkpoints from the paused run live in S3:
 
 | | |
 |---|---|
-| Instance | `i-0d36756d6aa2e6fcb` (c7a.metal-48xl, AMD EPYC Zen 4, 192 cores) |
-| IP | `100.54.208.173` (EC2 Instance Connect) |
-| Launch time | 2026-04-07 22:18 UTC |
-| Iter target | 8,000,000,000 |
-| Current iter | ~610M (~7.6% complete) |
-| Throughput | ~28-32K iter/s |
-| Wall-clock ETA | ~2026-04-11 (~3 days from launch start) |
-| Hash table | 2B slots, 45.7% load at 610M iters |
-| Insertion failures | 231 at 610M (negligible — see [Verified facts §3](#verified-facts)) |
-| Output | `/opt/blueprint_unified/regrets_latest.bin` (32 GB), checkpointed every 100M iters |
 | S3 bucket | `poker-blueprint-unified-v2` |
-| Log | `/var/log/blueprint-unified.log` (root-owned, sudo to read) |
+| Latest regrets | `checkpoints/regrets_1500M.bin` (60 GB, 1214M info sets) |
+| Earlier snapshots | 200M / 400M / 600M / 900M / 1200M |
+| Iter target when paused | 8,000,000,000 (only ~19% complete at 1500M) |
+| Training config | 2B-slot hash table, 6-max, Pluribus-style tiered preflop sizes |
+
+When credits land, resume training OR pivot to v3. See §"Immediate next steps"
+for the full "when credits land" runbook.
 
 ### v3 commit status
 
@@ -39,7 +39,7 @@ All v3 work is in **two commits on `master`**: `a82219b` (Phase 1) and `48da71b`
 |---|---|---|---|---|
 | 1.1 | CFR iters 200 → 2000 in realtime solver | `python/hud_solver.py:506` | ✅ | `DEFAULT_CFR_ITERATIONS = 2000` |
 | 1.2 | Delete `multiway_adjust.py` heuristics | `python/multiway_adjust.py` (gone) | ✅ | Trust N-player CFR |
-| 1.3 | Per-action EVs via σ̄-sampled walk | `src/mccfr_blueprint.c`, `precompute/export_v2.py`, `python/blueprint_v2.py`, `docs/PHASE_1_3_DESIGN.md` | ⚠️ **CODE LANDED, VERIFICATION PENDING** | Code shipped to master in commits `199c243` + `73c6adc`. Linux build verified clean. Real-data verification blocked mid regret-load on r6i.8xlarge — session time budget hit before the load completed (~25-30 min serial fread dominates). Next session: resume verification against the 1.5B v2 checkpoint, run sentinels, upload v3 .bps. See §"Finish the Phase 1.3 export-tool work" below. |
+| 1.3 | Per-action EVs via σ̄-sampled walk | `src/mccfr_blueprint.c`, `precompute/export_v2.py`, `python/blueprint_v2.py`, `docs/PHASE_1_3_DESIGN.md` | 🟡 **PHASE A DONE, PHASE B DEFERRED** | Phase A (local validation) complete as of 2026-04-09: parallel mmap loader (20x speedup), synthetic ground-truth C test, Python CFR self-consistency verifier (0.003 chip max error), strengthened sentinels 4/5, Bug 6 Python hash mixer sync. Phase B (1.5B v2 EC2 run) deferred pending AWS credit approval. See §"Finish the Phase 1.3 export-tool work" below. |
 | 2.1–2.8 | 8 defensive bug fixes | `src/mccfr_blueprint.c` | ✅ | All defensive — none change blueprint output in normal v2 conditions |
 | 3.1 | Bug 7: texture lookup → hashmap | `src/mccfr_blueprint.c:268+` | ✅ | +5–15% throughput when applied |
 | 3.2 | Bug 6: hash mixer → splitmix64 | `src/mccfr_blueprint.c:241–259` | ✅ | Eliminates the `max_probe = 4096` clustering. Requires fresh run to take effect (changes slot derivation). |
@@ -179,67 +179,76 @@ What WOULD fix the zigzag:
 
 ## Immediate next steps (this week)
 
-### 1. Let v2 finish
+### 1. v2 training — PAUSED
 
-ETA ~2026-04-11. No action needed. Don't terminate. Watch the dashboard at `https://poker-solver-dashboard.vercel.app` for hash table health and growth deceleration.
+The current v2 training run on EC2 is stopped as of early 2026-04-09 due to AWS budget
+ceiling. User has applied for AWS credits and is waiting on approval before resuming.
+Latest checkpoints on S3:
 
-**Stop conditions:**
-- Insertion failures growing >0.01% of info sets (currently 0.000025%)
-- Load factor projected >85% (currently projected 62%)
-- Unrelated EC2 problems
+- `s3://poker-blueprint-unified-v2/checkpoints/regrets_1500M.bin` (60 GB, 1214M info sets)
+- Earlier snapshots at 200M / 400M / 600M / 900M / 1200M iterations
+
+When training resumes (or a fresh v3 run kicks off with credits), this section should be
+updated with the new instance / target iter count / ETA.
+
+**Not to be confused with:** the older 1.6B-iter v2 blueprint exported on 2026-04-07 that
+lives locally at `blueprint_data/unified_blueprint.bps`. That file is from a DIFFERENT
+training run (pre-Bug-6 fix, 946M info sets vs. the current run's 1214M at 1500M) and its
+raw regrets are not in S3.
 
 ### 2. Finish the Phase 1.3 export-tool work
 
-**Status as of 2026-04-08 evening: code landed on master (commits `199c243` and `73c6adc`),
-Linux build verified, real-data verification blocked mid-regret-load due to session time budget.**
+**Status as of 2026-04-09: Phase A (local validation) complete, Phase B (1.5B EC2 run) deferred.**
 
-Code changes (landed on master):
-- `src/mccfr_blueprint.c`: `traverse_ev()` (σ̄-sampled MCCFR walk), `bp_compute_action_evs()`,
-  `bp_export_action_evs()`, `ensure_action_evs()`, `avg_strategy()` helpers
-- `src/mccfr_blueprint.h`: `BPInfoSet` gains `action_evs` + `ev_visit_count` fields;
-  two new public function declarations
-- `precompute/export_v2.py`: ctypes bindings, EV walk invocation (controlled by
-  `EV_WALK_ITERS` env var, default 50M), LZMA-compressed BPR3 section appended to .bps,
-  schema_version bumped 2→3
-- `python/blueprint_v2.py`: trailing BPR3 section parser, `get_all_bucket_action_evs()`,
-  `has_action_evs()` accessors
-- `precompute/verify_phase_1_3.py`: sentinel verification script
-- `docs/PHASE_1_3_DESIGN.md`: full mathematical design and algorithm
+#### Phase A — local validation (complete, 6 commits on master)
 
-Rather than a simple raw-regret export, Phase 1.3 does a **post-hoc σ̄-sampled MCCFR
-walk** (see `docs/PHASE_1_3_DESIGN.md` for the math). `traverse_ev()` is a read-only
-sibling of `traverse()` that samples from the average strategy and accumulates
-per-action EVs into `is->action_evs[]`. No retraining required — it runs against any
-existing checkpoint.
+| Commit | Scope |
+|---|---|
+| `199c243` | Phase 1.3 core: traverse_ev(), bp_compute_action_evs(), bp_export_action_evs(), BPInfoSet extensions, initial export_v2 + blueprint_v2 bindings |
+| `c968fe2` | **Parallel mmap regret loader (BPR4)** — ~20x speedup vs. serial; duplicate-merge correctness validated via hand-crafted 5000-entry test. Drive-by Windows build compat. |
+| `5e3f7fd` | Synthetic C ground-truth test (2p postflop toy game, Stage 1 sanity checks, test bundle format) |
+| `ac5c834` | **Bug 6 Python hash mixer sync** (splitmix64). Fixes silent lookup failure in blueprint_v2.py on v3+ files. Regression guard via tests/test_hash_sync.c + .py. |
+| `fd3d02a` | Strengthened sentinels: new sentinel 4 (AA/32o EV ordering at UTG open) and sentinel 5 (visit count distribution from new bp_get_ev_visit_stats C function) |
+| `fe087fd` | Hash mixer backcompat — tag `"hash_mixer": "splitmix64"` on new exports; blueprint_v2.py warns on legacy files |
+| `78b936a` | Python CFR self-consistency verifier — independently walks the toy game's action tree, validates 6 (info_set, action) pairs to 0.003 chip max error |
 
-**To complete verification (next session):**
+**What's validated locally:**
+- Parallel loader produces bit-identical hash table state vs. serial loader on a trained toy checkpoint AND on a hand-crafted 5000-entry duplicate-heavy file (atomic regret fetch_add + strategy_sum CAS merge verified under 24-thread contention)
+- Phase 1.3 EV walk math is self-consistent: Python walker reaches all 24 info sets the C code exports, validated (info_set, action) pairs match to 0.003 chip error, and sign-flip propagation across opponents in zero-sum is correct
+- Python hash-combine matches C splitmix64 byte-exactly on 17 test vectors (bp_mix64 + hash_combine + compute_action_hash)
+- Stage 1 C sanity checks (no NaN, bounded EVs, non-NULL action_evs allocation) pass on every synthetic run
+- Windows MSYS2 build now works end-to-end (was broken by unconditional sys/mman.h / sched.h / unistd.h includes before this session)
 
-1. Launch EC2: **`r6i.8xlarge`** (256 GB RAM, ~$2/hr). Important:
-   - `r6i.2xlarge` (64 GB) and `r6i.4xlarge` (128 GB) both **OOM** during regret load.
-     The Phase 1.3 BPInfoSet extensions add ~8 GB of struct overhead on top of the
-     existing hash table, which pushes the 1.5B v2 checkpoint over the r6i.4xlarge
-     limit.
+**What's NOT yet validated (Phase B territory):**
+- Full pipeline run against the 200M v2 raw regrets on this PC (27 GB downloaded to `blueprint_data/regrets_200M.bin`, pipeline run blocked waiting for CPU availability). This is the last Phase A task — ~10 min of 24-thread CPU pressure.
+- Full pipeline run against the **1.5B** v2 raw regrets on EC2 (requires ~$5 r6i.8xlarge spend; user is waiting on AWS credit approval before authorizing)
+
+#### Phase B — EC2 1.5B verification (deferred, requires AWS credits)
+
+When credits land, execute:
+
+1. Launch **`r6i.8xlarge`** (256 GB RAM, ~$2/hr, ~$5 total). Smaller instances OOM — the Phase 1.3 BPInfoSet extensions add ~8 GB of struct overhead on top of the existing hash table, which pushes the 1.5B v2 checkpoint over the r6i.4xlarge limit (documented from a prior failed attempt).
 2. `poker-solver-key` in us-east-1, Ubuntu 22.04 AMI, sg `poker-solver-sg`.
 3. SCP source tarball (or clone via GitHub auth — the public mirror is too stale).
 4. Download caches to `/tmp/` BEFORE running:
    - `s3://poker-blueprint-unified-v2/texture_cache.bin` → `/tmp/texture_cache.bin`
    - Turn centroids need fresh compute (~7.5 min) because the S3 file has stale
      magic `TKC1` — C code expects `TCN1`. Copy the regenerated file to
-     `/home/ubuntu/` so stop/start cycles don't lose it. Subsequent runs skip the
-     precompute when `/tmp/turn_centroids.bin` with `TCN1` magic is present.
+     `/home/ubuntu/` so stop/start cycles don't lose it.
 5. `EV_WALK_ITERS=1000000 python3 precompute/export_v2.py /path/to/regrets_1500M.bin
-   /home/ubuntu/out '' 1073741824` for a fast smoke test. Scale to 50M for production.
-6. **Regret load takes ~25-30 minutes** on a single thread because the loader is
-   serial fread of 1.2B entries. This dominates the wall time.
-7. Run `python3 precompute/verify_phase_1_3.py /home/ubuntu/out/unified_blueprint.bps`
-   to sentinel-check.
+   /home/ubuntu/out '' 1073741824` for a smoke test. Scale to 50M for production.
+6. **Regret load should now take ~1-2 minutes** (Tier 2 parallel loader), not the 25-30 min the old serial loader needed. This is the session-saver from Phase A.
+7. Run `python3 precompute/verify_phase_1_3.py /home/ubuntu/out/unified_blueprint.bps` — all 5 strengthened sentinels should pass.
 8. If sentinels pass: upload v3 .bps to S3 as `unified_blueprint_v3_1.5B.bps`.
-9. **Terminate EC2** (don't just stop — EBS charges continue). Verify in console.
+9. **Terminate EC2** (not stop — EBS charges continue). Shred `~/.aws/credentials` before termination. IAM access key `AKIAQD7AYAUBM43NHZWY` for user `prithish` should be rotated; it was exposed in a prior session's terminal output.
 
-Known gotcha: the EC2 AWS credentials uploaded for S3 access need to be wiped
-(`shred -u ~/.aws/credentials`) before termination, AND the user's long-lived access
-key `AKIAQD7AYAUBM43NHZWY` (for IAM user `prithish`) **should be rotated** — it was
-exposed in the previous session's terminal output.
+**Gotcha about production blueprint file:** the blueprint file currently on this PC at
+`blueprint_data/unified_blueprint.bps` (3.2 GB, 946M info sets, exported 2026-04-07 16:10 EDT
+from iter 1.6B) is from an **older training run** — pre-Bug 6 fix. Its keys use the
+boost-style mixer and do NOT match what current blueprint_v2.py computes. Any re-enable of
+`USE_BLUEPRINT=true` in nexusgto-api against this legacy file will trip the loud warning
+added in `fe087fd` and every get_strategy lookup will return None. The fix is to export a
+fresh .bps from a current S3 checkpoint (200M-1500M) once Phase B finishes.
 
 ### 3. After v2 reaches 8B: re-export with the new tool
 
