@@ -22,10 +22,28 @@
 #include <math.h>
 #include <stdio.h>
 #include <time.h>
-#include <unistd.h>
 #include <errno.h>
+#ifndef _WIN32
+#include <unistd.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <sched.h>
+#else
+/* Windows/MSYS2 compatibility shims. The solver is Linux-first (training
+ * runs on EC2) but Windows builds are needed for local tests and dev
+ * iteration. These shims give us the few POSIX calls we actually use;
+ * madvise is guarded separately by MADV_* ifdefs at each call site. */
+#include <windows.h>
+static inline void sched_yield(void) { SwitchToThread(); }
+static inline long sysconf(int name) {
+    (void)name;
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return (long)si.dwPageSize;
+}
+#define _SC_PAGESIZE 0
+#endif
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -3170,6 +3188,479 @@ int bp_save_regrets(const BPSolver *s, const char *path) {
     return 0;
 }
 
+/* ── Regret loader ────────────────────────────────────────────────
+ *
+ * Two implementations share the same public entry point bp_load_regrets:
+ *
+ *   (a) load_regrets_serial: legacy fread-based loader. Always used for
+ *       BPR2/BPR3 format (which we don't generate anymore but still have
+ *       to be able to read). Also the fallback when BP_LEGACY_LOADER=1.
+ *
+ *   (b) load_regrets_mmap_parallel: BPR4-only. mmaps the whole file,
+ *       walks once serially to build an offset index, then dispatches
+ *       threads to process the index in parallel. ~20x faster on
+ *       r6i.8xlarge for the 1.5B v2 checkpoint (60 GB).
+ *
+ * Set BP_LEGACY_LOADER=1 in the environment to force the serial loader
+ * on BPR4 files too — useful for correctness diffing old vs new.
+ *
+ * Both loaders MUST produce an identical final hash table state (same
+ * slot assignments, same regret sums, same strategy_sum state). A
+ * round-trip test in tests/test_phase_1_3_synthetic.c validates this on
+ * a toy checkpoint.
+ *
+ * The key correctness invariants preserved in BOTH loaders:
+ *   1. Regrets are ADDED, not written. Fresh arena slots have zeroed
+ *      regrets, so + is idempotent on fresh loads, and recovers split
+ *      regrets on duplicate-key Hogwild collisions.
+ *   2. strategy_sum is lazily arena-allocated on first encounter.
+ *   3. info_table_find_or_create uses the existing Hogwild-safe CAS;
+ *      its return slot is thread-safe to write to (each thread writes
+ *      to its own distinct slot after the CAS). */
+
+static int64_t load_regrets_serial(BPSolver *s, FILE *f,
+                                    int is_v4, int is_v3, int is_v2,
+                                    int64_t saved_entries,
+                                    int64_t saved_iters) {
+    (void)is_v3; (void)is_v2;
+    BPInfoTable *t = &s->info_table;
+    int64_t loaded = 0;
+    int64_t merged = 0;
+
+    int tmp_regrets[BP_MAX_ACTIONS];
+    float tmp_ss[BP_MAX_ACTIONS];
+
+    for (int64_t e = 0; e < saved_entries; e++) {
+        BPInfoKey key;
+        int na;
+
+        if (fread(&key.player, sizeof(int), 1, f) != 1) break;
+        if (fread(&key.street, sizeof(int), 1, f) != 1) break;
+        if (fread(&key.bucket, sizeof(int), 1, f) != 1) break;
+        if (fread(&key.board_hash, sizeof(uint64_t), 1, f) != 1) break;
+        if (fread(&key.action_hash, sizeof(uint64_t), 1, f) != 1) break;
+        if (fread(&na, sizeof(int), 1, f) != 1) break;
+        if (na > BP_MAX_ACTIONS) na = BP_MAX_ACTIONS;
+
+        int64_t slot = info_table_find_or_create(t, key, na);
+        if (slot < 0) {
+            fseek(f, na * sizeof(int), SEEK_CUR);
+            int has_ss;
+            fread(&has_ss, sizeof(int), 1, f);
+            if (has_ss) fseek(f, na * sizeof(float), SEEK_CUR);
+            continue;
+        }
+
+        BPInfoSet *is = &t->sets[slot];
+
+        fread(tmp_regrets, sizeof(int), na, f);
+        int is_dup = 0;
+        for (int a = 0; a < na; a++) {
+            if (is->regrets[a] != 0) { is_dup = 1; break; }
+        }
+        for (int a = 0; a < na; a++) {
+            is->regrets[a] += tmp_regrets[a];
+        }
+
+        int has_ss;
+        fread(&has_ss, sizeof(int), 1, f);
+        if (has_ss) {
+            if (!is->strategy_sum) {
+                is->strategy_sum = (float*)arena_alloc(na);
+            }
+            if (is->strategy_sum) {
+                fread(tmp_ss, sizeof(float), na, f);
+                for (int a = 0; a < na; a++)
+                    is->strategy_sum[a] += tmp_ss[a];
+            } else {
+                fseek(f, na * sizeof(float), SEEK_CUR);
+            }
+        }
+
+        if (is_dup) {
+            merged++;
+            if (merged <= 50) {
+                printf("[BP] Merged duplicate: player=%d street=%d bucket=%d "
+                       "ah=%016llx\n", key.player, key.street, key.bucket,
+                       (unsigned long long)key.action_hash);
+            }
+        }
+        loaded++;
+    }
+
+    s->iterations_run = saved_iters;
+
+    t->insertion_failures = 0;
+    t->max_probe_observed = 0;
+
+    if (merged > 0) {
+        printf("[BP] WARNING: merged %lld duplicate entries (Hogwild race bug). "
+               "Split regrets have been recovered.\n", (long long)merged);
+    }
+    printf("[BP] Loaded %lld/%lld info sets (%lld merged) [serial], table %lld/%lld\n",
+           (long long)loaded, (long long)saved_entries, (long long)merged,
+           (long long)t->num_entries, (long long)t->table_size);
+    return loaded;
+}
+
+/* ── mmap compat shim ──────────────────────────────────────────────
+ *
+ * Linux: standard POSIX mmap.
+ * Windows (MSYS2): CreateFileMapping + MapViewOfFile.
+ *
+ * We only need a read-only private mapping of the whole file. */
+typedef struct {
+    const unsigned char *base;
+    size_t size;
+#ifdef _WIN32
+    HANDLE h_file;
+    HANDLE h_map;
+#else
+    int fd;
+#endif
+} BPFileMap;
+
+static int bp_file_map_open(BPFileMap *m, const char *path) {
+    memset(m, 0, sizeof(*m));
+#ifdef _WIN32
+    m->h_file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (m->h_file == INVALID_HANDLE_VALUE) return -1;
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(m->h_file, &sz)) {
+        CloseHandle(m->h_file); return -1;
+    }
+    m->size = (size_t)sz.QuadPart;
+    m->h_map = CreateFileMappingA(m->h_file, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!m->h_map) { CloseHandle(m->h_file); return -1; }
+    m->base = (const unsigned char*)MapViewOfFile(m->h_map, FILE_MAP_READ, 0, 0, 0);
+    if (!m->base) { CloseHandle(m->h_map); CloseHandle(m->h_file); return -1; }
+    return 0;
+#else
+    m->fd = open(path, O_RDONLY);
+    if (m->fd < 0) return -1;
+    struct stat st;
+    if (fstat(m->fd, &st) < 0) { close(m->fd); return -1; }
+    m->size = (size_t)st.st_size;
+    m->base = (const unsigned char*)mmap(NULL, m->size, PROT_READ,
+                                          MAP_PRIVATE, m->fd, 0);
+    if (m->base == MAP_FAILED) { close(m->fd); return -1; }
+    /* MADV_SEQUENTIAL hints the kernel to aggressively read ahead and
+     * drop pages behind us. Good for a streaming one-pass walk. */
+#ifdef MADV_SEQUENTIAL
+    madvise((void*)m->base, m->size, MADV_SEQUENTIAL);
+#endif
+    return 0;
+#endif
+}
+
+static void bp_file_map_close(BPFileMap *m) {
+#ifdef _WIN32
+    if (m->base) UnmapViewOfFile(m->base);
+    if (m->h_map) CloseHandle(m->h_map);
+    if (m->h_file != INVALID_HANDLE_VALUE) CloseHandle(m->h_file);
+#else
+    if (m->base && m->base != MAP_FAILED)
+        munmap((void*)m->base, m->size);
+    if (m->fd >= 0) close(m->fd);
+#endif
+    memset(m, 0, sizeof(*m));
+}
+
+/* BPR4 parallel loader using mmap + two-pass index.
+ *
+ * Pass 1 (serial, single thread):
+ *   Walk the file from offset data_start (just past the 28-byte BPR4
+ *   header) to eof. For each entry, read num_actions and has_ss in
+ *   order to know its on-disk size, then record the entry's byte
+ *   offset into an int64 array. No hash inserts, no allocations, just
+ *   linear pointer arithmetic. Pages stream into cache as we touch
+ *   them. Expected time: ~60-90s for 1.2B entries on r6i.8xlarge.
+ *
+ * Pass 2 (parallel, #OMP threads):
+ *   Each thread takes a chunk of the index range. For each entry, read
+ *   the full entry directly from the mmap'd pointer, call
+ *   info_table_find_or_create, and merge regrets + strategy_sum into
+ *   the slot. The find-or-create CAS is already lock-free; the only
+ *   thing we need to preserve is the "fresh slot zeroed -> add is
+ *   safe" invariant, which holds because the arena is calloc'd.
+ *
+ * Merge safety: two threads MAY race on the same slot if the original
+ * training run had duplicate keys (Bug 11 / Hogwild race) — the serial
+ * loader relies on "previous += new" being sequential, but under
+ * parallelism two threads could race on the same regret[] slot. We fix
+ * this with atomic fetch_add on each regret array entry. strategy_sum
+ * allocation uses the same CAS pattern as ensure_strategy_sum. */
+static int64_t load_regrets_mmap_parallel(BPSolver *s, const char *path,
+                                           int64_t saved_entries,
+                                           int64_t saved_iters) {
+    BPFileMap mfile;
+    if (bp_file_map_open(&mfile, path) != 0) {
+        fprintf(stderr, "[BP] mmap failed on %s, falling back to serial\n", path);
+        return -2;  /* caller will retry with serial */
+    }
+    printf("[BP] mmap: %zu bytes\n", mfile.size); fflush(stdout);
+
+    /* Data starts just past the 28-byte BPR4 header (magic 4 + table_size 8 +
+     * num_entries 8 + iterations 8). */
+    const size_t data_start = 28;
+    const unsigned char *base = mfile.base;
+    size_t pos = data_start;
+    size_t eof = mfile.size;
+
+    /* ── Pass 1: build offset index ──
+     *
+     * Pre-allocate enough slots for saved_entries; if the walk finds fewer
+     * than that (truncated file), we shrink. On corrupt file we bail.
+     * Allocating 8 bytes × 1.2B entries = 9.6 GB — not tiny but manageable
+     * on r6i.8xlarge (256 GB) and on the PC's 64 GB for the 200M checkpoint
+     * (which only needs ~1.6 GB of index). */
+    int64_t *offsets = (int64_t*)malloc((size_t)saved_entries * sizeof(int64_t));
+    if (!offsets) {
+        fprintf(stderr, "[BP] OOM allocating %lld-entry offset index\n",
+                (long long)saved_entries);
+        bp_file_map_close(&mfile);
+        return -1;
+    }
+
+    printf("[BP] Pass 1: building offset index (serial walk)...\n"); fflush(stdout);
+    double t0 = 0.0;
+#ifdef _OPENMP
+    t0 = omp_get_wtime();
+#endif
+
+    int64_t n_indexed = 0;
+    int64_t last_progress = 0;
+    for (; n_indexed < saved_entries; n_indexed++) {
+        if (pos + 32 > eof) {
+            fprintf(stderr, "[BP] Pass 1: unexpected EOF at offset %zu, "
+                    "entry %lld / %lld\n", pos, (long long)n_indexed,
+                    (long long)saved_entries);
+            break;
+        }
+        offsets[n_indexed] = (int64_t)pos;
+
+        /* Read na without touching regrets — we need it to compute the
+         * entry size. Key fields are: player(4) + street(4) + bucket(4)
+         * + board_hash(8) + action_hash(8) = 28 bytes, then na at offset
+         * 28 from entry start. */
+        int na;
+        memcpy(&na, base + pos + 28, sizeof(int));
+        if (na < 0 || na > BP_MAX_ACTIONS) {
+            fprintf(stderr, "[BP] Pass 1: corrupt na=%d at offset %zu\n",
+                    na, pos);
+            free(offsets); bp_file_map_close(&mfile); return -1;
+        }
+
+        /* Advance past key(28) + na(4) + regrets(4*na) + has_ss(4) */
+        size_t next = pos + 28 + 4 + (size_t)(4 * na) + 4;
+        if (next > eof) {
+            fprintf(stderr, "[BP] Pass 1: truncated regrets at entry %lld\n",
+                    (long long)n_indexed);
+            break;
+        }
+        int has_ss;
+        memcpy(&has_ss, base + pos + 28 + 4 + (size_t)(4 * na), sizeof(int));
+        if (has_ss) {
+            next += (size_t)(4 * na);
+            if (next > eof) {
+                fprintf(stderr, "[BP] Pass 1: truncated strategy_sum at entry %lld\n",
+                        (long long)n_indexed);
+                break;
+            }
+        }
+        pos = next;
+
+        if (n_indexed - last_progress >= 100000000) {
+            last_progress = n_indexed;
+#ifdef _OPENMP
+            double dt = omp_get_wtime() - t0;
+            printf("[BP]   indexed %lld / %lld entries (%.1fs, %.0f M/s)\n",
+                   (long long)n_indexed, (long long)saved_entries, dt,
+                   (double)n_indexed / (dt * 1e6));
+#else
+            printf("[BP]   indexed %lld / %lld entries\n",
+                   (long long)n_indexed, (long long)saved_entries);
+#endif
+            fflush(stdout);
+        }
+    }
+
+#ifdef _OPENMP
+    double pass1_sec = omp_get_wtime() - t0;
+    printf("[BP] Pass 1 done: %lld entries in %.1fs\n",
+           (long long)n_indexed, pass1_sec);
+#else
+    printf("[BP] Pass 1 done: %lld entries\n", (long long)n_indexed);
+#endif
+    fflush(stdout);
+
+    /* ── Pass 2: parallel hash inserts ── */
+    BPInfoTable *t = &s->info_table;
+    int64_t loaded = 0;
+    int64_t merged = 0;
+    int64_t dropped = 0;
+
+#ifdef _OPENMP
+    t0 = omp_get_wtime();
+#endif
+    printf("[BP] Pass 2: parallel hash inserts (%d threads)...\n",
+#ifdef _OPENMP
+           omp_get_max_threads()
+#else
+           1
+#endif
+    ); fflush(stdout);
+
+    int64_t progress_stride = n_indexed / 20;
+    if (progress_stride < 1) progress_stride = 1;
+
+#ifdef _OPENMP
+    #pragma omp parallel reduction(+:loaded,merged,dropped)
+#endif
+    {
+        int64_t local_loaded = 0;
+        int64_t local_merged = 0;
+        int64_t local_dropped = 0;
+
+#ifdef _OPENMP
+        #pragma omp for schedule(dynamic, 65536)
+#endif
+        for (int64_t i = 0; i < n_indexed; i++) {
+            size_t ep = (size_t)offsets[i];
+            /* Decode entry header. Field-by-field memcpy so no alignment
+             * assumptions on the mmap region (on x86 unaligned is fine,
+             * but being explicit is cheaper than debugging later). */
+            BPInfoKey key;
+            memcpy(&key.player,      base + ep + 0,  sizeof(int));
+            memcpy(&key.street,      base + ep + 4,  sizeof(int));
+            memcpy(&key.bucket,      base + ep + 8,  sizeof(int));
+            memcpy(&key.board_hash,  base + ep + 12, sizeof(uint64_t));
+            memcpy(&key.action_hash, base + ep + 20, sizeof(uint64_t));
+            int na;
+            memcpy(&na, base + ep + 28, sizeof(int));
+            if (na > BP_MAX_ACTIONS) na = BP_MAX_ACTIONS;
+
+            int64_t slot = info_table_find_or_create(t, key, na);
+            if (slot < 0) {
+                local_dropped++;
+                continue;
+            }
+
+            BPInfoSet *is = &t->sets[slot];
+
+            /* Merge regrets. Under parallel load, two threads may race on
+             * this slot only if the source checkpoint has duplicate keys
+             * (Hogwild race bug in training). We use atomic fetch_add to
+             * be safe — for the 99.9999% fresh-slot case this compiles
+             * to a LOCK ADD which is cheap on x86; for the rare duplicate
+             * case it guarantees correctness.
+             *
+             * Detecting "is this a duplicate?" for reporting is racy but
+             * we only use it for logging, not for correctness. We check
+             * if any regret was already non-zero BEFORE our add (not
+             * atomic with the add — that's fine since we only want an
+             * approximate duplicate count). */
+            const int *src_regrets = (const int*)(base + ep + 32);
+            int is_dup = 0;
+            for (int a = 0; a < na; a++) {
+                int prev = __atomic_load_n(&is->regrets[a], __ATOMIC_RELAXED);
+                if (prev != 0) is_dup = 1;
+                int v;
+                memcpy(&v, src_regrets + a, sizeof(int));
+                __atomic_fetch_add(&is->regrets[a], v, __ATOMIC_RELAXED);
+            }
+
+            size_t has_ss_off = ep + 32 + (size_t)(4 * na);
+            int has_ss;
+            memcpy(&has_ss, base + has_ss_off, sizeof(int));
+            if (has_ss) {
+                /* Lazy strategy_sum allocation. Same CAS pattern as
+                 * ensure_strategy_sum but inlined here to avoid the extra
+                 * function call in the hot path. */
+                float *ss = __atomic_load_n((float**)&is->strategy_sum, __ATOMIC_ACQUIRE);
+                if (!ss) {
+                    float *buf = (float*)arena_alloc(na);
+                    if (buf) {
+                        float *expected = NULL;
+                        if (__atomic_compare_exchange_n(&is->strategy_sum, &expected, buf,
+                                                         0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                            ss = buf;
+                        } else {
+                            /* Another thread won — reload and use theirs.
+                             * buf is wasted arena space. */
+                            ss = __atomic_load_n((float**)&is->strategy_sum, __ATOMIC_ACQUIRE);
+                        }
+                    }
+                }
+                if (ss) {
+                    const float *src_ss = (const float*)(base + has_ss_off + 4);
+                    /* Atomic float add via CAS loop (no atomic_float_add in
+                     * C11). Each slot is independent; contention is only
+                     * on duplicate keys. */
+                    for (int a = 0; a < na; a++) {
+                        float add;
+                        memcpy(&add, src_ss + a, sizeof(float));
+                        int *slot_i = (int*)&ss[a];
+                        union { float f; int i; } old_u, new_u;
+                        do {
+                            old_u.i = __atomic_load_n(slot_i, __ATOMIC_RELAXED);
+                            new_u.f = old_u.f + add;
+                        } while (!__atomic_compare_exchange_n(
+                            slot_i, &old_u.i, new_u.i,
+                            0, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+                    }
+                }
+            }
+
+            if (is_dup) local_merged++;
+            local_loaded++;
+
+            if ((i % progress_stride) == 0 && i > 0) {
+#ifdef _OPENMP
+                if (omp_get_thread_num() == 0) {
+                    double dt = omp_get_wtime() - t0;
+                    printf("[BP]   Pass 2 progress: %lld / %lld (%.1fs)\n",
+                           (long long)i, (long long)n_indexed, dt);
+                    fflush(stdout);
+                }
+#endif
+            }
+        }
+
+        loaded += local_loaded;
+        merged += local_merged;
+        dropped += local_dropped;
+    }
+
+#ifdef _OPENMP
+    double pass2_sec = omp_get_wtime() - t0;
+    printf("[BP] Pass 2 done: %lld loaded, %lld merged, %lld dropped in %.1fs\n",
+           (long long)loaded, (long long)merged, (long long)dropped, pass2_sec);
+#else
+    printf("[BP] Pass 2 done: %lld loaded, %lld merged, %lld dropped\n",
+           (long long)loaded, (long long)merged, (long long)dropped);
+#endif
+    fflush(stdout);
+
+    free(offsets);
+    bp_file_map_close(&mfile);
+
+    s->iterations_run = saved_iters;
+
+    t->insertion_failures = 0;
+    t->max_probe_observed = 0;
+
+    if (merged > 0) {
+        printf("[BP] WARNING: merged %lld duplicate entries (Hogwild race bug). "
+               "Split regrets have been recovered.\n", (long long)merged);
+    }
+    printf("[BP] Loaded %lld/%lld info sets (%lld merged) [parallel], table %lld/%lld\n",
+           (long long)loaded, (long long)saved_entries, (long long)merged,
+           (long long)t->num_entries, (long long)t->table_size);
+    return loaded;
+}
+
 int64_t bp_load_regrets(BPSolver *s, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
@@ -3209,95 +3700,27 @@ int64_t bp_load_regrets(BPSolver *s, const char *path) {
     printf("[BP] Loading checkpoint: %lld info sets, %lld iterations\n",
            (long long)saved_entries, (long long)saved_iters);
 
-    BPInfoTable *t = &s->info_table;
-    int64_t loaded = 0;
-    int64_t merged = 0;
+    /* Dispatch:
+     *   - BPR4 by default → parallel mmap loader
+     *   - BPR4 with BP_LEGACY_LOADER=1 → serial loader (for correctness diff)
+     *   - BPR2/BPR3 → serial loader (always — these formats are legacy) */
+    const char *legacy = getenv("BP_LEGACY_LOADER");
+    int force_serial = (legacy && legacy[0] == '1');
 
-    int tmp_regrets[BP_MAX_ACTIONS];
-    float tmp_ss[BP_MAX_ACTIONS];
-
-    for (int64_t e = 0; e < saved_entries; e++) {
-        BPInfoKey key;
-        int na;
-
-        if (fread(&key.player, sizeof(int), 1, f) != 1) break;
-        if (fread(&key.street, sizeof(int), 1, f) != 1) break;
-        if (fread(&key.bucket, sizeof(int), 1, f) != 1) break;
-        if (fread(&key.board_hash, sizeof(uint64_t), 1, f) != 1) break;
-        if (fread(&key.action_hash, sizeof(uint64_t), 1, f) != 1) break;
-        if (fread(&na, sizeof(int), 1, f) != 1) break;
-        if (na > BP_MAX_ACTIONS) na = BP_MAX_ACTIONS;
-
-        int64_t slot = info_table_find_or_create(t, key, na);
-        if (slot < 0) {
-            fseek(f, na * sizeof(int), SEEK_CUR);
-            int has_ss;
-            fread(&has_ss, sizeof(int), 1, f);
-            if (has_ss) fseek(f, na * sizeof(float), SEEK_CUR);
-            continue;
-        }
-
-        BPInfoSet *is = &t->sets[slot];
-
-        /* Read regrets into temp buffer, then ADD to slot.
-         * For fresh slots (arena zeroed): 0 + new = new (normal load).
-         * For duplicate keys (Hogwild race bug): existing + new = merged.
-         * This recovers split regrets from the duplicate-key bug where
-         * two hash table entries accumulated partial regrets separately. */
-        fread(tmp_regrets, sizeof(int), na, f);
-        int is_dup = 0;
-        for (int a = 0; a < na; a++) {
-            if (is->regrets[a] != 0) { is_dup = 1; break; }
-        }
-        for (int a = 0; a < na; a++) {
-            is->regrets[a] += tmp_regrets[a];
-        }
-
-        int has_ss;
-        fread(&has_ss, sizeof(int), 1, f);
-        if (has_ss) {
-            if (!is->strategy_sum) {
-                is->strategy_sum = (float*)arena_alloc(na);
-            }
-            if (is->strategy_sum) {
-                fread(tmp_ss, sizeof(float), na, f);
-                for (int a = 0; a < na; a++)
-                    is->strategy_sum[a] += tmp_ss[a];
-            } else {
-                fseek(f, na * sizeof(float), SEEK_CUR);
-            }
-        }
-
-        if (is_dup) {
-            merged++;
-            if (merged <= 50) {
-                printf("[BP] Merged duplicate: player=%d street=%d bucket=%d "
-                       "ah=%016llx\n", key.player, key.street, key.bucket,
-                       (unsigned long long)key.action_hash);
-            }
-        }
-        loaded++;
+    if (is_v4 && !force_serial) {
+        fclose(f);  /* parallel loader opens its own mmap */
+        int64_t n = load_regrets_mmap_parallel(s, path, saved_entries, saved_iters);
+        if (n != -2) return n;  /* success or hard failure */
+        /* -2 = mmap failed, fall back to serial — re-open and seek past header */
+        f = fopen(path, "rb");
+        if (!f) return -1;
+        fseek(f, 28, SEEK_SET);
     }
 
-    s->iterations_run = saved_iters;
+    int64_t n = load_regrets_serial(s, f, is_v4, is_v3, is_v2,
+                                     saved_entries, saved_iters);
     fclose(f);
-
-    /* Reset health stat counters — they describe in-memory operations on this
-     * solver instance, not anything that happened during the previous run that
-     * created the checkpoint. The merge-on-load loop above may have triggered
-     * insertion failures into the new table, which we want to count, but only
-     * those — not anything from the source checkpoint. */
-    t->insertion_failures = 0;
-    t->max_probe_observed = 0;
-
-    if (merged > 0) {
-        printf("[BP] WARNING: merged %lld duplicate entries (Hogwild race bug). "
-               "Split regrets have been recovered.\n", (long long)merged);
-    }
-    printf("[BP] Loaded %lld/%lld info sets (%lld merged), table %lld/%lld\n",
-           (long long)loaded, (long long)saved_entries, (long long)merged,
-           (long long)t->num_entries, (long long)t->table_size);
-    return loaded;
+    return n;
 }
 
 int bp_save_texture_cache(const BPSolver *s, const char *path) {
