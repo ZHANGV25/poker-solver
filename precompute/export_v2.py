@@ -34,17 +34,27 @@ POSTFLOP_BET_SIZES = [0.5, 1.0]
 
 
 class BPConfig(ctypes.Structure):
+    """Must mirror BPConfig in src/mccfr_blueprint.h exactly.
+
+    The six iter/interval/threshold fields were changed from int to
+    int64_t in commit d1d21aa (2026-04-02) but this ctypes mirror was
+    never updated, producing ~8 months of silent config misalignment
+    where postflop_num_buckets in particular read garbage memory past
+    the end of the Python struct. Symptom observed on 2026-04-09: a
+    fresh export run printed `postflop_buckets=556` instead of the
+    expected 200, causing the texture_cache.bin load to reject and
+    triggering a ~60 min bucket precompute. Fix: match the C header."""
     _fields_ = [
-        ("discount_stop_iter", ctypes.c_int),
-        ("discount_interval", ctypes.c_int),
-        ("prune_start_iter", ctypes.c_int),
-        ("snapshot_start_iter", ctypes.c_int),
-        ("snapshot_interval", ctypes.c_int),
-        ("strategy_interval", ctypes.c_int),
-        ("num_threads", ctypes.c_int),
-        ("hash_table_size", ctypes.c_int64),  # int64_t on EC2 build
-        ("snapshot_dir", ctypes.c_char_p),
-        ("include_preflop", ctypes.c_int),
+        ("discount_stop_iter",  ctypes.c_int64),
+        ("discount_interval",   ctypes.c_int64),
+        ("prune_start_iter",    ctypes.c_int64),
+        ("snapshot_start_iter", ctypes.c_int64),
+        ("snapshot_interval",   ctypes.c_int64),
+        ("strategy_interval",   ctypes.c_int64),
+        ("num_threads",         ctypes.c_int),
+        ("hash_table_size",     ctypes.c_int64),
+        ("snapshot_dir",        ctypes.c_char_p),
+        ("include_preflop",     ctypes.c_int),
         ("postflop_num_buckets", ctypes.c_int),
     ]
 
@@ -62,9 +72,19 @@ def main():
     print("  BPS Export Tool v2 — Benchmarked")
     print("=" * 60, flush=True)
 
-    # Load DLL
+    # Load DLL — the Makefile produces .so on Linux and .dll on Windows,
+    # match whichever exists.
     t0 = time.time()
-    bp = ctypes.CDLL("./build/mccfr_blueprint.so")
+    _so_path = "./build/mccfr_blueprint.so"
+    _dll_path = "./build/mccfr_blueprint.dll"
+    if os.path.exists(_so_path):
+        bp = ctypes.CDLL(_so_path)
+    elif os.path.exists(_dll_path):
+        bp = ctypes.CDLL(_dll_path)
+    else:
+        print(f"FATAL: neither {_so_path} nor {_dll_path} exists. "
+              f"Run `make blueprint` first.", file=sys.stderr)
+        sys.exit(1)
     bp.bp_default_config.restype = None
     bp.bp_init_unified.restype = ctypes.c_int
     bp.bp_num_info_sets.restype = ctypes.c_int
