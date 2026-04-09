@@ -129,14 +129,28 @@ def _compute_action_hash(actions):
     return h
 
 
+def _bp_mix64(x):
+    """splitmix64 — must match bp_mix64 in mccfr_blueprint.c exactly.
+
+    Bug 6 (v3) replaced the boost-style hash_combine with a splitmix64
+    mixer. Any Python consumer that recomputes info-set hashes for
+    lookup must use this exact sequence or it will miss every slot in
+    v3 .bps files. Verified byte-identical on a randomized test vector
+    via tests/test_hash_sync.c."""
+    x = _mask64(x)
+    x ^= x >> 30; x = _mask64(x * 0xbf58476d1ce4e5b9)
+    x ^= x >> 27; x = _mask64(x * 0x94d049bb133111eb)
+    x ^= x >> 31
+    return x
+
+
 def _hash_combine(a, b):
     """Must match hash_combine in mccfr_blueprint.c exactly.
-    a ^= b + 0x9e3779b97f4a7c15ULL + (a << 6) + (a >> 2);
-    All operations in uint64."""
-    a = _mask64(a)
-    b = _mask64(b)
-    a = _mask64(a ^ _mask64(_mask64(b + 0x9e3779b97f4a7c15) + _mask64(a << 6) + (a >> 2)))
-    return a
+
+    C side (post-Bug-6):
+        return bp_mix64(a ^ bp_mix64(b));
+    """
+    return _bp_mix64(_mask64(a) ^ _bp_mix64(b))
 
 
 def board_to_texture_key(board_ints):
