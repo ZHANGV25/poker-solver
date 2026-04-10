@@ -6,68 +6,90 @@ Read `~/.claude/projects/C--Users-Victor/memory/postflop_wiring_session.md` for 
 
 ## Where we left off
 
-The unified preflop → postflop flow is **fully working end-to-end** and verified via Playwright:
+The unified preflop → postflop flow is **fully working end-to-end** (verified via Playwright). But the API is stateless — each solve is independent. The next step is to make it session-based with Pluribus-faithful mechanics.
 
-1. `/solver` loads 6-player preflop ranges from the 1.5B-iter blueprint JSON
-2. User walks the preflop action tree (e.g. CO raise → BTN fold → SB fold → BB call)
-3. "Preflop Complete — Deal the Flop" card appears with an inline BoardPicker
-4. User picks 3-5 board cards → "Solve Flop" button appears
-5. GPU CFR runs (200 iterations, ~14s HU flop on RTX 3060) with narrowed ranges
-6. Postflop strategies display in the same SolverShell/RangeGrid for both players
+## THE PLAN: Session-Based Pluribus API
 
-Layer 3 rollout-based leaf values are implemented and tested (56/56) but disabled by default (`USE_ROLLOUT_LEAVES=true` to enable). The Python rollout is ~100x slower than equity-only — needs Layer 3.3 CUDA port for production use.
+### What's being built
 
-## What to do next
+Server-side hand sessions that track state from preflop through river with:
+- **Bayesian range narrowing**: when a player acts, `P(hand|action) ∝ P(action|hand) × P(hand)`
+- **Strategy freezing** (Pluribus A3): on re-solve, hero's already-taken actions are frozen
+- **Off-tree bet interpolation**: pseudoharmonic instead of snap-to-nearest
+- **Cross-street continuity**: pot, stacks, board, and narrowed ranges carry across streets
 
-### Priority 1: Layer 4.A — Multi-way flop
-Fix `extract_leaf_info_from_tree` for variable `n_act` per leaf. Add 2-raises depth limit for 3+ player flops per Pluribus supplement §4. Currently the API returns 400 for 3+ players.
+### Phase 1: Session Models & Store (nexusgto-api)
 
-### Priority 2: Layer 4.B — Multi-street GPU CFR
-Port chance-node kernels from `flop_solve.cu` into `street_solve.cu` for HU flop→end-of-game and turn→end-of-game. Biggest CUDA work item (~1-2 weeks).
+New files:
+- `app/models/session.py` — `HandSession` dataclass, request/response models
+- `app/services/session_store.py` — In-memory store + Pluribus pipeline
+  - Import `RangeNarrower` from poker-solver
+  - On create: initialize per-position ranges from preflop weights, expand 169 hand classes → 1326 combos
+  - On action: Bayesian update via `RangeNarrower.update()`
+  - On deal: solve with narrowed ranges, store strategies for next narrowing
+  - 30-min auto-expiry, max 100 concurrent sessions
 
-### Priority 3: Layer 6 — Final-iteration strategy
-Return the last-iteration strategy instead of σ̄ for postflop decisions. Fixes convergence artifacts (zigzag pair-ladder) on rare lines. ~2 hours.
+### Phase 2: Session Endpoints (nexusgto-api)
 
-### Priority 4: Layer 5 — Preflop re-solve
-Trigger a subgame re-solve from the preflop root when an opponent bets >$100 off any tree size. Currently uses pseudoharmonic interpolation for all off-tree bets.
+New file: `app/routers/session.py`
+- `POST /api/session` — Create from preflop state (positions, range weights, pot, stacks)
+- `POST /api/session/{id}/deal` — Deal cards, trigger GPU solve with narrowed ranges, return strategies
+- `POST /api/session/{id}/action` — Player acts, Bayesian narrowing, update pot/stacks
+- `GET /api/session/{id}` — Get current state
+- `DELETE /api/session/{id}` — Clean up
 
-### Remaining bugs
-- C walker bug in `bp_compute_action_evs` — only visits 169 preflop info sets out of 1.21B. Blocks per-action EV display in frontend.
+Modified: `app/main.py` (register router), `app/services/dependencies.py` (store singleton)
 
-### What was fixed in the 2026-04-10 session
-- Unified preflop → postflop flow (Priority 1 from prior session) — DONE
-- Layer 3 rollout-based leaf values — DONE (betting sim, array builder, wiring)
-- GPU segfault on consecutive solves — FIXED (skip explicit free())
-- Frontend preflop tree walker loop-back bug — FIXED (findNextToAct checks committed < currentBet)
-- Action-hash test failures — FIXED (setHashMixer("boost") in tests)
-- All tests passing: 164/164 vitest, 56/56 rollout, 5/5 API e2e
+### Phase 3: Narrowing & Freezing Integration (nexusgto-api + poker-solver)
+
+The Pluribus-critical piece:
+- **On action**: Extract P(chosen_action|hand) from last solve's strategy → `RangeNarrower.update()`
+- **Range conversion**: 1326 combos (narrowing) ↔ 169 hand classes (solver). Expand on create, collapse before solve.
+- **Freezing**: Track per-position actions this street. Pass to `set_frozen_actions()` on solve. Reset on street change.
+- **Off-tree**: Call `interpolate_narrowing()` from `off_tree.py` for non-tree bet amounts.
+
+### Phase 4: Frontend Session Integration (nexusgto)
+
+- API client: `createSession()`, `dealStreet()`, `takeSessionAction()`, `getSession()`
+- Solver page: preflop complete → createSession → deal → display strategies → show postflop action buttons → user picks action → narrowing → deal next street → repeat
+- Reuse ActionBar for postflop actions (check, bet 33%, bet 75%, bet 150%, all-in)
+
+### Phase 5: Testing
+
+- Unit: session store, range narrowing, 169↔1326 conversion
+- API: full session flow via curl (create → deal → action → deal → verify ranges narrow)
+- Verify narrowed ranges produce different strategies than uniform
+
+## Key files to read before starting
+
+### Existing Pluribus mechanics (poker-solver/python/):
+- `range_narrowing.py` — `RangeNarrower` class with Bayesian updates
+- `off_tree.py` — `pseudoharmonic_map()`, `interpolate_narrowing()`
+- `hud_solver.py` — Reference implementation (full pipeline, not used by API)
+
+### Current API (nexusgto-api/app/):
+- `services/postflop_provider.py` — `GPUPostflopProvider` with `solve()` and `solve_all()`
+- `models/postflop.py` — `PostflopQuery` with `ranges` field
+- `routers/solve.py` — Stateless endpoints
+
+### Frontend (nexusgto/src/):
+- `app/solver/page.tsx` — Current unified flow
+- `lib/preflop-data.ts` — `extractRangeWeights()`
+- `lib/api.ts` — API client
+
+## Performance (RTX 3060, 200 CFR iterations, HU)
+
+| Street | Time | Bottleneck |
+|--------|------|------------|
+| Flop | ~15s | Leaf equity computation |
+| Turn | ~2.3s | Leaf equity (smaller) |
+| River | ~0.4s | Pure CFR (showdown) |
+
+200 iterations is fully converged (zero diff vs 1000/2000).
 
 ## How to start the stack
 
 ```bash
-# Terminal 1 — API server
-cd C:/Users/Victor/Documents/Projects/nexusgto-api
-uvicorn app.main:app --reload --port 8000
-
-# Terminal 2 — Frontend
-cd C:/Users/Victor/Documents/Projects/nexusgto
-npm run dev
+cd C:/Users/Victor/Documents/Projects/nexusgto-api && uvicorn app.main:app --reload --port 8000
+cd C:/Users/Victor/Documents/Projects/nexusgto && npm run dev
 ```
-
-Then visit `http://localhost:3000/solver` — walk preflop, deal flop, solve.
-
-## Performance (RTX 3060, 200 CFR iterations, HU)
-
-| Street | Hands | Time | Bottleneck |
-|--------|-------|------|------------|
-| Flop | 169 | ~15s | Leaf equity computation (49 turn cards × 97 leaves) |
-| Turn | 169 | ~2.3s | Leaf equity computation (smaller) |
-| River | 169 | ~0.4s | Pure CFR (no leaves, just showdown) |
-
-200 iterations is **fully converged** — zero strategy difference vs 1000 or 2000
-on this tree size (2231 nodes HU flop). The CFR iterations themselves take <1s;
-the bottleneck is the leaf value equity computation over runouts.
-
-## EC2
-
-All instances terminated. No running costs. v3 .bps in S3 at `s3://poker-blueprint-unified-v2/unified_blueprint_v3_1.5B.bps` and locally at `blueprint_data_v3/unified_blueprint_v3_1.5B.bps` (14.66 GB).
