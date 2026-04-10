@@ -50,7 +50,7 @@ All v3 work is in **two commits on `master`**: `a82219b` (Phase 1) and `48da71b`
 |---|---|---|---|
 | EC2 v2 training | PAUSED (no instance running) | 1.5B iters checkpoint in S3 | Waiting on AWS credits to resume |
 | Realtime solver (`hud_solver.py`) | v3 on master | reads `unified_blueprint_*.bps` | Phase 1.1 (2000 iters) + 1.2 active. Phase 1.3 equity-only fallback. |
-| GPU postflop solver (`street_solver_gpu.py`) | v3 on master | n/a (real-time CFR, no blueprint) | 200 iterations, ~14s HU flop / ~3s turn / ~1.4s river on RTX 3060. |
+| GPU postflop solver (`street_solver_gpu.py`) | v3 on master | n/a (real-time CFR, no blueprint) | 200 iterations (fully converged at this tree size), ~15s HU flop / ~2.3s turn / ~0.4s river on RTX 3060. Flop bottleneck is leaf equity computation, not CFR iters. |
 | Rollout leaf values (`rollout_leaves.py`) | v3 on master | uniform-strategy fallback | Layer 3 implemented, disabled by default (USE_ROLLOUT_LEAVES=true). ~100x slower than equity-only in Python. |
 | Export tool (`precompute/export_v2.py`) | unchanged | writes `schema_version: 2` | **Phase 1.3 step 2 not yet implemented** |
 | nexusgto-api (FastAPI) | separate repo | preflop via JSON, postflop via GPU CFR | `POST /api/solve-all` returns both players' strategies. Accepts `ranges` for narrowed preflop weights. |
@@ -326,7 +326,7 @@ The realtime code (Phase 1.1, 1.2, 1.3-after-export-fix) is already on `master`.
 | 2026-04-08 | **Don't fix river bucket abstraction in v3** | Mild (2-6% of boards), not worth blocking |
 | 2026-04-08 | **Skip the v3 retraining run** | Marginal quality improvement vs cost; Phase 1-3 realtime work delivers most of the benefit without retraining |
 | 2026-04-08 | Final-iteration strategy export is higher priority than v3 retraining | Probably bigger blueprint quality impact |
-| 2026-04-10 | API postflop uses 200 CFR iterations (not 2000) | 2000 would take ~140s per HU flop solve; 200 gives ~14s which is acceptable for interactive use. hud_solver keeps 2000 for standalone/batch. |
+| 2026-04-10 | API postflop uses 200 CFR iterations (not 2000) | Tested: 200 iters is fully converged on HU trees (zero L1 distance vs 1000/2000). Flop bottleneck is leaf equity (~15s), not CFR (<1s). hud_solver keeps 2000 for potential future multi-way trees where convergence may be slower. |
 | 2026-04-10 | Skip solver.free() to fix segfault | GPU memory freed inside ss_solve_gpu; CPU struct leak (~50KB/solve) is negligible vs the CUDA runtime corruption from explicit teardown |
 | 2026-04-10 | Layer 3 rollout disabled by default | Python rollout is ~100x slower than equity-only. Correct but impractical until CUDA port (Layer 3.3). Enable with USE_ROLLOUT_LEAVES=true for testing. |
 

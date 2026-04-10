@@ -56,13 +56,17 @@ npm run dev
 
 Then visit `http://localhost:3000/solver` — walk preflop, deal flop, solve.
 
-## Performance (RTX 3060, 200 CFR iterations)
+## Performance (RTX 3060, 200 CFR iterations, HU)
 
-| Street | Hands | Time |
-|--------|-------|------|
-| HU Flop | 169 | ~14s |
-| HU Turn | 169 | ~3s |
-| HU River | 169 | ~1.4s |
+| Street | Hands | Time | Bottleneck |
+|--------|-------|------|------------|
+| Flop | 169 | ~15s | Leaf equity computation (49 turn cards × 97 leaves) |
+| Turn | 169 | ~2.3s | Leaf equity computation (smaller) |
+| River | 169 | ~0.4s | Pure CFR (no leaves, just showdown) |
+
+200 iterations is **fully converged** — zero strategy difference vs 1000 or 2000
+on this tree size (2231 nodes HU flop). The CFR iterations themselves take <1s;
+the bottleneck is the leaf value equity computation over runouts.
 
 ## EC2
 
