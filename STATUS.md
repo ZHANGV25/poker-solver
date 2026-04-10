@@ -2,7 +2,7 @@
 
 **This is the single source of truth for the poker-solver repo.** Read this first. Everything else is either reference (frozen) or appendix (for one specific subsystem).
 
-Last updated: 2026-04-09 (Phase A verification complete — loader, tests, sentinels, Bug 6 sync all validated locally; Phase B EC2 run deferred pending AWS credits)
+Last updated: 2026-04-10 (unified preflop→postflop flow shipped, Layer 3 rollout implemented, GPU segfault fixed, tree walker bug fixed)
 
 ---
 
@@ -48,11 +48,13 @@ All v3 work is in **two commits on `master`**: `a82219b` (Phase 1) and `48da71b`
 
 | System | Code branch | Blueprint version | Notes |
 |---|---|---|---|
-| EC2 v2 training | pre-v3 (snapshot from launch time) | n/a — generating one | Cannot apply v3 without restart |
-| Realtime solver (`hud_solver.py`) | v3 committed in master | reads `unified_blueprint_*.bps` from S3 | Phase 1.1 + 1.2 active. Phase 1.3 falls back to equity-only because the export side wasn't shipped. |
+| EC2 v2 training | PAUSED (no instance running) | 1.5B iters checkpoint in S3 | Waiting on AWS credits to resume |
+| Realtime solver (`hud_solver.py`) | v3 on master | reads `unified_blueprint_*.bps` | Phase 1.1 (2000 iters) + 1.2 active. Phase 1.3 equity-only fallback. |
+| GPU postflop solver (`street_solver_gpu.py`) | v3 on master | n/a (real-time CFR, no blueprint) | 200 iterations, ~14s HU flop / ~3s turn / ~1.4s river on RTX 3060. |
+| Rollout leaf values (`rollout_leaves.py`) | v3 on master | uniform-strategy fallback | Layer 3 implemented, disabled by default (USE_ROLLOUT_LEAVES=true). ~100x slower than equity-only in Python. |
 | Export tool (`precompute/export_v2.py`) | unchanged | writes `schema_version: 2` | **Phase 1.3 step 2 not yet implemented** |
-| nexusgto-api (FastAPI) | separate repo | consumes .bps via this solver's Python layer | See [Repo layout](#related-repos-on-disk) below |
-| nexusgto (Next.js) | separate repo | consumes nexusgto-api over HTTP | See [Repo layout](#related-repos-on-disk) below |
+| nexusgto-api (FastAPI) | separate repo | preflop via JSON, postflop via GPU CFR | `POST /api/solve-all` returns both players' strategies. Accepts `ranges` for narrowed preflop weights. |
+| nexusgto (Next.js) | separate repo | unified preflop→postflop flow at `/solver` | Preflop tree walk → board picker → GPU CFR solve → range grid. Verified e2e via Playwright. |
 
 ---
 
@@ -177,7 +179,16 @@ What WOULD fix the zigzag:
 
 ---
 
-## Immediate next steps (this week)
+## What was completed 2026-04-10
+
+1. **Unified preflop → postflop UX** — `/solver` is one continuous flow. After preflop action completes, inline BoardPicker appears. User picks flop cards, clicks "Solve Flop". GPU CFR runs with narrowed ranges from the preflop walk. Both players' strategies displayed in the same SolverShell. Verified end-to-end via Playwright.
+2. **Layer 3 rollout-based leaf values** — `python/rollout_leaves.py` has full Pluribus-faithful betting simulation (EHS bucket lookup → blueprint σ̄ → 5x bias → action sampling). 56/56 tests pass. Disabled by default (Python ~100x slower than equity-only). Enable with `USE_ROLLOUT_LEAVES=true`.
+3. **GPU segfault fix** — back-to-back solves no longer crash. Skipped explicit `solver.free()` in the API provider (GPU memory already freed inside `ss_solve_gpu`).
+4. **Preflop tree walker bug fix** — `findNextToAct` in `solver-state.ts` now checks `committed < currentBet`, fixing action loop-back (e.g. UTG acting again after BB 3-bets).
+5. **New API endpoint** — `POST /api/solve-all` returns both players' strategies from a single GPU solve. Accepts optional `ranges` field for narrowed preflop weights.
+6. **Test coverage** — 164/164 vitest, 56/56 rollout, 5/5 API e2e, all passing.
+
+## Immediate next steps
 
 ### 1. v2 training — PAUSED
 
@@ -273,23 +284,23 @@ The realtime code (Phase 1.1, 1.2, 1.3-after-export-fix) is already on `master`.
 
 ---
 
-## Forward roadmap (next month)
+## Forward roadmap (Pluribus parity)
 
-### Short-term (2–4 weeks)
+### Short-term (1–2 weeks)
 
-| Item | Effort | Notes |
-|---|---|---|
-| Final-iteration strategy export | ~1 day | Pluribus uses final-iter for postflop because the average lags. Add an option to `export_v2.py` to write the current-iter strategy alongside the average. Probably bigger blueprint quality impact than a fresh v3 retraining. |
-| Sentinel decision audit + automation | ~3 days | First audit manually, then write `tests/audit_vs_pio.py` for repeatable checks. |
-| Nexusgto-api production hardening | ~2–3 days | API repo work, see [related repos](#related-repos-on-disk). |
+| Item | Effort | Status | Notes |
+|---|---|---|---|
+| Layer 6 — Final-iteration strategy | ~2 hours | Not started | Return iter-N strategy instead of σ̄ for postflop. Fixes zigzag convergence artifacts. |
+| Layer 3.3 — CUDA rollout port | 3–5 days | Not started | Port the Python rollout betting sim to CUDA. Required for real-time use (Python is ~100x slower). |
+| Layer 4.A — Multi-way flop | 3–5 days | Not started | Fix `extract_leaf_info_from_tree` for variable `n_act`, add 2-raises depth limit. Unlocks 3+ player postflop. |
 
-### Medium-term (1–2 months)
+### Medium-term (2–6 weeks)
 
-| Item | Effort | Notes |
-|---|---|---|
-| **T5.1 — Real-time search (multi-street GPU CFR)** | 2–4 weeks | The biggest structural improvement. Handles rare info sets at inference time, removes the need for the blueprint to cover everything. See [`docs/REALTIME_TODO.md`](docs/REALTIME_TODO.md) §T5.1. |
-| **T3.1 — Subgame depth analysis** | 3–5 days | Research task: solve 30–50 spots three ways (single-street + leaf, two-street, full-game) and measure pairwise strategy distance. Decides whether T5.1 is actually worth the cost. **Should precede T5.1.** |
-| **T4.1 — Preflop re-solve on large deviations** | ~1 week | Pluribus re-solves from preflop root when opponent bets >$100 off any tree size. We currently use pseudoharmonic interpolation. See REALTIME_TODO §T4.1. |
+| Item | Effort | Status | Notes |
+|---|---|---|---|
+| **Layer 4.B — Multi-street GPU CFR** | 1–2 weeks | Not started | Port chance-node kernels from `flop_solve.cu` into `street_solve.cu`. Biggest CUDA work item. |
+| **Layer 5 — Preflop re-solve** | ~1 week | Not started | >$100 off-tree bets trigger subgame re-solve from preflop root instead of pseudoharmonic snap. |
+| Sentinel decision audit | ~3 days | Not started | Compare 50 solver decisions to PioSolver/GTO Wizard. First quality measurement. |
 
 ### Long-term (1+ quarters)
 
@@ -315,6 +326,9 @@ The realtime code (Phase 1.1, 1.2, 1.3-after-export-fix) is already on `master`.
 | 2026-04-08 | **Don't fix river bucket abstraction in v3** | Mild (2-6% of boards), not worth blocking |
 | 2026-04-08 | **Skip the v3 retraining run** | Marginal quality improvement vs cost; Phase 1-3 realtime work delivers most of the benefit without retraining |
 | 2026-04-08 | Final-iteration strategy export is higher priority than v3 retraining | Probably bigger blueprint quality impact |
+| 2026-04-10 | API postflop uses 200 CFR iterations (not 2000) | 2000 would take ~140s per HU flop solve; 200 gives ~14s which is acceptable for interactive use. hud_solver keeps 2000 for standalone/batch. |
+| 2026-04-10 | Skip solver.free() to fix segfault | GPU memory freed inside ss_solve_gpu; CPU struct leak (~50KB/solve) is negligible vs the CUDA runtime corruption from explicit teardown |
+| 2026-04-10 | Layer 3 rollout disabled by default | Python rollout is ~100x slower than equity-only. Correct but impractical until CUDA port (Layer 3.3). Enable with USE_ROLLOUT_LEAVES=true for testing. |
 
 ---
 
