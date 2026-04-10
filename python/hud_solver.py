@@ -737,23 +737,42 @@ class HUDSolver:
             use_cont_strats = (street != "river")
             leaf_value_fn = None
 
+            # NOTE on the leaf-value callback signature:
+            # StreetSolverGPU calls leaf_value_fn(tree_data, player_hands,
+            # max_h, pot_chips) where player_hands is ALWAYS a list of
+            # per-player hand lists. The previous (oop_h, ip_h, ...)
+            # signature was a stale 5-arg API from before the N-player
+            # rewrite — it would crash at runtime, but nothing called it
+            # because postflop_provider returned mock data. Layer 2.3
+            # wires postflop_provider to call into here, so all closures
+            # use the correct 4-arg signature now.
+
             if street == "flop" and len(board) >= 3:
                 bp_store = self._get_bp_store(self.scenario_id)
                 if bp_store is not None:
-                    # Build a closure that computes leaf values using
-                    # the actual tree structure (solves chicken-and-egg).
+                    # Pluribus-exact path via BPST per-action EVs (when the
+                    # scenario's flop_blueprints/ exists). compute_flop_leaf_values
+                    # is the BlueprintStore consumer; it currently still expects
+                    # 2-player oop/ip arguments because BPST is a 2-player format
+                    # by construction (per-scenario per-texture HU flop solves).
+                    # Multi-way callers fall through to the v2 / equity path.
                     board_strs = list(board[:3])
 
-                    def _flop_leaf_fn(tree_data, oop_h, ip_h, max_h, pot_chips):
+                    def _flop_leaf_fn(tree_data, player_hands, max_h, pot_chips):
                         from leaf_values import (compute_flop_leaf_values,
                                                  extract_leaf_info_from_tree)
                         leaf_infos = extract_leaf_info_from_tree(tree_data)
                         if not leaf_infos:
                             return None
+                        if len(player_hands) != 2:
+                            # BPST path is HU-only by format; multi-way callers
+                            # should never reach here because the bp_store
+                            # gating up top is per-scenario HU. Defensive bail.
+                            return None
                         return compute_flop_leaf_values(
                             flop_board=[card_to_int(c) for c in board_strs],
-                            oop_hands=oop_h,
-                            ip_hands=ip_h,
+                            oop_hands=player_hands[0],
+                            ip_hands=player_hands[1],
                             blueprint_store=bp_store,
                             board_cards_str=board_strs,
                             leaf_infos=leaf_infos,
@@ -761,43 +780,28 @@ class HUDSolver:
                             starting_pot=pot_chips,
                         )
                     leaf_value_fn = _flop_leaf_fn
-                elif self.blueprint_v2 is not None:
-                    # Use v2 .bps blueprint for flop leaf values.
-                    # Flop leaves are at the turn boundary. Pluribus computes
-                    # continuation values by averaging equity over all 49 turn
-                    # cards, weighted by the 4 biased continuation strategies.
+                else:
+                    # First-order bias approximation path (Layer 3 will
+                    # replace this with rollout-based leaf values per
+                    # Pluribus / Brown & Sandholm 2018). Works for 2-6
+                    # players via the N-player generalization in
+                    # leaf_values.compute_flop_leaf_equity().
                     #
-                    # Without full per-action turn EVs from the v2 blueprint,
-                    # we compute per-turn-card equity directly. This is the
-                    # same method used for turn leaves (which are at the river
-                    # boundary). The 4 continuation strategy pairs all collapse
-                    # to the same equity value since we lack per-action EVs to
-                    # differentiate them. This is conservative — the GPU search
-                    # refines leaf values via CFR iterations regardless.
+                    # No blueprint dependency — equity is computed inline
+                    # via showdown evaluation over sampled turn × river
+                    # runouts. This is the gating fallback when the
+                    # per-scenario BPST blueprint doesn't exist.
                     board_strs = list(board[:3])
 
-                    def _flop_leaf_fn_v2(tree_data, player_hands,
-                                         max_h, pot_chips):
+                    def _flop_leaf_fn_v2(tree_data, player_hands, max_h, pot_chips):
                         from leaf_values import (compute_flop_leaf_equity,
                                                  extract_leaf_info_from_tree)
                         leaf_infos = extract_leaf_info_from_tree(tree_data)
                         if not leaf_infos:
                             return None
-                        flop_ints = [card_to_int(c) for c in board_strs]
-                        # player_hands is list of hand lists (N-player) or
-                        # the oop_hands list (2-player callback from StreetSolverGPU)
-                        if isinstance(player_hands, list) and \
-                           len(player_hands) > 0 and \
-                           isinstance(player_hands[0], list):
-                            oop_h = player_hands[0]
-                            ip_h = player_hands[1] if len(player_hands) > 1 else []
-                        else:
-                            oop_h = player_hands
-                            ip_h = []
                         return compute_flop_leaf_equity(
-                            flop_board=flop_ints,
-                            oop_hands=oop_h,
-                            ip_hands=ip_h,
+                            flop_board=[card_to_int(c) for c in board_strs],
+                            player_hands=player_hands,
                             leaf_infos=leaf_infos,
                             max_hands=max_h,
                             starting_pot=pot_chips,
@@ -807,7 +811,7 @@ class HUDSolver:
             elif street == "turn" and len(board) >= 4:
                 board_ints = [card_to_int(c) for c in board[:4]]
 
-                def _turn_leaf_fn(tree_data, oop_h, ip_h, max_h, pot_chips):
+                def _turn_leaf_fn(tree_data, player_hands, max_h, pot_chips):
                     from leaf_values import (compute_turn_leaf_values,
                                              extract_leaf_info_from_tree)
                     leaf_infos = extract_leaf_info_from_tree(tree_data)
@@ -815,8 +819,7 @@ class HUDSolver:
                         return None
                     return compute_turn_leaf_values(
                         board_4=board_ints,
-                        oop_hands=oop_h,
-                        ip_hands=ip_h,
+                        player_hands=player_hands,
                         leaf_infos=leaf_infos,
                         max_hands=max_h,
                         starting_pot=pot_chips,

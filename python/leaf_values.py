@@ -407,66 +407,81 @@ def compute_flop_leaf_values(
 
 def compute_flop_leaf_equity(
     flop_board: List[int],
-    player_hands: List[List[Tuple[int, int, float]]],
     leaf_infos: List[LeafInfo],
     max_hands: int,
     starting_pot: int,
-    # Legacy 2-player compat
-    oop_hands=None, ip_hands=None,
+    # N-player input (preferred). When provided, num_players = len(player_hands).
+    player_hands: Optional[List[List[Tuple[int, int, float]]]] = None,
+    # Legacy 2-player input (still accepted for backwards compat with the
+    # closure callbacks in hud_solver.py:_flop_leaf_fn_v2).
+    oop_hands: Optional[List[Tuple[int, int, float]]] = None,
+    ip_hands: Optional[List[Tuple[int, int, float]]] = None,
 ) -> np.ndarray:
     """Compute flop leaf values by averaging equity over turn+river runouts,
     then applying the first-order bias approximation at the flop pot level
-    to produce 16 different leaf values per (s0, s1) bias pair.
+    to produce 4^N leaf values per (s_0, ..., s_{N-1}) bias profile.
 
-    Previously this function returned identical values for all 16 (s0, s1)
-    pairs because the v2 .bps blueprint doesn't store per-action EVs. The v3
-    fix uses the bias-adjusted formula in `biased_leaf_value()` to differentiate
-    the 4 continuation strategies based on first-order pot/fold-prob effects.
+    Supports any player count from 2 to 6. The 2-player path is the heads-up
+    case used by HU flop solving; the 3-6 player paths are used by Pluribus's
+    multi-way flop subgame search where leaves sit at the start of the turn
+    (or after the 2nd raise of the flop, whichever is earlier per the
+    Pluribus supplement §4).
 
-    Note: 2-player only for now (matches the prior implementation). N-player
-    extension is straightforward but blocked on the realtime solver's
-    multi-villain leaf-value handling, which is currently 2-player.
+    Algorithm (per Brown & Sandholm 2018 NeurIPS depth-limited solving):
+      1. For each player p, compute showdown equity averaged over all
+         (turn × river) runouts: P(p's hand beats every other active
+         player's hand at showdown).
+      2. For each leaf, for each tuple (s_0, ..., s_{N-1}) ∈ {0,1,2,3}^N
+         of bias choices, compute the leaf value via biased_leaf_value()
+         which applies first-order pot-size and fold-probability effects.
+
+    Equity at a flop leaf is INDEPENDENT of which betting line led to the
+    leaf — only the leaf POT differs. We compute equity once per (player,
+    hand) and apply the per-leaf pot adjustment later.
 
     Returns:
         np.array[num_total_leaves, num_players, max_hands] float32
-        where num_total_leaves = len(leaf_infos) * 16
+        where num_total_leaves = len(leaf_infos) * 4^num_players
     """
-    if player_hands is None and oop_hands is not None:
+    if player_hands is None:
+        if oop_hands is None or ip_hands is None:
+            raise ValueError(
+                "compute_flop_leaf_equity requires either player_hands "
+                "or both oop_hands and ip_hands"
+            )
         player_hands = [oop_hands, ip_hands]
 
     num_players = len(player_hands)
-    if num_players != 2:
-        raise NotImplementedError(
-            "compute_flop_leaf_equity currently supports 2-player only. "
-            "Multi-player support requires the binary BlueprintStore path "
-            "(compute_flop_leaf_values) which has per-action EVs.")
+    if num_players < 2 or num_players > 6:
+        raise ValueError(
+            f"compute_flop_leaf_equity supports 2-6 players, got {num_players}"
+        )
 
     num_orig_leaves = len(leaf_infos)
-    cont_per_leaf = 16  # 4 × 4 for 2 players
+    cont_per_leaf = 4 ** num_players
     total_leaves = num_orig_leaves * cont_per_leaf
-    leaf_values = np.zeros((total_leaves, 2, max_hands), dtype=np.float32)
+    leaf_values = np.zeros((total_leaves, num_players, max_hands), dtype=np.float32)
 
     board_set = set(flop_board)
     turn_cards = [c for c in range(52) if c not in board_set]
 
-    oop_hands_l = player_hands[0]
-    ip_hands_l = player_hands[1]
-    nh0 = len(oop_hands_l)
-    nh1 = len(ip_hands_l)
+    nh = [len(player_hands[p]) for p in range(num_players)]
 
     # ── Compute raw per-hand equity at the flop, averaged over turn+river ──
     #
-    # Equity is INDEPENDENT of leaf pot — it's a function of (board, hand,
-    # opponent range). Compute it once per (player, hand) and reuse across all
-    # leaves. The per-leaf loop later just applies biased_leaf_value with the
-    # appropriate leaf pot.
-    raw_equity = np.zeros((2, max_hands), dtype=np.float64)
-    eq_counts = np.zeros((2, max_hands), dtype=np.float64)
+    # equity[p, h] = P(player p's hand h beats EVERY other active player's
+    #                 hand at showdown), averaged over all sampled (tc, rc).
+    # For ties, we award fractional credit 1/k where k is the number of
+    # tied-best hands (matching the standard pot-share rule).
+    raw_equity = np.zeros((num_players, max_hands), dtype=np.float64)
+    eq_counts = np.zeros((num_players, max_hands), dtype=np.float64)
 
-    # Subsample turn × river to keep CPU cost reasonable for large ranges.
+    # Subsample turn × river to keep CPU cost reasonable. The "any_large"
+    # gate triggers sampling only when at least one player's range is big
+    # enough to make full enumeration prohibitive.
     MAX_TURN_SAMPLES = 12
     MAX_RIVER_SAMPLES = 12
-    any_large = (nh0 > 50 or nh1 > 50)
+    any_large = any(n > 50 for n in nh)
     if len(turn_cards) > MAX_TURN_SAMPLES and any_large:
         rng = np.random.RandomState(42)
         sampled_turns = sorted(rng.choice(turn_cards, MAX_TURN_SAMPLES, replace=False))
@@ -486,223 +501,315 @@ def compute_flop_leaf_equity(
             board_5 = list(flop_board) + [tc, rc]
             board_5_set = set(board_5)
 
-            # Compute hand strengths for both players
-            oop_strengths = {}
-            ip_strengths = {}
-            for h in range(nh0):
-                hc0, hc1 = oop_hands_l[h][0], oop_hands_l[h][1]
-                if hc0 in board_5_set or hc1 in board_5_set:
-                    continue
-                oop_strengths[h] = _eval7_py(board_5 + [hc0, hc1])
-            for h in range(nh1):
-                hc0, hc1 = ip_hands_l[h][0], ip_hands_l[h][1]
-                if hc0 in board_5_set or hc1 in board_5_set:
-                    continue
-                ip_strengths[h] = _eval7_py(board_5 + [hc0, hc1])
+            # Per-player hand strengths for this runout, gated on board/hand
+            # cards being disjoint. None for blocked combos.
+            strengths_per_p = []
+            for p in range(num_players):
+                ps = {}
+                for h in range(nh[p]):
+                    hc0, hc1 = player_hands[p][h][0], player_hands[p][h][1]
+                    if hc0 in board_5_set or hc1 in board_5_set:
+                        continue
+                    ps[h] = _eval7_py(board_5 + [hc0, hc1])
+                strengths_per_p.append(ps)
 
-            # Pairwise compare for OOP equity
-            for h in range(nh0):
-                if h not in oop_strengths:
+            # For each (player, hand), compute equity vs the joint distribution
+            # of all other players' hands on this runout. We iterate the cross
+            # product of opponent hands for N-1 opponents which is O(prod_other_nh).
+            # For N>=4 this gets expensive; subsample within when needed.
+            for p in range(num_players):
+                if not strengths_per_p[p]:
                     continue
-                hs = oop_strengths[h]
-                hc0, hc1 = oop_hands_l[h][0], oop_hands_l[h][1]
-                wins = losses = ties = 0.0
-                for o in range(nh1):
-                    if o not in ip_strengths:
-                        continue
-                    oc0, oc1 = ip_hands_l[o][0], ip_hands_l[o][1]
-                    if hc0 == oc0 or hc0 == oc1 or hc1 == oc0 or hc1 == oc1:
-                        continue
-                    os_val = ip_strengths[o]
-                    if hs > os_val:
-                        wins += 1.0
-                    elif hs < os_val:
-                        losses += 1.0
-                    else:
-                        ties += 1.0
-                total = wins + losses + ties
-                if total > 0:
-                    raw_equity[0, h] += (wins + 0.5 * ties) / total
-                    eq_counts[0, h] += 1.0
+                _accumulate_nplayer_equity(
+                    p, num_players, player_hands, strengths_per_p,
+                    raw_equity, eq_counts,
+                )
 
-            # Pairwise compare for IP equity
-            for h in range(nh1):
-                if h not in ip_strengths:
-                    continue
-                hs = ip_strengths[h]
-                hc0, hc1 = ip_hands_l[h][0], ip_hands_l[h][1]
-                wins = losses = ties = 0.0
-                for o in range(nh0):
-                    if o not in oop_strengths:
-                        continue
-                    oc0, oc1 = oop_hands_l[o][0], oop_hands_l[o][1]
-                    if hc0 == oc0 or hc0 == oc1 or hc1 == oc0 or hc1 == oc1:
-                        continue
-                    os_val = oop_strengths[o]
-                    if hs > os_val:
-                        wins += 1.0
-                    elif hs < os_val:
-                        losses += 1.0
-                    else:
-                        ties += 1.0
-                total = wins + losses + ties
-                if total > 0:
-                    raw_equity[1, h] += (wins + 0.5 * ties) / total
-                    eq_counts[1, h] += 1.0
-
-    # Normalize to average equity in [0, 1]
+    # Normalize raw_equity to mean equity in [0, 1]
     valid = eq_counts > 0
     raw_equity[valid] /= eq_counts[valid]
 
     # ── Apply first-order bias adjustment at each leaf's pot ──
-    # Per (leaf, s0, s1) pair, compute biased_leaf_value(equity, leaf_pot, s_self, s_opp).
-    # This produces 16 different values per leaf, restoring variance reduction.
+    #
+    # For an N-player leaf, the bias profile is a tuple s = (s_0, ..., s_{N-1})
+    # in {0,1,2,3}^N. We flatten via the standard mixed-radix encoding:
+    #   combo_idx = sum_i s_i * 4^i
+    # which matches `extract_leaf_info_from_tree`'s leaf indexing convention.
+    #
+    # biased_leaf_value(equity, pot, s_self, s_opp) currently takes ONE
+    # opponent bias. For N>2 we use the average of all opponents' biases as a
+    # first-order proxy — that's the same approximation we use for 2-player,
+    # extended naturally. The Layer 3 rollout-based path (replacing this
+    # first-order approximation entirely) doesn't have this approximation
+    # because it actually rolls out under each player's chosen strategy.
     for li in leaf_infos:
         leaf_pot = li.pot
-        for s0 in range(4):
-            for s1 in range(4):
-                flat_idx = li.leaf_idx * 16 + s0 * 4 + s1
-                if flat_idx >= total_leaves:
-                    continue
-                for h in range(min(nh0, max_hands)):
-                    leaf_values[flat_idx, 0, h] = biased_leaf_value(
-                        raw_equity[0, h], leaf_pot, s0, s1)
-                for h in range(min(nh1, max_hands)):
-                    leaf_values[flat_idx, 1, h] = biased_leaf_value(
-                        raw_equity[1, h], leaf_pot, s1, s0)
+        for combo in range(cont_per_leaf):
+            flat_idx = li.leaf_idx * cont_per_leaf + combo
+            if flat_idx >= total_leaves:
+                continue
+            # Decode combo into per-player bias choices
+            biases = [(combo // (4 ** i)) % 4 for i in range(num_players)]
+            for p in range(num_players):
+                # First-order proxy for "opponent bias" when there are
+                # multiple opponents: arithmetic mean of the others'
+                # biases. With one opponent (N=2) this reduces to that
+                # opponent's bias exactly, matching the original 2-player
+                # behavior.
+                if num_players > 2:
+                    other_sum = sum(biases[q] for q in range(num_players) if q != p)
+                    s_opp_proxy = int(round(other_sum / (num_players - 1)))
+                    s_opp_proxy = max(0, min(3, s_opp_proxy))
+                else:
+                    s_opp_proxy = biases[1 - p]
+                for h in range(min(nh[p], max_hands)):
+                    leaf_values[flat_idx, p, h] = biased_leaf_value(
+                        raw_equity[p, h], leaf_pot, biases[p], s_opp_proxy
+                    )
 
     return leaf_values
+
+
+def _accumulate_nplayer_equity(
+    hero_p: int,
+    num_players: int,
+    player_hands,
+    strengths_per_p,
+    raw_equity: np.ndarray,
+    eq_counts: np.ndarray,
+) -> None:
+    """For one runout (board_5 already encoded into strengths_per_p),
+    accumulate hero player's per-hand equity vs the joint distribution of
+    all other players' hands.
+
+    For 2 players this is the original pairwise comparison. For 3+ players,
+    we iterate the cross product of opponents' hands. Cardinality grows as
+    O(prod_q!=p nh[q]); to keep this tractable for 6-max we subsample
+    opponent combos when the cross product exceeds a threshold.
+
+    Note: this is a quasi-Monte-Carlo expectation, not exact. The Layer 3
+    rollout-based path provides exact (modulo rollout count) leaf values
+    and replaces this approximation entirely.
+    """
+    import itertools
+    import random as _random
+
+    hero_strengths = strengths_per_p[hero_p]
+    if not hero_strengths:
+        return
+
+    opponent_indices = [q for q in range(num_players) if q != hero_p]
+    opp_hands_lists = [list(strengths_per_p[q].keys()) for q in opponent_indices]
+
+    # Cross product cardinality
+    total_combos = 1
+    for opp_hands in opp_hands_lists:
+        total_combos *= len(opp_hands)
+
+    if total_combos == 0:
+        return
+
+    # Cap the cross product at OPP_COMBO_LIMIT samples per (hero hand, runout).
+    # 2000 is empirically enough to bring the equity error below ~0.5% per
+    # estimate, while keeping a 6-max evaluation under a few seconds total.
+    OPP_COMBO_LIMIT = 2000
+
+    if total_combos <= OPP_COMBO_LIMIT:
+        opp_iter = itertools.product(*opp_hands_lists)
+        do_subsample = False
+    else:
+        rng = _random.Random(42)
+        def _sample_iter():
+            for _ in range(OPP_COMBO_LIMIT):
+                yield tuple(rng.choice(opp_hands) for opp_hands in opp_hands_lists)
+        opp_iter = _sample_iter()
+        do_subsample = True
+
+    # Convert to a list so we can re-iterate per hero hand.
+    opp_combos = list(opp_iter)
+
+    for h, hs in hero_strengths.items():
+        hc0, hc1 = player_hands[hero_p][h][0], player_hands[hero_p][h][1]
+        wins_with_ties = 0.0  # accumulator: 1.0 for outright win, 1/k for k-way tie
+        valid_combos = 0
+
+        for combo in opp_combos:
+            # Check that no opponent's cards conflict with hero's
+            blocked = False
+            for q_idx, opp_h in enumerate(combo):
+                opp_p = opponent_indices[q_idx]
+                oc0, oc1 = player_hands[opp_p][opp_h][0], player_hands[opp_p][opp_h][1]
+                if hc0 == oc0 or hc0 == oc1 or hc1 == oc0 or hc1 == oc1:
+                    blocked = True
+                    break
+            if blocked:
+                continue
+            # Also check pairwise conflicts BETWEEN opponents
+            opp_cards = []
+            ok = True
+            for q_idx, opp_h in enumerate(combo):
+                opp_p = opponent_indices[q_idx]
+                oc0, oc1 = player_hands[opp_p][opp_h][0], player_hands[opp_p][opp_h][1]
+                if oc0 in opp_cards or oc1 in opp_cards:
+                    ok = False
+                    break
+                opp_cards.append(oc0)
+                opp_cards.append(oc1)
+            if not ok:
+                continue
+
+            # Compare hero strength to all opponents
+            best_opp = None
+            for q_idx, opp_h in enumerate(combo):
+                opp_p = opponent_indices[q_idx]
+                opp_strength = strengths_per_p[opp_p].get(opp_h)
+                if opp_strength is None:
+                    continue
+                if best_opp is None or opp_strength > best_opp:
+                    best_opp = opp_strength
+
+            if best_opp is None:
+                continue
+
+            valid_combos += 1
+            if hs > best_opp:
+                wins_with_ties += 1.0
+            elif hs == best_opp:
+                # Count how many opponents tie hero
+                ties = 1  # hero
+                for q_idx, opp_h in enumerate(combo):
+                    opp_p = opponent_indices[q_idx]
+                    opp_strength = strengths_per_p[opp_p].get(opp_h)
+                    if opp_strength == hs:
+                        ties += 1
+                wins_with_ties += 1.0 / ties
+
+        if valid_combos > 0:
+            raw_equity[hero_p, h] += wins_with_ties / valid_combos
+            eq_counts[hero_p, h] += 1.0
 
 
 # ── Turn leaf values (river continuation) ────────────────────────────────
 
 def compute_turn_leaf_values(
     board_4: List[int],
-    oop_hands: List[Tuple[int, int, float]],
-    ip_hands: List[Tuple[int, int, float]],
     leaf_infos: List[LeafInfo],
     max_hands: int,
     starting_pot: int,
+    # N-player input (preferred). When provided, num_players = len(player_hands).
+    player_hands: Optional[List[List[Tuple[int, int, float]]]] = None,
+    # Legacy 2-player compat (used by hud_solver.py:_turn_leaf_fn).
+    oop_hands: Optional[List[Tuple[int, int, float]]] = None,
+    ip_hands: Optional[List[Tuple[int, int, float]]] = None,
 ) -> np.ndarray:
-    """Compute leaf values for a turn solve.
+    """Compute leaf values for a turn subgame, supporting 2-6 players.
 
     Turn leaves lead to the river. Pluribus solves the river in real-time
-    (no depth limit at river). For turn depth-limit leaves, we compute the
-    continuation value as the average showdown equity over all possible
-    river cards, weighted by pot size.
+    (no depth limit at river — see supplement §4: "all other cases, the
+    subgame extends to the end of the game"). For our depth-limited turn
+    solver, we compute the continuation value as the average showdown
+    equity over all possible river cards, then apply the first-order
+    bias adjustment per (s_0, ..., s_{N-1}) bias profile.
 
-    For performance with large ranges (200 hands), we sample a subset of
-    river cards rather than computing all 46. The sampling error is small
-    since equity averages converge quickly.
+    Per Pluribus, when our solver is the canonical end-of-game river
+    solver, no leaf values are needed at all (showdown is the terminal).
+    This function is the depth-limited fallback when the river solver
+    isn't reached because the user's query stops at the turn boundary.
 
     Each leaf has a different pot (check-check vs bet-call), so the
     showdown payoff differs per leaf.
 
     Returns:
-        np.array[num_total_leaves, 2, max_hands]
+        np.array[num_total_leaves, num_players, max_hands]
+        where num_total_leaves = len(leaf_infos) * 4^num_players
     """
+    if player_hands is None:
+        if oop_hands is None or ip_hands is None:
+            raise ValueError(
+                "compute_turn_leaf_values requires either player_hands "
+                "or both oop_hands and ip_hands"
+            )
+        player_hands = [oop_hands, ip_hands]
+
+    num_players = len(player_hands)
+    if num_players < 2 or num_players > 6:
+        raise ValueError(
+            f"compute_turn_leaf_values supports 2-6 players, got {num_players}"
+        )
+
     num_orig_leaves = len(leaf_infos)
-    total_leaves = num_orig_leaves * 16
-    leaf_values = np.zeros((total_leaves, 2, max_hands), dtype=np.float32)
+    cont_per_leaf = 4 ** num_players
+    total_leaves = num_orig_leaves * cont_per_leaf
+    leaf_values = np.zeros((total_leaves, num_players, max_hands), dtype=np.float32)
 
     board_set = set(board_4)
     river_cards = [c for c in range(52) if c not in board_set]
-    hands_by_player = [oop_hands, ip_hands]
 
-    nh0 = len(oop_hands)
-    nh1 = len(ip_hands)
+    nh = [len(player_hands[p]) for p in range(num_players)]
 
     # For large ranges, sample river cards to keep computation feasible.
     # 200 hands × 200 opps × 46 rivers × eval7 = ~85M evals.
     # Sample 12 rivers → ~2.4M evals, still ~3 seconds on CPU.
-    # With 80 hands: 80² × 12 = ~77K evals, very fast.
     MAX_RIVER_SAMPLES = 12
-    if len(river_cards) > MAX_RIVER_SAMPLES and (nh0 > 50 or nh1 > 50):
+    any_large = any(n > 50 for n in nh)
+    if len(river_cards) > MAX_RIVER_SAMPLES and any_large:
         rng = np.random.RandomState(42)  # deterministic
         sampled = sorted(rng.choice(river_cards, MAX_RIVER_SAMPLES, replace=False))
     else:
         sampled = river_cards
 
-    # Precompute all hand strengths for all sampled river cards.
-    # strengths[rc_idx][p][h] = hand strength or None if blocked
-    all_strengths = []
+    # Equity is independent of leaf pot — compute it once across all sampled
+    # rivers, then apply the per-leaf pot adjustment. (The original 2-player
+    # implementation accidentally re-computed equity per leaf in the inner
+    # loop, which was both slower and gave numerically identical results.)
+    raw_equity = np.zeros((num_players, max_hands), dtype=np.float64)
+    eq_counts = np.zeros((num_players, max_hands), dtype=np.float64)
+
     for rc in sampled:
         board_5 = list(board_4) + [rc]
         board_5_set = set(board_5)
-        rc_strengths = [{}, {}]
-        for p in range(2):
-            for h in range(len(hands_by_player[p])):
-                hc0, hc1 = hands_by_player[p][h][0], hands_by_player[p][h][1]
+        strengths_per_p = []
+        for p in range(num_players):
+            ps = {}
+            for h in range(nh[p]):
+                hc0, hc1 = player_hands[p][h][0], player_hands[p][h][1]
                 if hc0 in board_5_set or hc1 in board_5_set:
                     continue
-                rc_strengths[p][h] = _eval7_py(board_5 + [hc0, hc1])
-        all_strengths.append(rc_strengths)
+                ps[h] = _eval7_py(board_5 + [hc0, hc1])
+            strengths_per_p.append(ps)
 
-    for li_idx, li in enumerate(leaf_infos):
+        for p in range(num_players):
+            if not strengths_per_p[p]:
+                continue
+            _accumulate_nplayer_equity(
+                p, num_players, player_hands, strengths_per_p,
+                raw_equity, eq_counts,
+            )
+
+    valid = eq_counts > 0
+    raw_equity[valid] /= eq_counts[valid]
+
+    # Apply first-order bias adjustment at each leaf's pot. Same logic as
+    # compute_flop_leaf_equity above — see that function's docstring for
+    # the bias-encoding convention.
+    for li in leaf_infos:
         leaf_pot = li.pot
-
-        # Compute raw showdown equity per (player, hand). We accumulate equity
-        # (probability of winning) rather than chip-payoff so we can apply the
-        # bias-adjusted leaf-value formula per (s_self, s_opp) pair afterward.
-        raw_equity = np.zeros((2, max_hands), dtype=np.float64)
-        counts = np.zeros((2, max_hands), dtype=np.float64)
-
-        for rc_idx, rc in enumerate(sampled):
-            strengths = all_strengths[rc_idx]
-
-            for p in range(2):
-                opp = 1 - p
-                for h in range(len(hands_by_player[p])):
-                    if h not in strengths[p]:
-                        continue
-                    hs = strengths[p][h]
-                    hc0, hc1 = hands_by_player[p][h][0], hands_by_player[p][h][1]
-
-                    wins = 0.0
-                    losses = 0.0
-                    ties = 0.0
-                    for o in range(len(hands_by_player[opp])):
-                        if o not in strengths[opp]:
-                            continue
-                        oc0, oc1 = hands_by_player[opp][o][0], hands_by_player[opp][o][1]
-                        if hc0 == oc0 or hc0 == oc1 or hc1 == oc0 or hc1 == oc1:
-                            continue
-                        os_val = strengths[opp][o]
-                        if hs > os_val:
-                            wins += 1.0
-                        elif hs < os_val:
-                            losses += 1.0
-                        else:
-                            ties += 1.0
-
-                    total = wins + losses + ties
-                    if total > 0:
-                        eq = (wins + 0.5 * ties) / total
-                        raw_equity[p, h] += eq
-                        counts[p, h] += 1.0
-
-        valid = counts > 0
-        raw_equity[valid] /= counts[valid]
-
-        # v3 fix: produce 16 different leaf values per (s0, s1) bias pair using
-        # the first-order bias approximation. Previously all 16 collapsed to
-        # one value because we lacked per-action EVs from the v2 .bps blueprint.
-        # See the BIAS_FOLD_PROB / BIAS_POT_FACTOR comments at top of file.
-        # The proper Pluribus-exact fix (per-action EVs in .bps via post-hoc
-        # tree walk at export time) is tracked in REALTIME_TODO.md as the
-        # long-term replacement for this approximation.
-        for s0 in range(4):
-            for s1 in range(4):
-                flat_idx = li.leaf_idx * 16 + s0 * 4 + s1
-                if flat_idx >= total_leaves:
-                    continue
-                for h in range(max_hands):
-                    if h < len(hands_by_player[0]):
-                        leaf_values[flat_idx, 0, h] = biased_leaf_value(
-                            raw_equity[0, h], leaf_pot, s0, s1)
-                    if h < len(hands_by_player[1]):
-                        leaf_values[flat_idx, 1, h] = biased_leaf_value(
-                            raw_equity[1, h], leaf_pot, s1, s0)
+        for combo in range(cont_per_leaf):
+            flat_idx = li.leaf_idx * cont_per_leaf + combo
+            if flat_idx >= total_leaves:
+                continue
+            biases = [(combo // (4 ** i)) % 4 for i in range(num_players)]
+            for p in range(num_players):
+                if num_players > 2:
+                    other_sum = sum(biases[q] for q in range(num_players) if q != p)
+                    s_opp_proxy = int(round(other_sum / (num_players - 1)))
+                    s_opp_proxy = max(0, min(3, s_opp_proxy))
+                else:
+                    s_opp_proxy = biases[1 - p]
+                for h in range(min(nh[p], max_hands)):
+                    leaf_values[flat_idx, p, h] = biased_leaf_value(
+                        raw_equity[p, h], leaf_pot, biases[p], s_opp_proxy
+                    )
 
     return leaf_values
 

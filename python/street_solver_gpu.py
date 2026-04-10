@@ -345,7 +345,7 @@ class StreetSolverGPU:
                 break
 
             # Find matching child action
-            labels = get_action_labels(self._tree, current)
+            labels = _build_labels_at_node(self._tree, current)
             matched = -1
             for i, lbl in enumerate(labels):
                 if lbl.lower() == action_label.lower():
@@ -571,19 +571,26 @@ class StreetSolverGPU:
         raise ValueError(f"Hand {hand_str} not in player {player_idx}'s range")
 
     def free(self):
-        if self._freed:
+        # Defensive: __init__ can raise before _freed is set. Use getattr
+        # everywhere so __del__ on a partially-constructed instance is safe.
+        if getattr(self, "_freed", False):
             return
         self._freed = True
-        if hasattr(self, '_tree') and self._tree.nodes:
+        tree = getattr(self, "_tree", None)
+        if tree is not None and getattr(tree, "nodes", None):
             try:
-                self.lib.ss_free_tree(ctypes.byref(self._tree))
+                self.lib.ss_free_tree(ctypes.byref(tree))
             except Exception:
                 pass
-        if hasattr(self, '_output') and self._solved:
+        output = getattr(self, "_output", None)
+        if output is not None and getattr(self, "_solved", False):
             try:
-                self.lib.ss_free_output(ctypes.byref(self._output))
+                self.lib.ss_free_output(ctypes.byref(output))
             except Exception:
                 pass
 
     def __del__(self):
-        self.free()
+        try:
+            self.free()
+        except Exception:
+            pass
