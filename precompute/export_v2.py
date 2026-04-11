@@ -97,6 +97,30 @@ def main():
     bp.bp_load_regrets.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
     bp.bp_free.restype = None
 
+    # Phase 1.3 bug fix: bp_set_preflop_tier MUST be called before
+    # bp_load_regrets / bp_compute_action_evs, matching the training-time
+    # tier configuration from blueprint_worker_unified.py. Without this
+    # call, the export solver has num_preflop_tiers=0 and falls back to
+    # flat preflop sizes at every raise level.
+    bp.bp_set_preflop_tier.restype = ctypes.c_int
+    bp.bp_set_preflop_tier.argtypes = [
+        ctypes.c_void_p, ctypes.c_int,
+        ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+        ctypes.c_int
+    ]
+
+    # Phase 1.3 bug #2: v2 checkpoints use the OLD boost-style hash_combine
+    # because v2 training launched (2026-04-07 22:18 UTC) BEFORE commit
+    # 48da71b landed (2026-04-08 01:51 UTC) which replaced it with
+    # splitmix64. The file format has no way to distinguish them — stored
+    # action_hash values are just uint64_t. When Phase 1.3's traverse_ev
+    # re-queries a v2 checkpoint's info sets with splitmix64 compute_action_hash,
+    # every non-root lookup fails (26M / 40M lookups failed in run 4 on
+    # 2026-04-11). Toggle the legacy mixer for v2 checkpoints so
+    # compute_action_hash produces values that match what training stored.
+    bp.bp_set_legacy_hash_mixer.restype = None
+    bp.bp_set_legacy_hash_mixer.argtypes = [ctypes.c_int]
+
     # Phase 1.3: action EV computation + export bindings
     bp.bp_compute_action_evs.restype = ctypes.c_int
     bp.bp_compute_action_evs.argtypes = [ctypes.c_void_p, ctypes.c_int64]
@@ -154,6 +178,25 @@ def main():
     if ret != 0:
         print(f"FATAL: bp_init_unified returned {ret}")
         sys.exit(1)
+
+    # Apply tiered preflop sizing — MUST match training.
+    for level, sizes in sorted(PREFLOP_TIERS.items()):
+        c_sizes = (ctypes.c_float * len(sizes))(*sizes)
+        ret = bp.bp_set_preflop_tier(
+            solver, level, c_sizes, len(sizes), PREFLOP_MAX_RAISES)
+        if ret != 0:
+            print(f"FATAL: bp_set_preflop_tier level {level} returned {ret}")
+            bp.bp_free(solver)
+            sys.exit(1)
+    print(f"Tiered preflop: {len(PREFLOP_TIERS)} levels, "
+          f"max {PREFLOP_MAX_RAISES} raises", flush=True)
+
+    # Enable legacy boost-style hash_combine for v2 checkpoints. Opt-in via
+    # env var USE_LEGACY_HASH_MIXER=1 (default: off for v3/future checkpoints).
+    # For the current 1.5B v2 checkpoint this MUST be 1.
+    use_legacy = os.environ.get("USE_LEGACY_HASH_MIXER", "1") == "1"
+    bp.bp_set_legacy_hash_mixer(1 if use_legacy else 0)
+
     timings["init"] = time.time() - t0
     print(f"[{timings['init']:.2f}s] Solver initialized", flush=True)
 

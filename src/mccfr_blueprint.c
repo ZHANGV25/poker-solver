@@ -256,6 +256,29 @@ static inline uint64_t bp_mix64(uint64_t x) {
     return x;
 }
 
+/* Legacy-mixer mode for loading and re-querying v2 checkpoints that were
+ * trained with the boost-style hash_combine. Set to 1 via bp_set_legacy_hash_mixer()
+ * BEFORE calling bp_load_regrets on a v2 checkpoint. The v2 training run
+ * (2026-04-07 22:18 UTC) launched BEFORE commit 48da71b (2026-04-08 01:51 UTC)
+ * so the 1.5B checkpoint's action_hash values are derived from the old mixer.
+ * Phase 1.3's traverse_ev re-queries by key, so it must use the same mixer
+ * that produced the stored action_hash values, or every non-root lookup fails.
+ *
+ * When enabled, both hash_combine() (used for compute_action_hash, insert,
+ * and slot derivation) use the legacy boost-style mixer. The slot derivation
+ * just needs to be internally consistent for a given run — any mixer works
+ * for placement as long as insert and lookup agree. What MUST match training
+ * is the action_hash VALUE stored in the key field, because that's the
+ * opaque identifier that survives across checkpoint save/load. */
+static int g_legacy_hash_mixer = 0;
+
+void bp_set_legacy_hash_mixer(int enabled) {
+    g_legacy_hash_mixer = enabled ? 1 : 0;
+    printf("[BP] Hash mixer mode: %s\n",
+           g_legacy_hash_mixer ? "legacy (boost)" : "splitmix64");
+    fflush(stdout);
+}
+
 /* Bug 6 fix: replaces the previous boost::hash_combine
  *     a ^= b + 0x9e3779b97f4a7c15 + (a << 6) + (a >> 2);
  * which has known weak distribution on small structured inputs (sequences
@@ -265,14 +288,18 @@ static inline uint64_t bp_mix64(uint64_t x) {
  * by xxHash3 and gives ~uniform distribution over uint64.
  *
  * Note on backwards compatibility: this changes the slot derivation for
- * every info set in the hash table. v2's regrets_*.bin checkpoints can
- * still be LOADED by code with this fix (the load just reads stored key
- * fields and re-inserts them), and EXPORT works correctly because export
- * iterates the table without re-querying by key. RESUMING training from
- * a v2 checkpoint with this fix in place WOULD create duplicates because
- * the new hash places the same key in a different slot than v2 did.
- * v3 training is a fresh start from iter 0 so this is fine. */
+ * every info set in the hash table. v2's regrets_*.bin checkpoints must
+ * be loaded AND re-queried using the legacy mixer — use
+ * bp_set_legacy_hash_mixer(1) before bp_load_regrets. Phase 1.3 Phase B
+ * broke because Phase 1.3's traverse_ev re-queries by key and the
+ * splitmix64 output doesn't match what v2 training stored. */
 static inline uint64_t hash_combine(uint64_t a, uint64_t b) {
+    if (g_legacy_hash_mixer) {
+        /* Boost-style hash_combine (pre-48da71b). Used for action_hash
+         * computation on v2 checkpoints. */
+        a ^= b + 0x9e3779b97f4a7c15ULL + (a << 6) + (a >> 2);
+        return a;
+    }
     return bp_mix64(a ^ bp_mix64(b));
 }
 

@@ -331,6 +331,16 @@ BP_EXPORT void bp_get_table_stats(const BPSolver *s,
                                    int64_t *out_max_probe_observed);
 
 /**
+ * Enable the legacy boost-style hash_combine mixer. Must be called BEFORE
+ * bp_load_regrets when loading a v2 checkpoint (trained before commit
+ * 48da71b on 2026-04-08 01:51 UTC). v2's stored action_hash values were
+ * computed with the boost-style mixer; if Phase 1.3's traverse_ev runs
+ * with splitmix64, every non-root info set lookup fails because the
+ * recomputed action_hashes don't match the stored ones.
+ */
+BP_EXPORT void bp_set_legacy_hash_mixer(int enabled);
+
+/**
  * Save/load precomputed texture bucket cache to skip the 65-90 min
  * precompute on subsequent launches. Format: TXC1 header + hash keys
  * + bucket mappings. ~9.3 MB file for 1755 textures × 1326 hands.
