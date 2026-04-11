@@ -261,52 +261,64 @@ static inline uint64_t bp_mix64(uint64_t x) {
  * BEFORE calling bp_load_regrets on a v2 checkpoint. The v2 training run
  * (2026-04-07 22:18 UTC) launched BEFORE commit 48da71b (2026-04-08 01:51 UTC)
  * so the 1.5B checkpoint's action_hash values are derived from the old mixer.
- * Phase 1.3's traverse_ev re-queries by key, so it must use the same mixer
- * that produced the stored action_hash values, or every non-root lookup fails.
+ * Phase 1.3's traverse_ev re-queries by key, so compute_action_hash MUST
+ * produce values matching what training stored, or every non-root lookup fails.
  *
- * When enabled, both hash_combine() (used for compute_action_hash, insert,
- * and slot derivation) use the legacy boost-style mixer. The slot derivation
- * just needs to be internally consistent for a given run — any mixer works
- * for placement as long as insert and lookup agree. What MUST match training
- * is the action_hash VALUE stored in the key field, because that's the
- * opaque identifier that survives across checkpoint save/load. */
+ * IMPORTANT — separation of concerns:
+ *   - compute_action_hash VALUE is what gets stored in the key field and must
+ *     match training byte-for-byte. Controlled by g_legacy_hash_mixer.
+ *   - Slot derivation (info_table_find_or_create and traverse_ev probe) uses
+ *     hash_combine on the composite key (board_hash, action_hash, player,
+ *     street, bucket). This is purely for placement and only needs to be
+ *     internally consistent within a single process run. Always use splitmix64
+ *     here regardless of the legacy flag, because boost-style slot derivation
+ *     on the v2 checkpoint produces catastrophic probe-chain clustering
+ *     (20K insertion failures observed, ~2900x slower lookups than splitmix64).
+ *     First attempt at this fix tied both together and made Phase 1.3 EV walk
+ *     ~200x slower than needed — killed after 6.5 min with no iter progress.
+ */
 static int g_legacy_hash_mixer = 0;
 
 void bp_set_legacy_hash_mixer(int enabled) {
     g_legacy_hash_mixer = enabled ? 1 : 0;
-    printf("[BP] Hash mixer mode: %s\n",
+    printf("[BP] Action-hash mixer mode: %s (slot-derivation mixer: splitmix64 always)\n",
            g_legacy_hash_mixer ? "legacy (boost)" : "splitmix64");
     fflush(stdout);
 }
 
-/* Bug 6 fix: replaces the previous boost::hash_combine
- *     a ^= b + 0x9e3779b97f4a7c15 + (a << 6) + (a >> 2);
- * which has known weak distribution on small structured inputs (sequences
- * of small action indices, in our case). The new mixer runs each input
- * through two rounds of splitmix64 — full 64-bit avalanche, no structural
- * residue from the input pattern. This is the same family of mixer used
- * by xxHash3 and gives ~uniform distribution over uint64.
+/* Bug 6 fix: splitmix64 hash_combine for slot derivation in the main hash
+ * table. Used by info_table_find_or_create and traverse_ev probe loops.
+ * Always splitmix64 regardless of legacy flag — see comment above.
  *
- * Note on backwards compatibility: this changes the slot derivation for
- * every info set in the hash table. v2's regrets_*.bin checkpoints must
- * be loaded AND re-queried using the legacy mixer — use
- * bp_set_legacy_hash_mixer(1) before bp_load_regrets. Phase 1.3 Phase B
- * broke because Phase 1.3's traverse_ev re-queries by key and the
- * splitmix64 output doesn't match what v2 training stored. */
+ * The previous boost::hash_combine
+ *     a ^= b + 0x9e3779b97f4a7c15 + (a << 6) + (a >> 2);
+ * has known weak distribution on small structured inputs. splitmix64 gives
+ * ~uniform distribution over uint64. */
 static inline uint64_t hash_combine(uint64_t a, uint64_t b) {
-    if (g_legacy_hash_mixer) {
-        /* Boost-style hash_combine (pre-48da71b). Used for action_hash
-         * computation on v2 checkpoints. */
-        a ^= b + 0x9e3779b97f4a7c15ULL + (a << 6) + (a >> 2);
-        return a;
-    }
     return bp_mix64(a ^ bp_mix64(b));
+}
+
+/* Legacy boost-style combiner, used ONLY by compute_action_hash when
+ * g_legacy_hash_mixer is enabled. Reproduces the exact bits that v2 training
+ * wrote into key.action_hash, so lookups on a v2 checkpoint find the right
+ * entries. Do NOT call this from anywhere else. */
+static inline uint64_t hash_combine_boost_legacy(uint64_t a, uint64_t b) {
+    a ^= b + 0x9e3779b97f4a7c15ULL + (a << 6) + (a >> 2);
+    return a;
 }
 
 static uint64_t compute_board_hash(const int *board, int num_board) {
     uint64_t h = 0x123456789ABCDEFULL;
-    for (int i = 0; i < num_board; i++)
-        h = hash_combine(h, (uint64_t)board[i] * 31 + 7);
+    if (g_legacy_hash_mixer) {
+        /* Match the boost-style hash values stored in texture_cache.bin
+         * (created 2026-04-07 before commit 48da71b). This ensures
+         * texture_index_lookup() finds the right precomputed bucket row. */
+        for (int i = 0; i < num_board; i++)
+            h = hash_combine_boost_legacy(h, (uint64_t)board[i] * 31 + 7);
+    } else {
+        for (int i = 0; i < num_board; i++)
+            h = hash_combine(h, (uint64_t)board[i] * 31 + 7);
+    }
     return h;
 }
 
@@ -459,8 +471,16 @@ static void canonicalize_board(const int *board, int num_board, int *canon_out) 
 
 static uint64_t compute_action_hash(const int *actions, int num_actions) {
     uint64_t h = 0xFEDCBA9876543210ULL;
-    for (int i = 0; i < num_actions; i++)
-        h = hash_combine(h, (uint64_t)actions[i] * 17 + 3);
+    if (g_legacy_hash_mixer) {
+        /* v2 checkpoint mode: reproduce the byte-exact action_hash values
+         * that training stored using boost-style hash_combine. */
+        for (int i = 0; i < num_actions; i++)
+            h = hash_combine_boost_legacy(h, (uint64_t)actions[i] * 17 + 3);
+    } else {
+        /* v3+ mode: splitmix64 hash_combine. */
+        for (int i = 0; i < num_actions; i++)
+            h = hash_combine(h, (uint64_t)actions[i] * 17 + 3);
+    }
     return h;
 }
 
