@@ -3969,6 +3969,12 @@ int bp_compute_action_evs(BPSolver *s, int64_t num_iterations) {
     int64_t progress_interval = num_iterations / 20;  /* 5% progress marks */
     if (progress_interval < 1) progress_interval = 1;
 
+    /* Shared atomic iteration counter for progress reporting. The old
+     * tid==0 + iter%interval scheme was broken with schedule(dynamic,64)
+     * because tid 0 only processes a sparse random subset of iters. */
+    int64_t completed_iters = 0;
+    int64_t next_progress_mark = progress_interval;
+
     #ifdef _OPENMP
     #pragma omp parallel if(nt > 1)
     #endif
@@ -4067,19 +4073,28 @@ int bp_compute_action_evs(BPSolver *s, int64_t num_iterations) {
                 traverse_ev(&ts, 0, postflop_order, NP);
             }
 
-            /* Progress reporting from thread 0 only */
-            if (tid == 0 && (iter % progress_interval) == 0) {
-                #ifdef _OPENMP
-                double elapsed = omp_get_wtime() - t_start;
-                #else
-                double elapsed = (double)(clock() - t_start) / CLOCKS_PER_SEC;
-                #endif
-                double frac = (double)iter / (double)num_iterations;
-                double rate = iter / (elapsed > 0 ? elapsed : 1);
-                printf("[BP1.3] iter %lld/%lld (%.0f%%), %.1fs, %.0f iter/s\n",
-                       (long long)iter, (long long)num_iterations,
-                       frac * 100.0, elapsed, rate);
-                fflush(stdout);
+            /* Progress reporting via shared atomic counter — whichever
+             * thread crosses a 5% mark prints. Works with any OpenMP
+             * schedule. */
+            int64_t my_count = __atomic_add_fetch(&completed_iters, 1, __ATOMIC_RELAXED);
+            int64_t cur_mark = __atomic_load_n(&next_progress_mark, __ATOMIC_RELAXED);
+            if (my_count >= cur_mark) {
+                /* Try to claim this mark so only one thread prints per threshold. */
+                int64_t new_mark = cur_mark + progress_interval;
+                if (__atomic_compare_exchange_n(&next_progress_mark, &cur_mark, new_mark,
+                                                 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+                    #ifdef _OPENMP
+                    double elapsed = omp_get_wtime() - t_start;
+                    #else
+                    double elapsed = (double)(clock() - t_start) / CLOCKS_PER_SEC;
+                    #endif
+                    double frac = (double)my_count / (double)num_iterations;
+                    double rate = my_count / (elapsed > 0 ? elapsed : 1);
+                    printf("[BP1.3] iter %lld/%lld (%.0f%%), %.1fs, %.0f iter/s\n",
+                           (long long)my_count, (long long)num_iterations,
+                           frac * 100.0, elapsed, rate);
+                    fflush(stdout);
+                }
             }
         }
     }
