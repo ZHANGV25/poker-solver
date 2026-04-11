@@ -107,7 +107,12 @@ free -h
 
 echo "--- Running export_v2.py (full pipeline with Phase 1.3) ---"
 cd $WORKDIR
-export EV_WALK_ITERS=50000000
+# 5M iters for validation. Previous 50M/5M runs had zero progress
+# visibility due to broken tid-0-only progress print. Walker source
+# was updated with atomic counter-based progress; this run will
+# show iter/s rate within 1 min of walk start so we can assess true
+# throughput and decide on final iter count for production.
+export EV_WALK_ITERS=5000000
 export USE_LEGACY_HASH_MIXER=1
 export NUM_THREADS=32
 # Foreground run so the script waits for completion

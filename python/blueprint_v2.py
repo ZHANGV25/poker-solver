@@ -50,16 +50,20 @@ def _mask64(x):
     return x & 0xFFFFFFFFFFFFFFFF
 
 
-def _compute_board_hash(board, num_board):
+def _compute_board_hash(board, num_board, legacy_mixer=False):
     """Must match compute_board_hash in mccfr_blueprint.c exactly.
-    Board cards are canonicalized first (suit-isomorphic mapping)."""
+    Board cards are canonicalized first (suit-isomorphic mapping).
+
+    legacy_mixer=True reproduces the pre-48da71b boost-style mixer for
+    reading v2-era .bps files."""
     if num_board >= 3:
         canon = _canonicalize_board(board, num_board)
     else:
         canon = list(board[:num_board])
     h = _mask64(0x123456789ABCDEF)
     for i in range(num_board):
-        h = _hash_combine(h, _mask64(canon[i] * 31 + 7))
+        h = _hash_combine(h, _mask64(canon[i] * 31 + 7),
+                          legacy_mixer=legacy_mixer)
     return h
 
 
@@ -121,11 +125,18 @@ def _canonicalize_board(board, num_board):
     return canon
 
 
-def _compute_action_hash(actions):
-    """Must match compute_action_hash in mccfr_blueprint.c exactly."""
+def _compute_action_hash(actions, legacy_mixer=False):
+    """Must match compute_action_hash in mccfr_blueprint.c exactly.
+
+    legacy_mixer=True reproduces the pre-48da71b boost-style hash_combine
+    for reading v2-era .bps files that were exported with
+    bp_set_legacy_hash_mixer(1). Detected from the file's
+    `hash_mixer` metadata field and plumbed down through get_strategy /
+    get_all_bucket_strategies / get_all_bucket_action_evs.
+    """
     h = _mask64(0xFEDCBA9876543210)
     for a in actions:
-        h = _hash_combine(h, _mask64(a * 17 + 3))
+        h = _hash_combine(h, _mask64(a * 17 + 3), legacy_mixer=legacy_mixer)
     return h
 
 
@@ -144,12 +155,29 @@ def _bp_mix64(x):
     return x
 
 
-def _hash_combine(a, b):
+def _hash_combine_boost_legacy(a, b):
+    """Pre-48da71b boost-style hash_combine.
+
+    a ^= b + 0x9e3779b97f4a7c15 + (a << 6) + (a >> 2);
+
+    Used only when reading v2-era .bps files. See `g_legacy_hash_mixer`
+    in mccfr_blueprint.c for the full story."""
+    a = _mask64(a)
+    b = _mask64(b)
+    a ^= _mask64(b + 0x9e3779b97f4a7c15 + (a << 6) + (a >> 2))
+    return _mask64(a)
+
+
+def _hash_combine(a, b, legacy_mixer=False):
     """Must match hash_combine in mccfr_blueprint.c exactly.
 
-    C side (post-Bug-6):
+    C side (post-Bug-6, non-legacy):
         return bp_mix64(a ^ bp_mix64(b));
+
+    legacy_mixer=True dispatches to the boost-style mixer for v2-era files.
     """
+    if legacy_mixer:
+        return _hash_combine_boost_legacy(a, b)
     return _bp_mix64(_mask64(a) ^ _bp_mix64(b))
 
 
@@ -404,31 +432,39 @@ class BlueprintV2:
             self._textures[texture_key] = table
             self._metadata[texture_key] = meta
 
-        # Hash mixer backcompat check (Bug 6).
+        # Hash mixer backcompat (Bug 6 / Phase 1.3 rerun).
         #
-        # Files written before commit 48da71b (Bug 6 fix) used a boost-style
-        # hash_combine. The current Python _hash_combine uses splitmix64 to
-        # match the C side. If someone queries an old file with the new
-        # mixer, every get_strategy/get_all_bucket_strategies/...
-        # lookup silently returns None. Make the failure mode loud.
+        # Files written by export_v2.py record a `hash_mixer` field in
+        # metadata. Possible values:
+        #   "splitmix64" — post-48da71b: Python must use splitmix64 for lookups.
+        #   "boost"      — v2-era checkpoint re-exported with
+        #                  bp_set_legacy_hash_mixer(1). Python must use the
+        #                  boost-style mixer for lookups or every non-empty
+        #                  action history misses.
+        #   missing      — very old files pre-dating the tag. Assume boost.
+        #
+        # The `_legacy_mixer` flag is plumbed into _compute_action_hash and
+        # _compute_board_hash by the consumer methods so the dispatch is
+        # automatic at load time — no runtime flag needed from the caller.
         mixer_tag = meta.get("hash_mixer")
-        if mixer_tag != "splitmix64":
+        if mixer_tag == "splitmix64":
+            self._legacy_mixer = False
+        elif mixer_tag == "boost":
+            self._legacy_mixer = True
+            print(f"[blueprint_v2] Loaded {texture_key!r} with legacy boost mixer "
+                  f"(v2-era checkpoint). Python hash functions will dispatch "
+                  f"to the boost-style mixer for lookups.")
+        else:
+            # Pre-tag file — warn and assume boost (v2-era default)
             import warnings as _warn
             _warn.warn(
-                f"Blueprint {texture_key!r} has hash_mixer={mixer_tag!r} "
-                f"(expected 'splitmix64'). This file was exported before "
-                f"the Bug 6 hash mixer fix (commit 48da71b). Python "
-                f"get_strategy / get_all_bucket_strategies / "
-                f"get_all_bucket_action_evs lookups will return None for "
-                f"every non-empty action history because the in-Python "
-                f"action_hash no longer matches the keys in the file. "
-                f"Re-export the blueprint from a current solver build or "
-                f"pin a pre-Bug-6 checkout of blueprint_v2.py.",
+                f"Blueprint {texture_key!r} has no hash_mixer field "
+                f"(pre-tag file). Assuming boost-style mixer (v2-era). "
+                f"If lookups still miss, the file may use a different "
+                f"mixer — re-export from a current solver build.",
                 stacklevel=2,
             )
             self._legacy_mixer = True
-        else:
-            self._legacy_mixer = False
 
         # Phase 1.3: attempt to load the trailing BPR3 per-action EV section.
         # Schema v3+ files have this; schema v2 files don't.
@@ -617,8 +653,10 @@ class BlueprintV2:
         Returns:
             numpy array of action probabilities, or None if not found.
         """
-        board_hash = _compute_board_hash(board, len(board))
-        action_hash = _compute_action_hash(action_history)
+        board_hash = _compute_board_hash(board, len(board),
+                                          legacy_mixer=self._legacy_mixer)
+        action_hash = _compute_action_hash(action_history,
+                                            legacy_mixer=self._legacy_mixer)
         key = (board_hash, action_hash, player, street)
 
         # Check unified blueprint first
@@ -672,8 +710,10 @@ class BlueprintV2:
 
         Returns [num_buckets, num_actions] array, or None.
         """
-        board_hash = _compute_board_hash(board, len(board))
-        action_hash = _compute_action_hash(action_history)
+        board_hash = _compute_board_hash(board, len(board),
+                                          legacy_mixer=self._legacy_mixer)
+        action_hash = _compute_action_hash(action_history,
+                                            legacy_mixer=self._legacy_mixer)
         key = (board_hash, action_hash, player, street)
 
         # Check unified blueprint first
@@ -720,7 +760,8 @@ class BlueprintV2:
         """
         # Action EVs use board_hash=0 per the v3 export format (board is
         # abstracted by bucket, same as strategies in bucket-in-key mode).
-        action_hash = _compute_action_hash(action_history)
+        action_hash = _compute_action_hash(action_history,
+                                            legacy_mixer=self._legacy_mixer)
         key = (0, action_hash, player, street)
 
         # Check unified blueprint first

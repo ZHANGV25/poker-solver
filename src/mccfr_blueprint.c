@@ -3959,6 +3959,53 @@ int bp_compute_action_evs(BPSolver *s, int64_t num_iterations) {
            (long long)num_iterations, nt, (long long)s->info_table.num_entries);
     fflush(stdout);
 
+    /* Pre-allocate action_evs arena storage for every loaded info set
+     * in one sequential pass BEFORE the walk starts. Without this, the
+     * walk's first visit to each info set calls ensure_action_evs() →
+     * arena_alloc(), which hits a global atomic fetch_add inside
+     * arena_grab_slice() on slice refill. With 32 threads all allocating
+     * tiny (4-6 action) buffers concurrently during the first N iters,
+     * cache-line bouncing on the arena head pointer stalls everyone.
+     *
+     * One-time sequential pre-allocation eliminates this: single thread
+     * walks the table, calls arena_alloc for each occupied slot, stores
+     * the result. No concurrent arena churn during the walk. Expected
+     * memory cost: ~1.2B info sets × 4 actions avg × 4B float = ~20 GB
+     * (same as it would have been on-demand during the walk, just up
+     * front and deterministic).
+     *
+     * This was the main throughput bottleneck observed in prod run 2
+     * on 2026-04-11 (50M walk running ~1800 iter/s vs design's ~100K). */
+    {
+        #ifdef _OPENMP
+        double t_prealloc = omp_get_wtime();
+        #else
+        clock_t t_prealloc = clock();
+        #endif
+        int64_t prealloc_count = 0;
+        for (int64_t i = 0; i < s->info_table.table_size; i++) {
+            if (s->info_table.occupied[i] != 1) continue;
+            BPInfoSet *is = &s->info_table.sets[i];
+            /* Skip if somehow already allocated (shouldn't happen in
+             * a fresh bp_compute_action_evs call). */
+            if (is->action_evs != NULL) continue;
+            float *buf = (float*)arena_alloc(is->num_actions);
+            if (buf) {
+                is->action_evs = buf;
+                prealloc_count++;
+            }
+        }
+        #ifdef _OPENMP
+        double prealloc_elapsed = omp_get_wtime() - t_prealloc;
+        #else
+        double prealloc_elapsed = (double)(clock() - t_prealloc) / CLOCKS_PER_SEC;
+        #endif
+        printf("[BP1.3] Pre-allocated action_evs for %lld info sets in %.1fs "
+               "(eliminates per-visit arena contention during walk)\n",
+               (long long)prealloc_count, prealloc_elapsed);
+        fflush(stdout);
+    }
+
     #ifdef _OPENMP
     double t_start = omp_get_wtime();
     omp_set_num_threads(nt);

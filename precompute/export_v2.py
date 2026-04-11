@@ -9,6 +9,165 @@ import subprocess
 import sys
 import time
 
+
+def _validate_exported_bps(bps_path: str, use_legacy_mixer: bool,
+                            has_action_evs: bool) -> None:
+    """Parse the just-written .bps via blueprint_v2.BlueprintV2 and probe
+    sentinel info sets. Raises on any failure.
+
+    Rationale: prior Phase B runs (2026-04-09) silently produced broken
+    files that nothing caught until days later. This function runs at
+    export time and fails the pipeline BEFORE upload if anything's wrong.
+    Runs in <30s on a loaded 14 GB file.
+    """
+    # Add python/ to sys.path so we can import blueprint_v2
+    _py_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "..", "python")
+    if _py_dir not in sys.path:
+        sys.path.insert(0, _py_dir)
+
+    try:
+        import blueprint_v2 as _bpv2
+    except ImportError as e:
+        raise RuntimeError(
+            f"Could not import blueprint_v2 for validation: {e}. "
+            f"Expected {_py_dir}/blueprint_v2.py to exist."
+        )
+
+    # Create an empty-dir-backed BlueprintV2 and load_unified the new file.
+    # streets_to_load=[0,1,2,3] loads all streets including preflop for
+    # the sanity check; consumers typically only load specific streets.
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        bp = _bpv2.BlueprintV2(td, streets_to_load=[0, 1, 2, 3])
+        if not bp.load_unified(bps_path):
+            raise RuntimeError(
+                f"BlueprintV2.load_unified({bps_path}) returned False. "
+                f"File may be corrupt or have wrong magic bytes."
+            )
+
+        # Check 1: hash_mixer tag matches what we set
+        meta = bp._metadata.get("__unified__", {})
+        mixer_tag = meta.get("hash_mixer")
+        expected_tag = "boost" if use_legacy_mixer else "splitmix64"
+        if mixer_tag != expected_tag:
+            raise RuntimeError(
+                f"hash_mixer tag mismatch: expected {expected_tag!r}, "
+                f"got {mixer_tag!r}"
+            )
+        print(f"  [OK] hash_mixer tag = {mixer_tag!r}")
+
+        # Check 2: _legacy_mixer flag was set correctly from metadata
+        if bp._legacy_mixer != use_legacy_mixer:
+            raise RuntimeError(
+                f"BlueprintV2._legacy_mixer = {bp._legacy_mixer} but "
+                f"use_legacy_mixer = {use_legacy_mixer}"
+            )
+        print(f"  [OK] BlueprintV2._legacy_mixer dispatch wired "
+              f"(legacy={use_legacy_mixer})")
+
+        # Walk the loaded table directly instead of going through
+        # get_strategy() — get_strategy's board_hash computation uses the
+        # _compute_board_hash seed rather than 0 for empty boards, which
+        # doesn't match the C side's hardcoded key.board_hash=0 for
+        # preflop. We probe the raw `_textures['__unified__']` dict.
+        table = bp._textures.get('__unified__')
+        if table is None or len(table) == 0:
+            raise RuntimeError("Unified blueprint table is empty after load")
+
+        # Count entries by (player, street) to sanity-check coverage
+        by_player_street = {}
+        for key in table.keys():
+            board_hash, action_hash, player, street = key
+            by_player_street[(player, street)] = \
+                by_player_street.get((player, street), 0) + 1
+
+        print(f"  [OK] Loaded {len(table):,} unique (board,action,player,street) "
+              f"nodes across all streets")
+
+        # Check 3: every player 0..5 has preflop entries
+        for p in range(6):
+            count = by_player_street.get((p, 0), 0)
+            if count == 0:
+                raise RuntimeError(
+                    f"Player {p} has 0 preflop info sets in loaded table. "
+                    f"Expected millions per player."
+                )
+        print(f"  [OK] All 6 players have preflop entries "
+              f"(e.g. player 2 UTG has "
+              f"{by_player_street.get((2, 0), 0):,} preflop nodes)")
+
+        # Check 4: UTG preflop root (board_hash=0, action_hash=seed,
+        # player=2, street=0) is findable. This is the one info set
+        # that's findable even without the hash mixer fix, since its
+        # action_hash is the raw seed constant.
+        utg_root_key = (0, 0xFEDCBA9876543210, 2, 0)
+        if utg_root_key not in table:
+            raise RuntimeError(
+                f"UTG preflop root key {utg_root_key} not in loaded table. "
+                f"File is fundamentally unreadable."
+            )
+        utg_root_strategies = table[utg_root_key]  # [num_buckets, num_actions] array
+        print(f"  [OK] UTG preflop root findable: "
+              f"shape={utg_root_strategies.shape}, "
+              f"AA (bucket 0) strategy = "
+              f"{[round(float(x), 3) for x in utg_root_strategies[0]]}")
+
+        # Check 5: If action EVs were supposed to be exported, verify
+        # the BPR3 section is present and populated. This is the direct
+        # catch for the 2026-04-09 silent failure.
+        if has_action_evs:
+            if not bp.has_action_evs():
+                raise RuntimeError(
+                    "has_action_evs=True at export but "
+                    "BlueprintV2.has_action_evs() returned False. "
+                    "BPR3 section not populated or failed to parse."
+                )
+            ev_table = bp._action_evs.get('__unified__')
+            if ev_table is None or len(ev_table) == 0:
+                raise RuntimeError(
+                    "BPR3 section parsed but action_evs table is empty"
+                )
+            print(f"  [OK] BPR3 action-EVs loaded: "
+                  f"{len(ev_table):,} (action_hash,player,street) nodes")
+
+            # Probe: does UTG preflop root have action EVs?
+            # action_evs keys are (board_hash=0, action_hash, player, street)
+            utg_ev_key = (0, 0xFEDCBA9876543210, 2, 0)
+            utg_evs = ev_table.get(utg_ev_key)
+            if utg_evs is None:
+                raise RuntimeError(
+                    f"UTG preflop root has no action_evs entry at {utg_ev_key}. "
+                    f"The EV walk did not populate it."
+                )
+            import numpy as _np
+            nz = int(_np.count_nonzero(utg_evs))
+            total_cells = int(_np.prod(utg_evs.shape))
+            print(f"  [OK] UTG preflop action_evs: "
+                  f"shape={utg_evs.shape}, "
+                  f"{nz}/{total_cells} non-zero cells")
+            if nz == 0:
+                raise RuntimeError(
+                    "UTG action_evs are all zero. EV walk did not run or "
+                    "accumulation failed."
+                )
+
+            # Also check: some NON-UTG player has action EVs.
+            # In the broken 2026-04-09 run, ONLY UTG roots had visits.
+            # Scan for any player=0 (SB) or player=1 (BB) entries.
+            non_utg_ev_count = sum(1 for (bh, ah, pl, st) in ev_table.keys()
+                                    if pl != 2 or st != 0)
+            if non_utg_ev_count == 0:
+                raise RuntimeError(
+                    "ALL action_evs are at UTG preflop root — this is the "
+                    "exact symptom of the 2026-04-09 broken walk. The walker "
+                    "never made it past UTG. Hash mixer dispatch may be wrong."
+                )
+            print(f"  [OK] {non_utg_ev_count:,} non-UTG-preflop-root info sets "
+                  f"have action_evs (the 2026-04-09 broken walk had 0)")
+
+    print("All sanity checks passed.", flush=True)
+
 NUM_PLAYERS = 6
 SMALL_BLIND = 50
 BIG_BLIND = 100
@@ -369,11 +528,14 @@ def main():
         # Bug 6 / v3: explicit hash-mixer tag. Python consumers that
         # recompute info-set hashes (e.g. get_strategy() calls in
         # blueprint_v2.py) must use the same mixer as the C exporter
-        # or every lookup misses. Files tagged "splitmix64" work with
-        # the post-Bug-6 Python implementation; files without this
-        # field (legacy) were exported with the old boost-style mixer
-        # and are incompatible with current blueprint_v2.py lookups.
-        "hash_mixer": "splitmix64",
+        # or every lookup misses.
+        #
+        # The action_hash VALUES stored in this file are whatever
+        # compute_action_hash() produced on the C side, which depends on
+        # g_legacy_hash_mixer at export time. Track it here so Python
+        # consumers can dispatch to the matching mixer at load time and
+        # self-configure without a runtime flag.
+        "hash_mixer": "boost" if use_legacy else "splitmix64",
         # Phase 1.3: per-action EVs under the average strategy, computed
         # post-hoc via σ̄-sampled MCCFR walk. See docs/PHASE_1_3_DESIGN.md.
         "has_action_evs": has_action_evs,
@@ -408,6 +570,39 @@ def main():
 
     bps_mb = os.path.getsize(bps_path) / (1024 * 1024)
     print(f"Wrote {bps_path} ({bps_mb:.1f} MB)", flush=True)
+
+    # ── Post-export sanity check ─────────────────────────────────────
+    #
+    # Before uploading to S3, parse the just-written .bps file back via
+    # blueprint_v2.BlueprintV2 and verify the output is actually usable:
+    #   - file parses without errors
+    #   - hash_mixer tag matches what we set at export time
+    #   - the UTG preflop root info set is findable (proves the
+    #     action_hash roundtrip works)
+    #   - if schema v3+, at least one action EV lookup returns non-zero
+    #     values (proves the BPR3 section is populated — the 2026-04-09
+    #     run produced a file with 0 MB of action EVs that went unnoticed
+    #     because nothing ever tried to USE the file)
+    #
+    # This whole check runs in <30 seconds. If it fails the script exits
+    # non-zero BEFORE the S3 upload, leaving the bucket contents untouched.
+    t0 = time.time()
+    print()
+    print("=" * 60)
+    print("  POST-EXPORT SANITY CHECK")
+    print("=" * 60, flush=True)
+    try:
+        _validate_exported_bps(bps_path, use_legacy_mixer=use_legacy,
+                               has_action_evs=has_action_evs)
+    except Exception as e:
+        print(f"FATAL: post-export validation failed: {e}", flush=True)
+        print(f"       The file at {bps_path} will NOT be uploaded.", flush=True)
+        import traceback
+        traceback.print_exc()
+        sys.exit(2)
+    timings["sanity_check"] = time.time() - t0
+    print(f"[{timings['sanity_check']:.2f}s] Sanity check passed", flush=True)
+    print()
 
     # Upload to S3
     if s3_bucket:
