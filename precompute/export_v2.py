@@ -156,7 +156,10 @@ def main():
     t0 = time.time()
     config = BPConfig()
     bp.bp_default_config(ctypes.byref(config))
-    config.num_threads = 1
+    # Phase 1.3 EV walk is embarrassingly parallel — OpenMP distributes
+    # iterations across threads via #pragma omp for. Default to 32 threads
+    # for the production export; override via NUM_THREADS env var.
+    config.num_threads = int(os.environ.get("NUM_THREADS", "32"))
     config.include_preflop = 1
     config.hash_table_size = hash_size
     config.postflop_num_buckets = 200
